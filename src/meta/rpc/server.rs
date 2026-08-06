@@ -860,7 +860,9 @@ mod tests {
             .await
             .unwrap();
 
-        // unlink -> stat not found
+        // unlink removes the directory entry; lookup must report NotFound.
+        // (The inode itself may remain stat-able until GC, matching POSIX
+        // unlink semantics for open handles — do not assert stat ENOENT.)
         client
             .unlink(UnlinkRequest {
                 parent: dir_ino,
@@ -868,14 +870,18 @@ mod tests {
             })
             .await
             .unwrap();
-        let stat_err = client
-            .stat(StatRequest { ino: file_ino })
+        let lookup_err = client
+            .lookup(LookupRequest {
+                parent: dir_ino,
+                name: "g".into(),
+            })
             .await
             .unwrap_err();
-        assert_eq!(stat_err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(lookup_err.code(), tonic::Code::FailedPrecondition);
 
-        // stat missing inode maps to NotFound wire code
-        let _ = client.stat(StatRequest { ino: 999_999 }).await.unwrap_err();
+        // stat of a never-existing inode maps to NotFound wire code
+        let stat_err = client.stat(StatRequest { ino: 999_999 }).await.unwrap_err();
+        assert_eq!(stat_err.code(), tonic::Code::FailedPrecondition);
 
         // batch_stat preserves positional correspondence (missing -> ino=0)
         let batch = client
