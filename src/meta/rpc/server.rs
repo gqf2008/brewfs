@@ -262,10 +262,18 @@ where
     ) -> Result<Response<proto::BatchStatResponse>, Status> {
         let inos = request.into_inner().inos;
         let attrs = self.store.batch_stat(&inos).await.map_err(status)?;
+        // Keep positional correspondence with the request: missing inodes are
+        // returned as an attr with ino=0 (contract: "缺项为 attr.ino=0").
         Ok(Response::new(proto::BatchStatResponse {
             attrs: attrs
                 .into_iter()
-                .filter_map(|a| a.map(|a| file_attr_to_proto(&a)))
+                .map(|a| match a {
+                    Some(a) => file_attr_to_proto(&a),
+                    None => proto::FileAttr {
+                        ino: 0,
+                        ..Default::default()
+                    },
+                })
                 .collect(),
         }))
     }
@@ -868,5 +876,19 @@ mod tests {
 
         // stat missing inode maps to NotFound wire code
         let _ = client.stat(StatRequest { ino: 999_999 }).await.unwrap_err();
+
+        // batch_stat preserves positional correspondence (missing -> ino=0)
+        let batch = client
+            .batch_stat(brewfs_meta_proto::v1::BatchStatRequest {
+                inos: vec![1, 999_999, dir_ino],
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .attrs;
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].ino, 1);
+        assert_eq!(batch[1].ino, 0);
+        assert_eq!(batch[2].ino, dir_ino);
     }
 }
