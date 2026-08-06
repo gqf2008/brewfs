@@ -109,6 +109,11 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      # brewfs-meta-proto's build.rs compiles the gRPC contract and needs
+      # protoc (Ubuntu jobs install protobuf-compiler; Windows gets it via choco).
+      - name: Install protoc
+        run: choco install protoc -y
+
       # WinFsp is NOT required to build: winfsp-sys ships a built-in import
       # library and the binary delay-loads winfsp-x64.dll at runtime.
       - name: Check formatting
