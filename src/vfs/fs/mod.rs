@@ -76,6 +76,7 @@ impl VfsBackgroundConfig {
         let compaction = CompactionWorkerConfig {
             scan_interval: compact_config.interval,
             max_chunks_per_run: compact_config.max_chunks_per_run,
+            max_concurrent_tasks: compact_config.max_concurrent_tasks,
             enabled,
         };
 
