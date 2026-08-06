@@ -3,6 +3,7 @@ use crate::chunk::{ChunkLayout, ChunkSpan, ChunkTag};
 pub(crate) mod cached_block_assembler;
 pub(crate) mod reader;
 pub(crate) mod writer;
+pub(crate) mod writer_policy;
 
 pub(crate) use reader::DataReader;
 pub(crate) use reader::FileReader;
