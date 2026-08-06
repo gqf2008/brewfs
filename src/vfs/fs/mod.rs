@@ -314,6 +314,10 @@ where
     statfs_cache: StdMutex<Option<StatFsCache>>,
     fallocate_statfs_cache: StdMutex<Option<FallocateStatFsCache>>,
     posix_lock_owners: DashMap<(i64, i64), ()>,
+    /// Per-inode count of registered POSIX lock owners. Lets the read path
+    /// check "does this inode hold locks" in O(1) instead of scanning the
+    /// whole `posix_lock_owners` map (which grows with every locked file).
+    posix_lock_inode_counts: DashMap<i64, usize>,
     fuse_lock_owners_by_handle: DashMap<(i64, u64, i64), ()>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
     memory_budget: Option<MemoryBudget>,
@@ -534,6 +538,7 @@ where
             statfs_cache: StdMutex::new(None),
             fallocate_statfs_cache: StdMutex::new(None),
             posix_lock_owners: DashMap::new(),
+            posix_lock_inode_counts: DashMap::new(),
             fuse_lock_owners_by_handle: DashMap::new(),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
             memory_budget,
@@ -4148,7 +4153,13 @@ where
         lock_type: FileLockType,
     ) {
         if lock_type != FileLockType::UnLock {
-            self.state.posix_lock_owners.insert((inode, owner), ());
+            match self.state.posix_lock_owners.entry((inode, owner)) {
+                Entry::Vacant(entry) => {
+                    entry.insert(());
+                    *self.state.posix_lock_inode_counts.entry(inode).or_insert(0) += 1;
+                }
+                Entry::Occupied(_) => {}
+            }
         }
     }
 
@@ -4196,7 +4207,14 @@ where
         let mut owners = Vec::with_capacity(keys.len());
         for key in keys {
             if self.state.fuse_lock_owners_by_handle.remove(&key).is_some() {
-                self.state.posix_lock_owners.remove(&(inode, key.2));
+                if self
+                    .state
+                    .posix_lock_owners
+                    .remove(&(inode, key.2))
+                    .is_some()
+                {
+                    Self::decrement_posix_lock_count(&self.state, inode);
+                }
                 owners.push(key.2);
             }
         }
@@ -4208,17 +4226,33 @@ where
     }
 
     pub(crate) fn take_posix_lock_owner(&self, inode: i64, owner: i64) -> bool {
-        self.state
+        let removed = self
+            .state
             .posix_lock_owners
             .remove(&(inode, owner))
-            .is_some()
+            .is_some();
+        if removed {
+            Self::decrement_posix_lock_count(&self.state, inode);
+        }
+        removed
     }
 
     pub(crate) fn has_posix_locks_for_inode(&self, inode: i64) -> bool {
         self.state
-            .posix_lock_owners
-            .iter()
-            .any(|entry| entry.key().0 == inode)
+            .posix_lock_inode_counts
+            .get(&inode)
+            .is_some_and(|count| *count > 0)
+    }
+
+    fn decrement_posix_lock_count(state: &VfsState<S, M>, inode: i64) {
+        if let Entry::Occupied(mut entry) = state.posix_lock_inode_counts.entry(inode) {
+            let count = *entry.get();
+            if count <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = count - 1;
+            }
+        }
     }
 
     /// Set xattr for a given inode.

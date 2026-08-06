@@ -3378,6 +3378,43 @@ mod truncate_flush_tests {
         assert!(!fs.has_fuse_lock_owners());
     }
 
+    #[tokio::test]
+    async fn test_posix_lock_owner_count_tracks_per_inode_locks() {
+        let fs = new_vfs().await;
+        let ino = 42;
+        let other_ino = 43;
+
+        assert!(!fs.has_posix_locks_for_inode(ino));
+        assert!(!fs.has_posix_locks_for_inode(other_ino));
+
+        // First registration creates the per-inode count.
+        fs.remember_posix_lock_owner(ino, 11, FileLockType::Write);
+        assert!(fs.has_posix_locks_for_inode(ino));
+
+        // Duplicate registration for the same (inode, owner) must not inflate
+        // the count, otherwise the inode would be considered locked forever.
+        fs.remember_posix_lock_owner(ino, 11, FileLockType::Write);
+        fs.remember_posix_lock_owner(ino, 11, FileLockType::Read);
+        assert!(fs.has_posix_locks_for_inode(ino));
+
+        // A second distinct owner keeps the inode locked after the first is
+        // taken; unlocking the last owner clears the fast path.
+        fs.remember_posix_lock_owner(ino, 12, FileLockType::Read);
+        assert!(fs.take_posix_lock_owner(ino, 11));
+        assert!(fs.has_posix_locks_for_inode(ino));
+        assert!(fs.take_posix_lock_owner(ino, 12));
+        assert!(!fs.has_posix_locks_for_inode(ino));
+
+        // Unlocking an unknown owner is a no-op and must not go negative.
+        assert!(!fs.take_posix_lock_owner(ino, 99));
+        assert!(!fs.has_posix_locks_for_inode(ino));
+
+        // Locks on one inode never affect another inode.
+        fs.remember_posix_lock_owner(other_ino, 13, FileLockType::Write);
+        assert!(!fs.has_posix_locks_for_inode(ino));
+        assert!(fs.has_posix_locks_for_inode(other_ino));
+    }
+
     /// Write a large amount of data, then immediately truncate to zero
     /// before any background flush can complete.  This is the worst case
     /// for the flush_required path — lots of dirty data to upload.
