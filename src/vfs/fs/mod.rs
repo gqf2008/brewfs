@@ -1552,6 +1552,35 @@ where
         Some(attr)
     }
 
+    /// Batch attribute lookup for multiple inodes (readdirplus fast path).
+    /// Uses the meta layer's batched fetch (Redis MGET / DB IN when the
+    /// backend supports it) and applies the same close-to-open size overlay
+    /// as [`Self::stat_ino`]. Falls back to per-inode `stat_ino` on error so
+    /// readdirplus stays best-effort.
+    #[tracing::instrument(level = "trace", skip(self, inos), fields(count = inos.len()))]
+    pub(crate) async fn stat_inos(&self, inos: &[i64]) -> Vec<Option<FileAttr>> {
+        match self.meta_layer().batch_stat(inos).await {
+            Ok(mut attrs) => {
+                for (attr, &ino) in attrs.iter_mut().zip(inos.iter()) {
+                    if let Some(attr) = attr
+                        && let Some(size) = self.inode_size_cached(ino)
+                    {
+                        attr.size = size;
+                    }
+                }
+                attrs
+            }
+            Err(err) => {
+                tracing::warn!(count = inos.len(), error = ?err, "batch_stat failed; falling back to per-inode stat_ino");
+                let mut attrs = Vec::with_capacity(inos.len());
+                for &ino in inos {
+                    attrs.push(self.stat_ino(ino).await);
+                }
+                attrs
+            }
+        }
+    }
+
     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
         if let Some(inode) = self.state.inodes.get(&attr.ino)
             && let Some(blocks) = inode.allocated_blocks_512()

@@ -1283,8 +1283,14 @@ where
             }
         };
 
+        // Batch-fetch child attributes in one request (Redis MGET / DB IN)
+        // instead of issuing one stat per entry, which dominates readdirplus
+        // latency for large directories.
+        let child_inos: Vec<i64> = entries.iter().map(|e| e.ino).collect();
+        let child_attrs = self.stat_inos(&child_inos).await;
+
         for (i, e) in entries.iter().enumerate() {
-            let Some(cattr) = self.stat_ino(e.ino).await else {
+            let Some(cattr) = child_attrs.get(i).and_then(Clone::clone) else {
                 continue;
             };
             let fattr = vfs_to_fuse_attr(&cattr, &req, self.blocks_for_attr(&cattr));

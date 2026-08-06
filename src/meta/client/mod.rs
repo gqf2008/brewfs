@@ -2147,6 +2147,45 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.cached_stat(ino).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self, inodes), fields(count = inodes.len()))]
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        let mut results: Vec<Option<FileAttr>> = Vec::with_capacity(inodes.len());
+        let mut misses: Vec<i64> = Vec::new();
+        let mut miss_indexes: Vec<usize> = Vec::new();
+
+        for (idx, &raw_ino) in inodes.iter().enumerate() {
+            let inode = self.check_root(raw_ino);
+            if let Some(attr) = self.inode_cache.get_attr(inode).await {
+                results.push(Some(attr));
+            } else {
+                results.push(None);
+                misses.push(inode);
+                miss_indexes.push(idx);
+            }
+        }
+
+        if !misses.is_empty() {
+            let attrs = self
+                .store
+                .batch_stat(&misses)
+                .instrument(tracing::trace_span!(
+                    "batch_stat.store",
+                    count = misses.len()
+                ))
+                .await?;
+            for (idx, attr) in miss_indexes.iter().zip(attrs.iter()) {
+                results[*idx] = attr.clone();
+            }
+            for (ino, attr) in misses.iter().zip(attrs.into_iter()) {
+                if let Some(attr) = attr {
+                    self.inode_cache.insert_node(*ino, attr, None).await;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
@@ -3539,6 +3578,32 @@ mod tests {
         assert_eq!(test_slices, second);
         let metrics = client.metrics().snapshot();
         assert_eq!(metrics.get_slices_cache_hit, 1);
+    }
+
+    #[tokio::test]
+    async fn test_meta_client_batch_stat_returns_attrs_in_order() {
+        let client = create_test_client().await;
+
+        let ino1 = client
+            .create_file(1, "batch_stat_1.txt".to_string())
+            .await
+            .unwrap();
+        let ino2 = client
+            .create_file(1, "batch_stat_2.txt".to_string())
+            .await
+            .unwrap();
+
+        // Missing inode must map to None while preserving input order.
+        let attrs = client.batch_stat(&[ino2, 999999, ino1]).await.unwrap();
+        assert_eq!(attrs.len(), 3);
+        assert!(attrs[0].as_ref().is_some_and(|a| a.ino == ino2));
+        assert!(attrs[1].is_none());
+        assert!(attrs[2].as_ref().is_some_and(|a| a.ino == ino1));
+
+        // Repeated call with warm cache returns the same order.
+        let attrs = client.batch_stat(&[ino1, ino2]).await.unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert!(attrs.iter().all(|a| a.is_some()));
     }
 
     #[tokio::test]
