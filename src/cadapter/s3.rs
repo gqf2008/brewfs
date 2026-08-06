@@ -8,6 +8,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::{Client, config::Region};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -678,6 +679,70 @@ impl ObjectBackend for S3Backend {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Batch delete via S3 `DeleteObjects` (up to 1000 keys per request).
+    /// Missing objects are treated as success (S3 semantics); per-key errors
+    /// returned by the server are surfaced as a single `Err` so the caller
+    /// can retry the whole batch.
+    #[tracing::instrument(level = "debug", skip(self, keys), fields(count = keys.len()))]
+    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        const S3_MAX_DELETE_KEYS: usize = 1000;
+
+        for chunk in keys.chunks(S3_MAX_DELETE_KEYS) {
+            let objects = chunk
+                .iter()
+                .map(|key| {
+                    ObjectIdentifier::builder()
+                        .key(key.clone())
+                        .build()
+                        .map_err(|e| anyhow!("invalid S3 delete key {key}: {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .map_err(|e| anyhow!("failed to build S3 DeleteObjects request: {e}"))?;
+
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.config.bucket)
+                    .delete(delete.clone())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let errors = resp.errors();
+                        if errors.is_empty() {
+                            break;
+                        }
+                        let detail = errors
+                            .iter()
+                            .map(|e| {
+                                format!(
+                                    "{}:{}",
+                                    e.key().unwrap_or("<unknown>"),
+                                    e.code().unwrap_or("<unknown>")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(anyhow!("S3 DeleteObjects partial failure: {detail}"));
+                    }
+                    Err(_e) if attempt < self.config.max_retries => {
+                        let delay = self.config.retry_base_delay * (1 << (attempt - 1));
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

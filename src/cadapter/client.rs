@@ -31,6 +31,17 @@ pub trait ObjectBackend: Send + Sync {
 
     #[allow(dead_code)]
     async fn delete_object(&self, key: &str) -> Result<()>;
+
+    /// Delete multiple objects. The default implementation falls back to
+    /// per-key [`Self::delete_object`]; backends with native batch delete
+    /// (S3 `DeleteObjects`) should override. A failed batch returns `Err` so
+    /// callers can retry; missing objects are not an error.
+    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        for key in keys {
+            self.delete_object(key).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -74,5 +85,10 @@ impl<B: ObjectBackend> ObjectClient<B> {
     #[allow(dead_code)]
     pub async fn delete_object(&self, key: &str) -> Result<()> {
         self.backend.delete_object(key).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        self.backend.delete_objects(keys).await
     }
 }

@@ -969,12 +969,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let (chunk_id, block_index) = key;
         let start = block_index;
         let end = start + block_count.as_u32();
-        for i in start..end {
-            let key_str = Self::key_for((chunk_id, i));
+        let keys: Vec<String> = (start..end).map(|i| Self::key_for((chunk_id, i))).collect();
+        if !keys.is_empty() {
             self.client
-                .delete_object(&key_str)
+                .delete_objects(&keys)
                 .await
-                .map_err(|e| anyhow::anyhow!("object store delete failed: {key_str}, {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("object store batch delete failed: {e:?}"))?;
+        }
+        for _ in 0..block_count {
             self.object_metrics.record_delete();
         }
         Ok(())
@@ -2692,6 +2694,130 @@ mod tests {
             0,
             "dropped background prefetch should not issue a full-object GET"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_range_uses_batch_delete_objects() -> anyhow::Result<()> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct BatchMockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            delete_batches: Arc<Mutex<Vec<Vec<String>>>>,
+            delete_object_calls: Arc<Mutex<u64>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for BatchMockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                let mut written = 0;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let start = offset as usize;
+                    let end = (start + buf.len()).min(data.len());
+                    if start < data.len() {
+                        let copy_len = end - start;
+                        buf[..copy_len].copy_from_slice(&data[start..end]);
+                        written = copy_len;
+                    }
+                }
+                Ok(written)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                *self.delete_object_calls.lock().unwrap() += 1;
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+
+            async fn delete_objects(&self, keys: &[String]) -> anyhow::Result<()> {
+                self.delete_batches.lock().unwrap().push(keys.to_vec());
+                let mut data = self.data.lock().unwrap();
+                for key in keys {
+                    data.remove(key);
+                }
+                Ok(())
+            }
+        }
+
+        let backend = BatchMockBackend::default();
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 64 * 1024,
+                page_size: 4 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let metrics = store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics");
+
+        for i in 0..3 {
+            backend
+                .data
+                .lock()
+                .unwrap()
+                .insert(format!("chunks/11/{i}"), vec![1u8; 1024]);
+        }
+
+        store.delete_range((11, 0), 3).await?;
+
+        let batches = backend.delete_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "delete_range should issue a single batch delete"
+        );
+        assert_eq!(
+            batches[0],
+            vec![
+                "chunks/11/0".to_string(),
+                "chunks/11/1".to_string(),
+                "chunks/11/2".to_string()
+            ]
+        );
+        assert_eq!(
+            *backend.delete_object_calls.lock().unwrap(),
+            0,
+            "batch-capable backend should not fall back to per-key delete"
+        );
+        assert!(
+            backend.data.lock().unwrap().is_empty(),
+            "batch delete should remove every key"
+        );
+        assert_eq!(metrics.snapshot().del_ops, 3);
 
         Ok(())
     }
