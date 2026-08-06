@@ -10,6 +10,7 @@ license = "MIT"
 [workspace]
 members = [
     "desktop",
+    "meta-proto",
     "tools/stats"
 ]
 
@@ -34,6 +35,7 @@ quote = "1.0"
 proc-macro2 = "1.0"
 asyncfuse = { version = "0.1.12", default-features = false }
 brewfs = { path = "." }
+brewfs-meta-proto = { path = "meta-proto" }
 libcgroups = { version = "0.5.7", default-features = false }
 libcontainer = "0.5.7"
 tonic-build = "=0.7.2"
@@ -301,6 +303,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-client = { workspace = true }
 rkyv = { workspace = true, optional = true, features = ["uuid-1"] }
 lz4_flex = { workspace = true }
+brewfs-meta-proto = { workspace = true }
 zstd = { workspace = true }
 governor = { workspace = true }
 

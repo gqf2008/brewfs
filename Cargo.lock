@@ -1576,6 +1576,7 @@ dependencies = [
  "axum 0.8.8",
  "base64 0.22.1",
  "bitflags 2.11.0",
+ "brewfs-meta-proto",
  "bytes",
  "chrono",
  "clap",
@@ -1630,6 +1631,17 @@ dependencies = [
  "uuid",
  "winfsp",
  "zstd",
+]
+
+[[package]]
+name = "brewfs-meta-proto"
+version = "0.1.0"
+dependencies = [
+ "prost 0.14.3",
+ "prost-types",
+ "tonic 0.14.4",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

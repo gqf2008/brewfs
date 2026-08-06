@@ -1,0 +1,408 @@
+// BrewFS 元数据服务 API 契约（v1）。
+//
+// 设计依据：doc/architecture/meta-service.md（gqf2008/brewfs#16）。
+// 服务边界：只暴露文件系统元数据语义，不暴露后端 key/schema。
+// 客户端保留缓存；本服务是语义来源 + 失效事件源。
+//
+// 版本化：package 固定为 brewfs.meta.v1；字段编号一经发布不得重用/删除。
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+package brewfs.meta.v1;
+
+// ---------------------------------------------------------------------------
+// 错误模型
+// ---------------------------------------------------------------------------
+
+// BrewFS 元数据错误码。RPC 层映射：成功返回对应响应；失败返回 gRPC status，
+// message 可读，details 携带 MetaErrorInfo（见下）。
+enum MetaErrorCode {
+  META_ERROR_CODE_UNSPECIFIED = 0;
+  NOT_FOUND = 1;               // ENOENT（含 ParentNotFound）
+  ALREADY_EXISTS = 2;          // EEXIST
+  NOT_DIRECTORY = 3;           // ENOTDIR
+  DIRECTORY_NOT_EMPTY = 4;     // ENOTEMPTY
+  INVALID_FILENAME = 5;        // EINVAL
+  FILENAME_TOO_LONG = 6;       // ENAMETOOLONG
+  INVALID_PATH = 7;            // EINVAL
+  NOT_SUPPORTED = 8;           // ENOTSUP（后端明确不支持）
+  NOT_IMPLEMENTED = 9;         // ENOTSUP（契约未实现）
+  LOCK_CONFLICT = 10;          // EAGAIN / EWOULDBLOCK
+  LOCK_NOT_FOUND = 11;         // ENOENT
+  DEADLOCK = 12;               // EDEADLK
+  INVALID_HANDLE = 13;         // ESTALE
+  PERMISSION_DENIED = 14;      // EACCES
+  READ_ONLY = 15;              // EROFS
+  IO_ERROR = 16;               // 透传 io::ErrorKind 语义（message 说明）
+  CONFLICT = 17;               // 版本冲突，客户端按 backoff 重试（ContinueRetry）
+  INTERNAL = 18;               // EIO
+  QUOTA_EXCEEDED = 19;         // EDQUOT
+  STORAGE_FULL = 20;           // ENOSPC
+  CROSS_DEVICE = 21;           // EXDEV
+  TOO_MANY_LINKS = 22;         // EMLINK
+  INVALID_INPUT = 23;          // EINVAL（通用）
+  RESOURCE_BUSY = 24;          // EBUSY
+  TIMED_OUT = 25;              // ETIMEDOUT
+}
+
+// gRPC status details 载体（可选）。
+message MetaErrorInfo {
+  MetaErrorCode code = 1;
+  string message = 2;
+  int64 ino = 3; // 相关 inode（可为 0）
+}
+
+// ---------------------------------------------------------------------------
+// 公共类型
+// ---------------------------------------------------------------------------
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  REGULAR = 1;
+  DIRECTORY = 2;
+  SYMLINK = 3;
+  FIFO = 4;
+  SOCKET = 5;
+  CHARACTER_DEVICE = 6;
+  BLOCK_DEVICE = 7;
+}
+
+message FileAttr {
+  int64 ino = 1;
+  uint64 size = 2;
+  uint64 blocks = 3;           // 512B 块数
+  int64 atime_ns = 4;
+  int64 mtime_ns = 5;
+  int64 ctime_ns = 6;
+  FileType kind = 7;
+  uint32 perm = 8;             // mode & 0o7777
+  uint32 nlink = 9;
+  uint32 uid = 10;
+  uint32 gid = 11;
+  uint32 rdev = 12;
+  uint32 blksize = 13;
+  int64 crtime_ns = 14;        // macOS 创建时间（0 = 不支持）
+}
+
+message DirEntry {
+  string name = 1;
+  int64 ino = 2;
+  FileType kind = 3;
+}
+
+message SliceDesc {
+  uint64 slice_id = 1;
+  uint64 chunk_id = 2;
+  uint64 offset = 3;
+  uint64 length = 4;
+}
+
+message StatFsSnapshot {
+  uint64 total_blocks = 1;
+  uint64 used_blocks = 2;
+  uint64 available_blocks = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint64 bsize = 6;
+  uint64 frsize = 7;
+  uint32 namelen = 8;
+}
+
+// open() 标志（透传 FUSE/libc 语义）。
+message OpenFlags {
+  bool read = 1;
+  bool write = 2;
+  bool append = 3;
+  bool truncate = 4;
+  bool create = 5;
+  bool exclusive = 6;
+  bool directory = 7;
+  bool nonblock = 8;
+  bool sync = 9;
+}
+
+// setattr 标志位（与 SetAttrFlags 对应）。
+message SetAttrFlags {
+  bool mode = 1;
+  bool uid = 2;
+  bool gid = 3;
+  bool size = 4;
+  bool atime = 5;
+  bool mtime = 6;
+  bool ctime = 7;
+  bool atime_now = 8;
+  bool mtime_now = 9;
+}
+
+message SetAttrRequest {
+  optional uint32 mode = 1;
+  optional uint32 uid = 2;
+  optional uint32 gid = 3;
+  optional uint64 size = 4;
+  optional int64 atime_ns = 5;
+  optional int64 mtime_ns = 6;
+}
+
+enum FileLockType {
+  FILE_LOCK_TYPE_UNSPECIFIED = 0;
+  SHARED = 1;   // F_RDLCK / LOCK_SH
+  EXCLUSIVE = 2; // F_WRLCK / LOCK_EX
+  UNLOCK = 3;   // F_UNLCK / LOCK_UN
+}
+
+message FileLockRange {
+  uint64 start = 1;
+  uint64 end = 2; // 开区间 [start, end)
+}
+
+message SessionInfo {
+  string hostname = 1;
+  string mount_point = 2;
+  string process_name = 3;
+  uint32 pid = 4;
+  int64 version = 5; // 协议版本
+}
+
+message WatchEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    INODE_INVALIDATE = 1;      // attr/namespace 失效
+    CHUNK_SLICES_INVALIDATE = 2; // slice 列表失效
+    INODE_REMOVED = 3;         // unlink/rmdir 后 inode 失效
+    SESSION_CHANGED = 4;       // 会话/锁变化（低优先级）
+  }
+  Kind kind = 1;
+  int64 seq = 2;               // 全局单调序号（断线重连用）
+  int64 ino = 3;
+  uint64 chunk_index = 4;      // CHUNK_SLICES_INVALIDATE 时有效
+  string path = 5;             // 最佳努力路径提示
+}
+
+// ---------------------------------------------------------------------------
+// 查询
+// ---------------------------------------------------------------------------
+
+message StatRequest { int64 ino = 1; }
+message StatResponse { FileAttr attr = 1; }
+
+message BatchStatRequest { repeated int64 inos = 1; }
+message BatchStatResponse { repeated FileAttr attrs = 1; } // 与请求顺序一致，缺项为 attr.ino=0
+
+message LookupRequest {
+  int64 parent = 1;
+  string name = 2;
+}
+message LookupResponse { int64 ino = 1; }
+message LookupWithAttrResponse {
+  int64 ino = 1;
+  FileAttr attr = 2;
+}
+
+message LookupPathRequest { string path = 1; }
+message LookupPathResponse {
+  int64 ino = 1;
+  FileType kind = 2;
+}
+
+message ReaddirRequest { int64 ino = 1; }
+message ReaddirResponse { repeated DirEntry entries = 1; }
+
+// ---------------------------------------------------------------------------
+// 变更
+// ---------------------------------------------------------------------------
+
+message MkdirRequest { int64 parent = 1; string name = 2; }
+message MkdirResponse { int64 ino = 1; }
+
+message RmdirRequest { int64 parent = 1; string name = 2; }
+
+message CreateFileRequest { int64 parent = 1; string name = 2; }
+message CreateFileResponse { int64 ino = 1; }
+
+message UnlinkRequest { int64 parent = 1; string name = 2; }
+
+message RenameRequest {
+  int64 old_parent = 1;
+  string old_name = 2;
+  int64 new_parent = 3;
+  string new_name = 4;
+  bool noreplace = 5;   // 不覆盖目标（对应 RENAME_NOREPLACE）
+  bool exchange = 6;    // 交换（对应 RENAME_EXCHANGE）
+}
+
+message LinkRequest {
+  int64 ino = 1;
+  int64 parent = 2;
+  string name = 3;
+}
+message LinkResponse { FileAttr attr = 1; }
+
+message SymlinkRequest { int64 parent = 1; string name = 2; string target = 3; }
+message SymlinkResponse { int64 ino = 1; }
+
+message ReadSymlinkRequest { int64 ino = 1; }
+message ReadSymlinkResponse { string target = 1; }
+
+message ChmodRequest { int64 ino = 1; uint32 mode = 2; }
+message ChmodResponse { FileAttr attr = 1; }
+
+message SetAttrRequestWrapper {
+  int64 ino = 1;
+  SetAttrRequest request = 2;
+  SetAttrFlags flags = 3;
+}
+message SetAttrResponse { FileAttr attr = 1; }
+
+message OpenRequest {
+  int64 ino = 1;
+  OpenFlags flags = 2;
+}
+message OpenResponse { FileAttr attr = 1; }
+
+message CloseRequest { int64 ino = 1; }
+
+message SetFileSizeRequest { int64 ino = 1; uint64 size = 2; }
+message TruncateRequest {
+  int64 ino = 1;
+  uint64 size = 2;
+  uint64 chunk_size = 3; // 布局 chunk 大小
+}
+
+// ---------------------------------------------------------------------------
+// slice 映射
+// ---------------------------------------------------------------------------
+
+message GetSlicesRequest {
+  uint64 chunk_id = 1;
+  int64 version = 2; // 客户端已知版本（0 = 不校验）；响应 version 变化时重取
+}
+message GetSlicesResponse {
+  int64 version = 1;
+  repeated SliceDesc slices = 2;
+}
+
+message ReadSlicesRequest {
+  int64 ino = 1;
+  uint32 chunk_index = 2;
+}
+message ReadSlicesResponse { repeated SliceDesc slices = 1; }
+
+message AppendSliceRequest {
+  uint64 chunk_id = 1;
+  SliceDesc slice = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 计数 / 统计
+// ---------------------------------------------------------------------------
+
+message NextIdRequest { string key = 1; }
+message NextIdResponse { int64 id = 1; }
+
+message GetCounterRequest { string name = 1; }
+message GetCounterResponse { int64 value = 1; }
+message IncrCounterRequest { string name = 1; int64 delta = 2; }
+message IncrCounterResponse { int64 value = 1; }
+
+message StatFsRequest {}
+message StatFsResponse { StatFsSnapshot snapshot = 1; }
+
+// ---------------------------------------------------------------------------
+// 锁
+// ---------------------------------------------------------------------------
+
+message GetFlockRequest { int64 ino = 1; int64 owner = 2; }
+message GetFlockResponse { FileLockType lock_type = 1; }
+message SetFlockRequest {
+  int64 ino = 1;
+  int64 owner = 2;
+  FileLockType lock_type = 3;
+}
+
+message GetPlockRequest {
+  int64 ino = 1;
+  int64 owner = 2;
+  FileLockRange range = 3;
+}
+message GetPlockResponse { FileLockType lock_type = 1; }
+message SetPlockRequest {
+  int64 ino = 1;
+  int64 owner = 2;
+  FileLockRange range = 3;
+  FileLockType lock_type = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 会话
+// ---------------------------------------------------------------------------
+
+message StartSessionRequest { SessionInfo info = 1; }
+message StartSessionResponse {
+  uint64 session_id = 1;
+  string volume = 2;
+}
+
+message ShutdownSessionRequest {}
+message CleanupSessionsRequest {}
+message CleanupSessionsResponse { uint64 removed = 1; }
+
+// ---------------------------------------------------------------------------
+// 服务定义
+// ---------------------------------------------------------------------------
+
+service MetaService {
+  // 查询
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc BatchStat(BatchStatRequest) returns (BatchStatResponse);
+  rpc Lookup(LookupRequest) returns (LookupResponse);
+  rpc LookupWithAttr(LookupRequest) returns (LookupWithAttrResponse);
+  rpc LookupPath(LookupPathRequest) returns (LookupPathResponse);
+  rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
+
+  // 变更
+  rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc Rmdir(RmdirRequest) returns (google.protobuf.Empty);
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc Unlink(UnlinkRequest) returns (google.protobuf.Empty);
+  rpc Rename(RenameRequest) returns (google.protobuf.Empty);
+  rpc Link(LinkRequest) returns (LinkResponse);
+  rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
+  rpc ReadSymlink(ReadSymlinkRequest) returns (ReadSymlinkResponse);
+  rpc Chmod(ChmodRequest) returns (ChmodResponse);
+  rpc SetAttr(SetAttrRequestWrapper) returns (SetAttrResponse);
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Close(CloseRequest) returns (google.protobuf.Empty);
+  rpc SetFileSize(SetFileSizeRequest) returns (google.protobuf.Empty);
+  rpc Truncate(TruncateRequest) returns (google.protobuf.Empty);
+
+  // slice 映射
+  rpc GetSlices(GetSlicesRequest) returns (GetSlicesResponse);
+  rpc ReadSlices(ReadSlicesRequest) returns (ReadSlicesResponse);
+  rpc AppendSlice(AppendSliceRequest) returns (google.protobuf.Empty);
+
+  // 计数 / 统计
+  rpc NextId(NextIdRequest) returns (NextIdResponse);
+  rpc GetCounter(GetCounterRequest) returns (GetCounterResponse);
+  rpc IncrCounter(IncrCounterRequest) returns (IncrCounterResponse);
+  rpc StatFs(StatFsRequest) returns (StatFsResponse);
+
+  // 锁
+  rpc GetFlock(GetFlockRequest) returns (GetFlockResponse);
+  rpc SetFlock(SetFlockRequest) returns (google.protobuf.Empty);
+  rpc GetPlock(GetPlockRequest) returns (GetPlockResponse);
+  rpc SetPlock(SetPlockRequest) returns (google.protobuf.Empty);
+
+  // 会话
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  rpc ShutdownSession(ShutdownSessionRequest) returns (google.protobuf.Empty);
+  rpc CleanupSessions(CleanupSessionsRequest) returns (CleanupSessionsResponse);
+}
+
+// 失效事件流：客户端保持订阅，断线后降级 TTL 并重连。
+service MetaWatch {
+  rpc WatchEvents(WatchEventsRequest) returns (stream WatchEvent);
+}
+message WatchEventsRequest {
+  int64 last_seq = 1; // 客户端已知最大 seq；0 = 从当前开始
+}
