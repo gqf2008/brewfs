@@ -44,6 +44,8 @@ enum MetaErrorCode {
   INVALID_INPUT = 23;          // EINVAL（通用）
   RESOURCE_BUSY = 24;          // EBUSY
   TIMED_OUT = 25;              // ETIMEDOUT
+  IS_DIRECTORY = 26;           // EISDIR
+  FILE_TOO_LARGE = 27;         // EFBIG
 }
 
 // gRPC status details 载体（可选）。

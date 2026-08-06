@@ -50,8 +50,13 @@ fn io_error_code(err: &std::io::Error) -> MetaErrorCode {
     match err.kind() {
         ErrorKind::NotFound => MetaErrorCode::NotFound,
         ErrorKind::AlreadyExists => MetaErrorCode::AlreadyExists,
+        ErrorKind::NotADirectory => MetaErrorCode::NotDirectory,
+        ErrorKind::IsADirectory => MetaErrorCode::IsDirectory,
+        ErrorKind::DirectoryNotEmpty => MetaErrorCode::DirectoryNotEmpty,
         ErrorKind::PermissionDenied => MetaErrorCode::PermissionDenied,
+        ErrorKind::ReadOnlyFilesystem => MetaErrorCode::ReadOnly,
         ErrorKind::WouldBlock => MetaErrorCode::LockConflict,
+        ErrorKind::FileTooLarge => MetaErrorCode::FileTooLarge,
         ErrorKind::TimedOut => MetaErrorCode::TimedOut,
         ErrorKind::StorageFull => MetaErrorCode::StorageFull,
         ErrorKind::QuotaExceeded => MetaErrorCode::QuotaExceeded,
@@ -197,6 +202,41 @@ mod tests {
                 "w"
             ))),
             MetaErrorCode::LockConflict
+        );
+        assert_eq!(
+            code(MetaError::Io(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "n"
+            ))),
+            MetaErrorCode::NotDirectory
+        );
+        assert_eq!(
+            code(MetaError::Io(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "i"
+            ))),
+            MetaErrorCode::IsDirectory
+        );
+        assert_eq!(
+            code(MetaError::Io(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                "r"
+            ))),
+            MetaErrorCode::ReadOnly
+        );
+        assert_eq!(
+            code(MetaError::Io(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                "d"
+            ))),
+            MetaErrorCode::DirectoryNotEmpty
+        );
+        assert_eq!(
+            code(MetaError::Io(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "f"
+            ))),
+            MetaErrorCode::FileTooLarge
         );
         assert_eq!(
             code(MetaError::Io(io::Error::new(
