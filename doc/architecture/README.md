@@ -9,6 +9,7 @@ changes runtime semantics rather than deployment or testing workflow.
 - [arch.md](arch.md): high-level architecture and component boundaries.
 - [meta.md](meta.md): metadata layer overview.
 - [metadata.md](metadata.md): metadata structures and behavior notes.
+- [meta-service.md](meta-service.md): standalone metadata service design (service boundary, API, cache, invalidation, HA, migration).
 - [chunk.md](chunk.md): chunk model and IDs.
 - [data-layout.md](data-layout.md): persisted data layout.
 

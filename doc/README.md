@@ -37,6 +37,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 |---|---|
 | System overview | [architecture/arch.md](architecture/arch.md) |
 | Metadata model | [architecture/meta.md](architecture/meta.md) and [architecture/metadata.md](architecture/metadata.md) |
+| Standalone metadata service | [architecture/meta-service.md](architecture/meta-service.md) |
 | Chunk and data layout | [architecture/chunk.md](architecture/chunk.md) and [architecture/data-layout.md](architecture/data-layout.md) |
 | Read path | [architecture/read-path.md](architecture/read-path.md) |
 | Write path | [architecture/write-path.md](architecture/write-path.md) |
