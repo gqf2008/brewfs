@@ -355,12 +355,12 @@ struct DiskStorage {
     /// Lazy min-heap of `(last_access, key)` used to pick eviction victims
     /// without scanning the cache directory. Entries may be stale (key
     /// re-accessed or removed); `evict_lru` validates lazily.
-    eviction_queue: Arc<
-        std::sync::Mutex<
-            std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>,
-        >,
-    >,
+    eviction_queue: Arc<EvictionQueue>,
 }
+
+/// Lazy min-heap of `(last_access, key)` used for disk-cache LRU eviction.
+type EvictionQueue =
+    std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>>;
 
 impl DiskStorage {
     pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
@@ -1005,10 +1005,11 @@ impl DiskStorage {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&tmp_prefix) && name.ends_with(".tmp") {
-                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
-                    trace!(key, path = %entry.path().display(), error = ?e, "failed to remove leftover tmp cache file");
-                }
+            if name.starts_with(&tmp_prefix)
+                && name.ends_with(".tmp")
+                && let Err(e) = tokio::fs::remove_file(entry.path()).await
+            {
+                trace!(key, path = %entry.path().display(), error = ?e, "failed to remove leftover tmp cache file");
             }
         }
 
