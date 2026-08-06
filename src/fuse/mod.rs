@@ -4,7 +4,6 @@
 //! to the operating system via the FUSE protocol.
 //!
 //! Main components:
-//! - `adapter`: Contains the FUSE adapter implementation.
 //! - `mount`: Handles mounting the virtual filesystem using FUSE.
 //! - Implementation of the `Filesystem` trait for `VFS`, enabling translation of FUSE requests
 //!   into virtual filesystem operations.
@@ -12,7 +11,6 @@
 //!
 //! The module also includes platform-specific tests for mounting and basic operations,
 //! and provides utilities for mapping VFS metadata to FUSE attributes.
-pub(crate) mod adapter;
 pub mod mount;
 use crate::chunk::store::BlockStore;
 use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};

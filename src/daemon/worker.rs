@@ -11,11 +11,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-#[allow(dead_code)]
-pub(crate) fn start_upload_workers() {
-    // TODO: implement upload worker pool
-}
-
 /// Configuration for object-level garbage collection.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

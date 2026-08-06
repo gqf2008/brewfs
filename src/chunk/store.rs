@@ -13,7 +13,6 @@ use crate::{
 use anyhow::{self, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::executor::block_on;
 use hex::encode;
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
@@ -382,31 +381,6 @@ impl BlockStoreConfig {
 
 impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     #[allow(dead_code)]
-    pub fn new(client: ObjectClient<B>) -> Self {
-        let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
-
-        let _ = fs::create_dir_all(cache_dir.clone());
-
-        let block_cache = block_on(ChunksCache::new_with_config(ChunksCacheConfig::default()))
-            .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))
-            .unwrap();
-        let config = BlockStoreConfig::default();
-        config.validate().expect("default config must be valid");
-        let page_cache = ReadPageCache::new(config.page_cache_capacity, config.page_size);
-        Self {
-            client: Arc::new(client),
-            block_cache,
-            page_cache,
-            page_flight: SingleFlight::new(),
-            read_flight: Arc::new(SingleFlight::new()),
-            range_prefetch_limit: Arc::new(Semaphore::new(8)),
-            config,
-            bandwidth: BandwidthLimiter::unlimited(),
-            object_metrics: Arc::new(ObjectStoreMetrics::default()),
-        }
-    }
-
-    #[allow(dead_code)]
     pub async fn new_async(client: ObjectClient<B>) -> anyhow::Result<Self> {
         Self::new_with_configs_async(
             client,
@@ -414,43 +388,6 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             BlockStoreConfig::default(),
         )
         .await
-    }
-
-    /// Creates a new ObjectBlockStore with custom cache configuration
-    #[allow(unused)]
-    pub fn new_with_config(
-        client: ObjectClient<B>,
-        cache_config: ChunksCacheConfig,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_configs(client, cache_config, BlockStoreConfig::default())
-    }
-
-    /// Creates a new ObjectBlockStore with custom cache and block store configurations
-    #[allow(unused)]
-    pub fn new_with_configs(
-        client: ObjectClient<B>,
-        cache_config: ChunksCacheConfig,
-        store_config: BlockStoreConfig,
-    ) -> anyhow::Result<Self> {
-        store_config.validate()?;
-        let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
-        let _ = fs::create_dir_all(cache_dir.clone());
-
-        let block_cache = block_on(ChunksCache::new_with_config(cache_config))
-            .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))?;
-        let page_cache =
-            ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
-        Ok(Self {
-            client: Arc::new(client),
-            block_cache,
-            page_cache,
-            page_flight: SingleFlight::new(),
-            read_flight: Arc::new(SingleFlight::new()),
-            range_prefetch_limit: Arc::new(Semaphore::new(8)),
-            config: store_config,
-            bandwidth: BandwidthLimiter::unlimited(),
-            object_metrics: Arc::new(ObjectStoreMetrics::default()),
-        })
     }
 
     pub async fn new_with_configs_async(
@@ -979,13 +916,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         for _ in 0..block_count {
             self.object_metrics.record_delete();
         }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn cache_block(&self, key: BlockKey, data: &[u8]) -> anyhow::Result<()> {
-        let key_str = Self::key_for(key);
-        let _ = self.block_cache.insert(&key_str, &data.to_vec()).await;
         Ok(())
     }
 
