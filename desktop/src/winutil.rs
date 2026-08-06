@@ -199,6 +199,12 @@ pub fn reap_child(pid: u32) {
     }
 }
 
+/// Windows has no Unix-style zombie children: an exited process's entry
+/// disappears from the process table once all its handles are closed, so
+/// there is nothing for the parent to reap. No-op.
+#[cfg(windows)]
+pub fn reap_child(_pid: u32) {}
+
 /// macOS: show/hide the Dock icon by switching the app activation policy
 /// (Regular=0 → Dock icon, Accessory=1 → menu-bar only). When making the
 /// Dock icon visible we also activate the app so a freshly shown window
