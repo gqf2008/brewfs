@@ -260,6 +260,40 @@ VFS ──► MetaLayer trait
 6. RPO=0 是否可承诺（后端即持久层）？`uncommitted slice` 恢复流程如何走服务端？
 7. 是否需要版本化契约（protobuf 向后兼容策略）？
 
+### 建议答案（作者草拟，供评审确认）
+
+1. **选主是否必须？单实例 + 后端 HA 能否满足第一版？**
+   第一阶段（#18/#19）不需要选主：单实例作为唯一写入者，配合后端自身 HA（Redis
+   Sentinel / TiKV / etcd / PostgreSQL 主从）即可满足；服务实例除可重建的内存缓存外
+   无本地状态，重启即恢复。选主留到阶段 C（#21）。
+
+2. **失效广播多一跳是否可接受？事件延迟目标？**
+   可接受且是净收益：直连模式下 Redis/TiKV/SQL 根本没有跨客户端失效（只有 etcd
+   watch），服务化首次提供统一失效。目标：变更提交成功 → 客户端缓存失效 ≤ 100ms
+   （局域网）；事件发送异步，不阻塞写路径。
+
+3. **变更请求是否全部经 leader？读请求能否走任意实例？**
+   阶段 C 选主后：变更必须经 leader（保持写序与失效序一致）；读请求可走任意实例
+   （后端强一致），强一致读（如 open fresh stat）可带 `require_consistent` 标志走
+   leader 或后端强一致读。v1 简化：变更经 leader，读默认任意实例 + 客户端 TTL 缓存。
+
+4. **batch_stat / readdir 批量语义是否进 v1？**
+   进 v1：`BatchStat`（Redis 已有 MGET 实现，metaperf 依赖）与 `Readdir`（单次返回
+   完整目录 + 客户端缓存/失效）。不做"一次 RPC 多个操作"的跨方法批量，保持错误处理简单。
+
+5. **客户端缓存 TTL 默认值是否沿用直连模式？**
+   沿用（inode TTL 与 `fuse_cache_ttl` 对齐，默认 1s 级别）。服务化后失效是事件驱动，
+   TTL 只作兜底；close-to-open 仍走 `StatFresh` 绕过缓存，因此 TTL 不改变强一致语义。
+
+6. **RPO=0 是否可承诺？uncommitted slice 恢复流程如何走服务端？**
+   可承诺：服务端无本地持久状态，所有元数据在后端事务中；RPO=0 由后端保证。
+   uncommitted slice 沿用现有机制（`record_uncommitted_slice` + GC 孤儿清理），
+   服务端暴露维护方法，客户端崩溃后由 GC 周期清理。
+
+7. **是否需要版本化契约？**
+   需要：`package brewfs.meta.v1`，遵循 protobuf 兼容规则（字段编号不重用/不删除、
+   枚举预留）；服务端/客户端版本不匹配时通过 version 握手显式失败，避免静默语义漂移。
+
 ## 10. 落地计划（issue 映射）
 
 | Issue | 内容 | 依赖 |
