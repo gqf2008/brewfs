@@ -2189,7 +2189,12 @@ impl ChunksCache {
     pub async fn insert_hot(&self, key: &str, data: bytes::Bytes) {
         let len = data.len() as u64;
         self.hot_cache.insert(key.to_owned(), data).await;
-        self.hot_cache.run_pending_tasks().await;
+        // moka runs maintenance (and thus eviction listeners) automatically
+        // on write ops (see base_cache::apply_reads_writes_if_needed), so
+        // forcing run_pending_tasks here would add a hot-path cost without
+        // changing eventual eviction-listener delivery. hot_bytes may lag
+        // slightly behind evictions until the next auto-maintenance batch;
+        // this is bounded and self-correcting.
         self.hot_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
@@ -2975,6 +2980,9 @@ mod tests {
         cache
             .insert_hot("hot-filler", bytes::Bytes::from(vec![1u8; 3 * 1024 * 1024]))
             .await;
+        // weighted_size() is approximate until moka maintenance runs; insert_hot
+        // no longer forces run_pending_tasks on the hot path (see insert_hot).
+        cache.hot_cache.run_pending_tasks().await;
         assert!(cache.hot_cache.weighted_size() > cache.config.max_hot_bytes * 700 / 1000);
 
         let key = "disk-hit-budget-key".to_string();
