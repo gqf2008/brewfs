@@ -5,3 +5,4 @@
 //! mapping between the internal `MetaError` domain and the wire error
 //! codes so server and client implementations share one translation.
 pub mod error;
+pub mod server;
