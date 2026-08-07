@@ -43,55 +43,6 @@ use super::writer_handle::*;
 use super::writer_policy::*;
 pub(crate) use super::writer_state::*;
 
-#[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SliceStatus {
-    /// Writable: slice is writable and there may be uploaded blocks.
-    #[default]
-    Writable,
-    /// Readonly: frozen, no more writes allowed.
-    Readonly,
-    /// Uploaded: data uploaded successfully.
-    Uploaded,
-    /// Failed: upload or metadata commit exhausted its retry budget.
-    Failed,
-    /// Committed: metadata committed.
-    Committed,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SliceFreezeReason {
-    SizeOrChunkEnd,
-    MaxUnflushed,
-    ExplicitFlush,
-    Auto,
-    CommitAgeSafety,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum AutoFreezeTrigger {
-    Age,
-    Idle,
-    Pressure,
-    TooMany,
-    BufferHigh,
-    FlushDuration,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum WriteOrigin {
-    Normal,
-    Cached,
-}
-
-impl WriteOrigin {
-    pub(crate) fn mask(self) -> u8 {
-        match self {
-            Self::Normal => 0b01,
-            Self::Cached => 0b10,
-        }
-    }
-}
-
 pub(crate) struct FileWriter<B, M> {
     shared: Arc<Shared<B, M>>,
 }

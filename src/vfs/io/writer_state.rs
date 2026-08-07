@@ -8,7 +8,6 @@ use crate::utils::UsageGuard;
 use crate::vfs::cache::page::CacheSlice;
 use crate::vfs::cache::page::WriteAction as PageWriteAction;
 use crate::vfs::config::WriteConfig;
-use crate::vfs::io::writer::{AutoFreezeTrigger, SliceFreezeReason, SliceStatus, WriteOrigin};
 use crate::vfs::io::writer_upload::WriteOriginKind;
 use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard};
 use parking_lot::Mutex as ParkingMutex;
@@ -17,6 +16,55 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Notify;
+
+#[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SliceStatus {
+    /// Writable: slice is writable and there may be uploaded blocks.
+    #[default]
+    Writable,
+    /// Readonly: frozen, no more writes allowed.
+    Readonly,
+    /// Uploaded: data uploaded successfully.
+    Uploaded,
+    /// Failed: upload or metadata commit exhausted its retry budget.
+    Failed,
+    /// Committed: metadata committed.
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SliceFreezeReason {
+    SizeOrChunkEnd,
+    MaxUnflushed,
+    ExplicitFlush,
+    Auto,
+    CommitAgeSafety,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AutoFreezeTrigger {
+    Age,
+    Idle,
+    Pressure,
+    TooMany,
+    BufferHigh,
+    FlushDuration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WriteOrigin {
+    Normal,
+    Cached,
+}
+
+impl WriteOrigin {
+    pub(crate) fn mask(self) -> u8 {
+        match self {
+            Self::Normal => 0b01,
+            Self::Cached => 0b10,
+        }
+    }
+}
 
 pub(crate) struct SliceState {
     pub(crate) state: SliceStatus,
