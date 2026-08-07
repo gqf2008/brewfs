@@ -930,7 +930,10 @@ mod tests {
             inode_ttl: Duration::from_secs(300),
             path_ttl: Duration::from_secs(300),
         };
-        let make_client = |endpoint: String| async move {
+        async fn make_client(
+            endpoint: String,
+            ttl: crate::meta::config::CacheTtl,
+        ) -> Arc<crate::meta::client::MetaClient<RpcMetaStore>> {
             let opts = MetaClientOptions {
                 watch_endpoint: Some(endpoint.clone()),
                 ..Default::default()
@@ -938,12 +941,12 @@ mod tests {
             crate::meta::client::MetaClient::with_options(
                 Arc::new(RpcMetaStore::connect(endpoint).await.unwrap()),
                 crate::meta::config::CacheCapacity::default(),
-                ttl.clone(),
+                ttl,
                 opts,
             )
-        };
-        let a = make_client(endpoint.clone()).await;
-        let b = make_client(endpoint.clone()).await;
+        }
+        let a = make_client(endpoint.clone(), ttl.clone()).await;
+        let b = make_client(endpoint.clone(), ttl.clone()).await;
         MetaLayer::initialize(&*a).await.unwrap();
         MetaLayer::initialize(&*b).await.unwrap();
 
