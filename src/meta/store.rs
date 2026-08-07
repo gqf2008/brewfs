@@ -414,6 +414,8 @@ pub struct LoadOption {
 pub enum LockName {
     CleanupSessionsLock,
     ChunkCompactLock(u64), // chunk_id
+    /// Leader lease for the standalone metadata service (#21).
+    MetaServiceLeader,
 }
 
 /// Default TTL for checking if chunk compact lock is held.
@@ -424,6 +426,7 @@ impl fmt::Display for LockName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LockName::CleanupSessionsLock => write!(f, "CleanupSessionsLock"),
+            LockName::MetaServiceLeader => write!(f, "MetaServiceLeader"),
             LockName::ChunkCompactLock(chunk_id) => write!(f, "ChunkCompactLock({})", chunk_id),
         }
     }

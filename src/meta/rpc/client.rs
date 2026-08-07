@@ -15,7 +15,6 @@
 use crate::chunk::SliceDesc;
 use crate::meta::client::session::SessionInfo;
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::rpc::server::MetaServiceImpl; // not used directly; keeps module linkage clear
 use crate::meta::store::{
     CreateEntryResult, DirEntry, FileAttr, FileType, MetaError, MetaStore, MetaStoreCapabilities,
     OpenFlags, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
@@ -25,7 +24,6 @@ use brewfs_meta_proto::v1::{
     self as proto, FileLockType as ProtoFileLockType, FileType as ProtoFileType,
     OpenFlags as ProtoOpenFlags, SetAttrFlags as ProtoSetAttrFlags,
 };
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
@@ -804,6 +802,7 @@ mod tests {
     use crate::meta::layer::MetaLayer;
     use crate::meta::rpc::server::MetaServiceImpl;
     use brewfs_meta_proto::v1::meta_service_server;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
 
