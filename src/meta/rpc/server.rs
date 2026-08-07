@@ -198,34 +198,32 @@ fn status(err: MetaError) -> Status {
     Status::new(code, err.to_string())
 }
 
-/// Map a wire error code to a gRPC status code. Wire codes deliberately
-/// mirror errno semantics; the mapping below keeps the common cases aligned
-/// with tonic's standard codes.
+/// Map a wire error code to a gRPC status code.
+///
+/// Wire codes deliberately mirror errno semantics (see the proto contract);
+/// the gRPC code is the transport-level classification a client can switch
+/// on without parsing the wire code from the status message.
 fn grpc_code(code: brewfs_meta_proto::v1::MetaErrorCode) -> tonic::Code {
     use brewfs_meta_proto::v1::MetaErrorCode as C;
     match code {
-        C::NotFound
-        | C::LockNotFound
-        | C::InvalidHandle
-        | C::InvalidFilename
+        C::NotFound | C::LockNotFound | C::InvalidHandle => tonic::Code::NotFound,
+        C::AlreadyExists => tonic::Code::AlreadyExists,
+        C::Conflict | C::LockConflict | C::Deadlock => tonic::Code::Aborted,
+        C::InvalidFilename
         | C::FilenameTooLong
         | C::InvalidPath
         | C::InvalidInput
         | C::IsDirectory
-        | C::FileTooLarge
+        | C::FileTooLarge => tonic::Code::InvalidArgument,
+        C::PermissionDenied | C::ReadOnly => tonic::Code::PermissionDenied,
+        C::NotSupported | C::NotImplemented => tonic::Code::Unimplemented,
+        C::NotDirectory
+        | C::DirectoryNotEmpty
         | C::TooManyLinks
         | C::CrossDevice
-        | C::QuotaExceeded
-        | C::StorageFull
-        | C::ReadOnly
-        | C::PermissionDenied
-        | C::ResourceBusy
-        | C::TimedOut => tonic::Code::FailedPrecondition,
-        C::AlreadyExists | C::Conflict => tonic::Code::Aborted,
-        C::NotDirectory | C::DirectoryNotEmpty | C::NotSupported | C::NotImplemented => {
-            tonic::Code::Unimplemented
-        }
-        C::LockConflict | C::Deadlock => tonic::Code::Aborted,
+        | C::ResourceBusy => tonic::Code::FailedPrecondition,
+        C::QuotaExceeded | C::StorageFull => tonic::Code::ResourceExhausted,
+        C::TimedOut => tonic::Code::DeadlineExceeded,
         C::IoError | C::Internal | C::Unspecified => tonic::Code::Internal,
     }
 }
@@ -877,11 +875,11 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(lookup_err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(lookup_err.code(), tonic::Code::NotFound);
 
         // stat of a never-existing inode maps to NotFound wire code
         let stat_err = client.stat(StatRequest { ino: 999_999 }).await.unwrap_err();
-        assert_eq!(stat_err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(stat_err.code(), tonic::Code::NotFound);
 
         // batch_stat preserves positional correspondence (missing -> ino=0)
         let batch = client
