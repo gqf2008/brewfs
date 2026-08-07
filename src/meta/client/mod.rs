@@ -107,6 +107,10 @@ pub struct MetaClientOptions {
     /// to readonly opens; close may seed the final attr for a later readonly
     /// open without allowing write opens to skip their fresh stat.
     pub open_file_cache: OpenFileCacheConfig,
+    /// When set, this client subscribes to a metadata service's invalidation
+    /// stream (`MetaWatch`) and applies cache invalidation on events. Only
+    /// meaningful when the underlying store is a gRPC `RpcMetaStore` (#20).
+    pub watch_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -287,6 +291,7 @@ impl Default for MetaClientOptions {
             max_symlinks: 40,
             batch_prefetch: BatchPrefetchConfig::default(),
             open_file_cache: OpenFileCacheConfig::default(),
+            watch_endpoint: None,
         }
     }
 }
@@ -456,8 +461,78 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             });
         }
 
+        // Subscribe to metadata service invalidation events when configured.
+        // The store itself may be a direct backend (no events) — the task then
+        // simply waits on a closed channel and exits.
+        if let Some(endpoint) = client.options.watch_endpoint.clone() {
+            if !client.options.no_background_jobs {
+                let client_clone = client.clone();
+                tokio::spawn(async move {
+                    client_clone.run_rpc_watch(endpoint).await;
+                });
+            }
+        }
+
         debug!("MetaClient::with_options complete");
         client
+    }
+
+    /// Connect to a metadata service `MetaWatch` stream and apply
+    /// invalidation events until the stream ends (e.g. service shutdown).
+    async fn run_rpc_watch(&self, endpoint: String) {
+        use brewfs_meta_proto::v1::meta_watch_client::MetaWatchClient;
+        use futures_util::StreamExt;
+
+        let Ok(mut client) = MetaWatchClient::connect(endpoint.clone()).await else {
+            warn!("MetaClient: cannot connect to watch endpoint {endpoint}");
+            return;
+        };
+        let Ok(mut stream) = client
+            .watch_events(brewfs_meta_proto::v1::WatchEventsRequest { last_seq: 0 })
+            .await
+            .map(|resp| resp.into_inner())
+        else {
+            warn!("MetaClient: watch stream setup failed for {endpoint}");
+            return;
+        };
+
+        // v1 keeps this simple: reconnect is the caller's responsibility and
+        // on reconnect the client rebuilds caches (safe fallback). A longer
+        // lived subscriber with seq-based replay lands in #21.
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => self.handle_watch_event(event).await,
+                Err(err) => {
+                    warn!(error = %err, "MetaClient: watch stream ended, caches fall back to TTL");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Apply a single metadata service invalidation event to local caches.
+    pub(crate) async fn handle_watch_event(&self, event: brewfs_meta_proto::v1::WatchEvent) {
+        use brewfs_meta_proto::v1::watch_event::Kind;
+        match Kind::try_from(event.kind) {
+            Ok(Kind::ChunkSlicesInvalidate) => {
+                if let Ok(chunk_id) = crate::vfs::chunk_id_for(event.ino, event.chunk_index) {
+                    self.invalidate_chunk_slices(chunk_id).await;
+                }
+            }
+            Ok(Kind::InodeRemoved) => {
+                self.inode_cache.invalidate_inode(event.ino).await;
+                self.invalidate_open_file_cache_inode(event.ino).await;
+                if !event.path.is_empty() {
+                    self.invalidate_parent_path(self.check_root(event.ino))
+                        .await;
+                }
+            }
+            Ok(Kind::InodeInvalidate) | Ok(Kind::SessionChanged) | Ok(Kind::Unspecified) => {
+                self.inode_cache.invalidate_inode(event.ino).await;
+                self.invalidate_open_file_cache_inode(event.ino).await;
+            }
+            Err(_) => {}
+        }
     }
 
     /// Returns the current root inode honoured by the client. This mirrors
