@@ -5,6 +5,7 @@ pub(crate) mod reader;
 pub(crate) mod writer;
 pub(crate) mod writer_accounting;
 pub(crate) mod writer_cached_write;
+pub(crate) mod writer_data;
 pub(crate) mod writer_handle;
 pub(crate) mod writer_policy;
 pub(crate) mod writer_state;
