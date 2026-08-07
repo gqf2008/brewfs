@@ -800,6 +800,7 @@ impl MetaStore for RpcMetaStore {
 mod tests {
     use super::*;
     use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::layer::MetaLayer;
     use crate::meta::rpc::server::MetaServiceImpl;
     use brewfs_meta_proto::v1::meta_service_server;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -905,13 +906,15 @@ mod tests {
         // Unwrap the Arc so method resolution uses MetaLayer directly instead
         // of hitting auto_impl's `MetaStore for Arc<T>` candidate (which would
         // require MetaClient<T>: MetaStore and fail its bounds).
-        let client = Arc::try_unwrap(crate::meta::client::MetaClient::with_options(
+        let client = match Arc::try_unwrap(crate::meta::client::MetaClient::with_options(
             Arc::new(rpc),
             crate::meta::config::CacheCapacity::default(),
             crate::meta::config::CacheTtl::default(),
             Default::default(),
-        ))
-        .unwrap();
+        )) {
+            Ok(client) => client,
+            Err(_) => panic!("unique Arc expected"),
+        };
         client.initialize().await.unwrap();
 
         let dir_ino = client.mkdir(1, "d".to_string()).await.unwrap();
