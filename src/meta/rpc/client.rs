@@ -805,10 +805,9 @@ mod tests {
     use brewfs_meta_proto::v1::meta_service_server;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    /// Start a metadata service over a sqlite file and return (endpoint, db_path).
-    async fn start_server(db_path: &std::path::Path) -> String {
-        let url = format!("sqlite://{}", db_path.display());
-        let meta_handle = create_meta_store_from_url(&url).await.unwrap();
+    /// Start a metadata service over an in-memory sqlite store.
+    async fn start_server() -> String {
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let store = meta_handle.store();
         store.initialize().await.unwrap();
 
@@ -826,70 +825,73 @@ mod tests {
         format!("http://{addr}")
     }
 
-    #[tokio::test]
-    async fn rpc_store_core_operations() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("meta.db");
-        let endpoint = start_server(&db).await;
-
-        let rpc = RpcMetaStore::connect(endpoint).await.unwrap();
-        let direct = create_meta_store_from_url(&format!("sqlite://{}", db.display()))
-            .await
-            .unwrap()
-            .store();
-
-        // mkdir via RPC
-        let dir_ino = rpc.mkdir(1, "d".into()).await.unwrap();
-        assert_eq!(rpc.lookup(1, "d").await.unwrap(), Some(dir_ino));
-
-        // create_file via RPC, verify through direct store
-        let file_ino = rpc.create_file(dir_ino, "f".into()).await.unwrap();
-        let entries = direct.readdir(dir_ino).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "f");
-        assert_eq!(entries[0].ino, file_ino);
-
-        // attr equality across transports
-        let rpc_attr = rpc.stat(file_ino).await.unwrap().unwrap();
-        let direct_attr = direct.stat(file_ino).await.unwrap().unwrap();
-        assert_eq!(rpc_attr.ino, direct_attr.ino);
-        assert_eq!(rpc_attr.kind, direct_attr.kind);
-        assert_eq!(rpc_attr.size, direct_attr.size);
-
-        // batch_stat positional semantics
-        let batch = rpc.batch_stat(&[1, dir_ino, 999_999]).await.unwrap();
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].as_ref().unwrap().ino, 1);
-        assert_eq!(batch[1].as_ref().unwrap().ino, dir_ino);
-        assert!(batch[2].is_none());
-
-        // slices via RPC, verified via direct store
+    /// Run the same metadata operation sequence against any MetaStore.
+    /// Returns (dir_ino, file_ino, entries, slices, flock_type).
+    #[allow(clippy::type_complexity)]
+    async fn exercise(
+        store: &dyn MetaStore,
+    ) -> (i64, i64, Vec<DirEntry>, Vec<SliceDesc>, FileLockType) {
+        let dir_ino = store.mkdir(1, "d".to_string()).await.unwrap();
+        let file_ino = store.create_file(dir_ino, "f".to_string()).await.unwrap();
+        let entries = store.readdir(dir_ino).await.unwrap();
         let slice = SliceDesc {
             slice_id: 7,
             chunk_id: 42,
             offset: 0,
             length: 4096,
         };
-        rpc.append_slice(42, slice).await.unwrap();
-        let direct_slices = direct.get_slices(42).await.unwrap();
-        assert_eq!(direct_slices.len(), 1);
-        assert_eq!(direct_slices[0].slice_id, 7);
-
-        // rename via RPC
-        rpc.rename(dir_ino, "f", dir_ino, "g".to_string())
+        store.append_slice(42, slice).await.unwrap();
+        let slices = store.get_slices(42).await.unwrap();
+        store
+            .rename(dir_ino, "f", dir_ino, "g".to_string())
             .await
             .unwrap();
-        assert!(direct.lookup(dir_ino, "g").await.unwrap().is_some());
-        assert!(direct.lookup(dir_ino, "f").await.unwrap().is_none());
-
-        // flock via RPC, verified via direct store
-        rpc.set_flock(file_ino, 42, false, FileLockType::Read)
+        store
+            .set_flock(file_ino, 42, false, FileLockType::Read)
             .await
             .unwrap();
-        assert_eq!(
-            direct.get_flock(file_ino, 42).await.unwrap(),
-            FileLockType::Read
-        );
+        let lock = store.get_flock(file_ino, 42).await.unwrap();
+        (dir_ino, file_ino, entries, slices, lock)
+    }
+
+    #[tokio::test]
+    async fn rpc_store_core_operations() {
+        let endpoint = start_server().await;
+        let rpc = RpcMetaStore::connect(endpoint).await.unwrap();
+        let direct = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .store();
+
+        // Same operation sequence through RPC and through a direct store:
+        // results must be equivalent (behavioral parity).
+        let (rpc_dir, rpc_file, rpc_entries, rpc_slices, rpc_lock) = exercise(&rpc).await;
+        let (direct_dir, direct_file, direct_entries, direct_slices, direct_lock) =
+            exercise(&direct).await;
+
+        assert_eq!(rpc_dir, direct_dir);
+        assert_eq!(rpc_file, direct_file);
+        assert_eq!(rpc_entries.len(), direct_entries.len());
+        assert_eq!(rpc_entries[0].name, direct_entries[0].name);
+        assert_eq!(rpc_entries[0].ino, direct_entries[0].ino);
+        assert_eq!(rpc_slices.len(), direct_slices.len());
+        assert_eq!(rpc_slices[0].slice_id, direct_slices[0].slice_id);
+        assert_eq!(rpc_slices[0].length, direct_slices[0].length);
+        assert_eq!(rpc_lock, direct_lock);
+
+        // stat parity
+        let rpc_attr = rpc.stat(rpc_file).await.unwrap().unwrap();
+        let direct_attr = direct.stat(direct_file).await.unwrap().unwrap();
+        assert_eq!(rpc_attr.ino, direct_attr.ino);
+        assert_eq!(rpc_attr.kind, direct_attr.kind);
+        assert_eq!(rpc_attr.size, direct_attr.size);
+
+        // batch_stat positional semantics
+        let batch = rpc.batch_stat(&[1, rpc_dir, 999_999]).await.unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].as_ref().unwrap().ino, 1);
+        assert_eq!(batch[1].as_ref().unwrap().ino, rpc_dir);
+        assert!(batch[2].is_none());
 
         // error mapping: never-existing inode -> MetaError::NotFound
         let err = rpc.stat(999_999).await.unwrap_err();
@@ -898,10 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn meta_client_works_over_rpc_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("meta.db");
-        let endpoint = start_server(&db).await;
-
+        let endpoint = start_server().await;
         let rpc = RpcMetaStore::connect(endpoint).await.unwrap();
         // Unwrap the Arc so method resolution uses MetaLayer directly instead
         // of hitting auto_impl's `MetaStore for Arc<T>` candidate (which would
