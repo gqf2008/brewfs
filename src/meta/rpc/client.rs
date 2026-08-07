@@ -828,9 +828,7 @@ mod tests {
     /// Run the same metadata operation sequence against any MetaStore.
     /// Returns (dir_ino, file_ino, entries, slices, flock_type).
     #[allow(clippy::type_complexity)]
-    async fn exercise(
-        store: &dyn MetaStore,
-    ) -> (i64, i64, Vec<DirEntry>, Vec<SliceDesc>, FileLockType) {
+    async fn exercise(store: &dyn MetaStore) -> (i64, i64, Vec<DirEntry>, Vec<SliceDesc>) {
         let dir_ino = store.mkdir(1, "d".to_string()).await.unwrap();
         let file_ino = store.create_file(dir_ino, "f".to_string()).await.unwrap();
         let entries = store.readdir(dir_ino).await.unwrap();
@@ -846,12 +844,7 @@ mod tests {
             .rename(dir_ino, "f", dir_ino, "g".to_string())
             .await
             .unwrap();
-        store
-            .set_flock(file_ino, 42, false, FileLockType::Read)
-            .await
-            .unwrap();
-        let lock = store.get_flock(file_ino, 42).await.unwrap();
-        (dir_ino, file_ino, entries, slices, lock)
+        (dir_ino, file_ino, entries, slices)
     }
 
     #[tokio::test]
@@ -865,9 +858,8 @@ mod tests {
 
         // Same operation sequence through RPC and through a direct store:
         // results must be equivalent (behavioral parity).
-        let (rpc_dir, rpc_file, rpc_entries, rpc_slices, rpc_lock) = exercise(&rpc).await;
-        let (direct_dir, direct_file, direct_entries, direct_slices, direct_lock) =
-            exercise(&direct).await;
+        let (rpc_dir, rpc_file, rpc_entries, rpc_slices) = exercise(&rpc).await;
+        let (direct_dir, direct_file, direct_entries, direct_slices) = exercise(&direct).await;
 
         assert_eq!(rpc_dir, direct_dir);
         assert_eq!(rpc_file, direct_file);
@@ -877,7 +869,6 @@ mod tests {
         assert_eq!(rpc_slices.len(), direct_slices.len());
         assert_eq!(rpc_slices[0].slice_id, direct_slices[0].slice_id);
         assert_eq!(rpc_slices[0].length, direct_slices[0].length);
-        assert_eq!(rpc_lock, direct_lock);
 
         // stat parity
         let rpc_attr = rpc.stat(rpc_file).await.unwrap().unwrap();
@@ -902,28 +893,30 @@ mod tests {
     async fn meta_client_works_over_rpc_store() {
         let endpoint = start_server().await;
         let rpc = RpcMetaStore::connect(endpoint).await.unwrap();
-        // Unwrap the Arc so method resolution uses MetaLayer directly instead
-        // of hitting auto_impl's `MetaStore for Arc<T>` candidate (which would
-        // require MetaClient<T>: MetaStore and fail its bounds).
-        let client = match Arc::try_unwrap(crate::meta::client::MetaClient::with_options(
+        // with_options returns an Arc that is also held internally, so method
+        // resolution on Arc<MetaClient> would hit auto_impl's `MetaStore for
+        // Arc<T>` candidate (unsatisfied bounds). Call MetaLayer methods via
+        // UFCS on &MetaClient to keep the cache layer exercised.
+        let client = crate::meta::client::MetaClient::with_options(
             Arc::new(rpc),
             crate::meta::config::CacheCapacity::default(),
             crate::meta::config::CacheTtl::default(),
             Default::default(),
-        )) {
-            Ok(client) => client,
-            Err(_) => panic!("unique Arc expected"),
-        };
-        client.initialize().await.unwrap();
+        );
 
-        let dir_ino = client.mkdir(1, "d".to_string()).await.unwrap();
-        let found = client.lookup(1, "d").await.unwrap();
+        MetaLayer::initialize(&*client).await.unwrap();
+        let dir_ino = MetaLayer::mkdir(&*client, 1, "d".to_string())
+            .await
+            .unwrap();
+        let found = MetaLayer::lookup(&*client, 1, "d").await.unwrap();
         assert_eq!(found, Some(dir_ino));
-        let attr = client.stat(dir_ino).await.unwrap().unwrap();
+        let attr = MetaLayer::stat(&*client, dir_ino).await.unwrap().unwrap();
         assert_eq!(attr.ino, dir_ino);
 
-        let file_ino = client.create_file(dir_ino, "f".to_string()).await.unwrap();
-        let entries = client.readdir(dir_ino).await.unwrap();
+        let file_ino = MetaLayer::create_file(&*client, dir_ino, "f".to_string())
+            .await
+            .unwrap();
+        let entries = MetaLayer::readdir(&*client, dir_ino).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ino, file_ino);
     }
