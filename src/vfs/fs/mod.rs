@@ -4183,10 +4183,15 @@ where
         lock_type: FileLockType,
     ) {
         if lock_type != FileLockType::UnLock {
+            // Bump the per-inode count BEFORE inserting the owner: a concurrent
+            // read path that observes the new owner only via the OLD O(n) scan
+            // must never see a zero count for a lock that is being registered.
+            // Ordering this way only ever over-reports (conservative sleep),
+            // never under-reports.
             match self.state.posix_lock_owners.entry((inode, owner)) {
                 Entry::Vacant(entry) => {
-                    entry.insert(());
                     *self.state.posix_lock_inode_counts.entry(inode).or_insert(0) += 1;
+                    entry.insert(());
                 }
                 Entry::Occupied(_) => {}
             }
