@@ -880,11 +880,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let svc = MetaServiceImpl::new(store);
         let handle = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(meta_service_server::MetaServiceServer::new(
-                    MetaServiceImpl::new(store),
-                ))
+                .add_service(meta_service_server::MetaServiceServer::new(svc.clone()))
+                .add_service(meta_watch_server::MetaWatchServer::new(svc))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
