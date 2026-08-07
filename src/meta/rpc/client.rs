@@ -902,12 +902,16 @@ mod tests {
         let endpoint = start_server(&db).await;
 
         let rpc = RpcMetaStore::connect(endpoint).await.unwrap();
-        let client = crate::meta::client::MetaClient::with_options(
+        // Unwrap the Arc so method resolution uses MetaLayer directly instead
+        // of hitting auto_impl's `MetaStore for Arc<T>` candidate (which would
+        // require MetaClient<T>: MetaStore and fail its bounds).
+        let client = Arc::try_unwrap(crate::meta::client::MetaClient::with_options(
             Arc::new(rpc),
             crate::meta::config::CacheCapacity::default(),
             crate::meta::config::CacheTtl::default(),
             Default::default(),
-        );
+        ))
+        .unwrap();
         client.initialize().await.unwrap();
 
         let dir_ino = client.mkdir(1, "d".to_string()).await.unwrap();
