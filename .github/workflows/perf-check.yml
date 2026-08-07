@@ -1,0 +1,45 @@
+name: perf-check
+
+on:
+  push:
+    branches: [codex/perf-ci]
+
+jobs:
+  writeback-perf:
+    name: Writeback focused perf
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config fuse3
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse || true
+          sudo chmod 666 /dev/fuse || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run focused writeback throughput profile
+        env:
+          PERF_LOG_TO_CONSOLE: "false"
+          PERF_FIO_SIZE: "512m"
+          PERF_FIO_RUNTIME: "20"
+        run: |
+          bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+            --writeback-throughput-profile \
+            --tools "fio-seqwrite fio-randwrite fio-randrw"
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-artifacts
+          path: docker/compose-xfstests/artifacts/
+          retention-days: 14
