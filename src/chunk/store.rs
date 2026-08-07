@@ -908,11 +908,16 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let end = start + block_count.as_u32();
         let keys: Vec<String> = (start..end).map(|i| Self::key_for((chunk_id, i))).collect();
         if !keys.is_empty() {
-            self.client
-                .delete_objects(&keys)
-                .await
-                .map_err(|e| anyhow::anyhow!("object store batch delete failed: {e:?}"))?;
+            self.client.delete_objects(&keys).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "object store batch delete failed for {} keys: {e:?}",
+                    keys.len()
+                )
+            })?;
         }
+        // del_ops is credited only after the whole batch succeeds; a partial
+        // failure returns Err above and the caller retries the batch, so
+        // counting per key here would over-report after retries.
         for _ in 0..block_count {
             self.object_metrics.record_delete();
         }
@@ -2748,6 +2753,136 @@ mod tests {
             "batch delete should remove every key"
         );
         assert_eq!(metrics.snapshot().del_ops, 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_range_propagates_partial_batch_failure_and_retries_idempotent()
+    -> anyhow::Result<()> {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct FlakyMockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            delete_calls: Arc<Mutex<u64>>,
+            fail_next: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for FlakyMockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                let mut written = 0;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let start = offset as usize;
+                    let end = (start + buf.len()).min(data.len());
+                    if start < data.len() {
+                        let copy_len = end - start;
+                        buf[..copy_len].copy_from_slice(&data[start..end]);
+                        written = copy_len;
+                    }
+                }
+                Ok(written)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+
+            async fn delete_objects(&self, keys: &[String]) -> anyhow::Result<()> {
+                *self.delete_calls.lock().unwrap() += 1;
+                let mut data = self.data.lock().unwrap();
+                for key in keys {
+                    data.remove(key);
+                }
+                drop(data);
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("simulated partial backend failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let backend = FlakyMockBackend::default();
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 64 * 1024,
+                page_size: 4 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let metrics = store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics");
+
+        for i in 0..3 {
+            backend
+                .data
+                .lock()
+                .unwrap()
+                .insert(format!("chunks/12/{i}"), vec![1u8; 1024]);
+        }
+
+        // First attempt: the backend applies the deletes but still reports a
+        // failure. delete_range must surface the Err and NOT credit del_ops.
+        backend.fail_next.store(true, Ordering::SeqCst);
+        let err = store.delete_range((12, 0), 3).await.unwrap_err();
+        assert!(
+            err.to_string().contains("batch delete failed"),
+            "delete_range should propagate the batch error: {err}"
+        );
+        assert!(
+            backend.data.lock().unwrap().is_empty(),
+            "backend applied the deletes before failing"
+        );
+        assert_eq!(
+            metrics.snapshot().del_ops,
+            0,
+            "del_ops must not be credited for a failed batch"
+        );
+
+        // Retry: deleting already-missing keys is idempotent and the batch
+        // succeeds, so del_ops is credited once.
+        store.delete_range((12, 0), 3).await?;
+        assert_eq!(
+            metrics.snapshot().del_ops,
+            3,
+            "successful retry should credit per-key delete metrics"
+        );
+        assert_eq!(*backend.delete_calls.lock().unwrap(), 2);
 
         Ok(())
     }

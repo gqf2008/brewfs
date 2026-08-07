@@ -228,7 +228,28 @@ write-tail regression in the A/B sample. Keep focus on the bottleneck reported
 by tools/perf: write buffer backpressure, auto-flush, and committed-but-not-
 uploaded drain behavior.
 
+## Accepted (2026-08, non-meta batch)
+
+Focused writeback profile on Linux CI (ubuntu, `run_redis_perf.sh --s3
+--writeback-throughput-profile --tools "fio-seqwrite fio-randwrite fio-randrw"`,
+artifact `perf-run-1786074081-14345`):
+
+- Disk-cache LRU eviction indexed in memory (access-index + lazy heap), replacing
+  host-atime + full-directory-scan; bounded queue with access-index snapshot
+  compaction; legacy fallback skips indexed keys.
+- `insert_hot` no longer forces `run_pending_tasks` per insert (criterion A/B:
+  -30% time / +43% throughput; moka auto-maintenance keeps listener delivery
+  bounded).
+- readdirplus batches child stats (MetaLayer::batch_stat, Redis MGET), chunked at
+  512 inodes; lock read path uses per-inode POSIX lock counts (O(1)); compaction
+  worker runs with bounded concurrency; S3 deletes use DeleteObjects.
+
+Result vs README baseline (BrewFS Redis): seqwrite 21s (21s), randwrite 23s
+(24s), randrw 20s (26s); zero warnings/timeouts; post-write drain leaves
+pending/dirty bytes at 0.
+
 ## Measurement
+
 
 Run benchmarks before/after each optimization:
 ```bash

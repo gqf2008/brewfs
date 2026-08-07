@@ -301,6 +301,9 @@ where
     // Bounded concurrency: chunks in one cycle are distinct, and the per-chunk
     // global lock already prevents two nodes (or two tasks) from compacting the
     // same chunk, so parallel processing only overlaps independent chunks.
+    // NOTE: the await inside this loop requires a multi-threaded runtime
+    // (current_thread would deadlock: the loop would block the only worker
+    // while spawned compaction tasks need it to run).
     let sem = Arc::new(tokio::sync::Semaphore::new(
         config.max_concurrent_tasks.max(1),
     ));

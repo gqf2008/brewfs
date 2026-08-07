@@ -1053,9 +1053,9 @@ fn bench_small_stats(c: &mut Criterion) {
     group.finish();
 }
 
-/// A/B harness for issue #11: measure `insert_hot` (which currently forces
-/// `hot_cache.run_pending_tasks()` after every insert) under eviction churn.
-/// Run with `--bench insert_hot` before and after the change to compare.
+/// A/B harness for issue #11: measure `insert_hot` without a forced
+/// `run_pending_tasks` on the hot path, under eviction churn. Run with
+/// `--bench insert_hot` to compare against a baseline build.
 fn bench_insert_hot(c: &mut Criterion) {
     let runtime = tokio_runtime(2);
     let mut group = c.benchmark_group("brewfs_insert_hot");
