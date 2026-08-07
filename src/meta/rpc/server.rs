@@ -401,6 +401,7 @@ where
             .mkdir(req.parent, req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
         self.emit_inode(ino, String::new());
         Ok(Response::new(proto::MkdirResponse { ino }))
     }
@@ -417,6 +418,8 @@ where
             .rmdir(req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
+        self.emit_inode(req.parent, String::new());
         self.emit_removed(ino.unwrap_or(0), req.name);
         Ok(Response::new(()))
     }
@@ -431,6 +434,7 @@ where
             .create_file(req.parent, req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
         self.emit_inode(ino, String::new());
         Ok(Response::new(proto::CreateFileResponse { ino }))
     }
@@ -447,6 +451,8 @@ where
             .unlink(req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
+        self.emit_inode(req.parent, String::new());
         self.emit_removed(ino.unwrap_or(0), req.name);
         Ok(Response::new(()))
     }
@@ -465,6 +471,8 @@ where
             .rename(req.old_parent, &req.old_name, req.new_parent, req.new_name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.old_parent, String::new());
+        self.emit_inode(req.new_parent, String::new());
         self.emit_removed(ino.unwrap_or(0), req.old_name.to_string());
         self.emit_inode(ino.unwrap_or(0), new_name);
         Ok(Response::new(()))
@@ -480,6 +488,7 @@ where
             .link(req.ino, req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
         self.emit_inode(attr.ino, String::new());
         Ok(Response::new(proto::LinkResponse {
             attr: Some(file_attr_to_proto(&attr)),
@@ -496,6 +505,7 @@ where
             .symlink(req.parent, &req.name, &req.target)
             .await
             .map_err(status)?;
+        self.emit_inode(req.parent, String::new());
         self.emit_inode(ino, String::new());
         Ok(Response::new(proto::SymlinkResponse { ino }))
     }
