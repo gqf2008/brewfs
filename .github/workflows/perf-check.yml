@@ -26,15 +26,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run focused writeback throughput profile
+      - name: Run full writeback throughput matrix
         env:
           PERF_LOG_TO_CONSOLE: "false"
           PERF_FIO_SIZE: "512m"
           PERF_FIO_RUNTIME: "20"
+          PERF_FIO_BIGREAD_REPEATS: "1"
         run: |
           bash docker/compose-xfstests/run_redis_perf.sh --s3 \
             --writeback-throughput-profile \
-            --tools "fio-seqwrite fio-randwrite fio-randrw"
+            --tools "fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio-bigread fio-bigwrite metaperf dirstress dirperf"
 
       - name: Upload perf artifacts
         if: always()
