@@ -2156,8 +2156,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         for (idx, &raw_ino) in inodes.iter().enumerate() {
             let inode = self.check_root(raw_ino);
             if let Some(attr) = self.inode_cache.get_attr(inode).await {
+                self.metrics.record_stat_cache_hit();
                 results.push(Some(attr));
             } else {
+                self.metrics.record_stat_cache_miss();
                 results.push(None);
                 misses.push(inode);
                 miss_indexes.push(idx);
@@ -2165,20 +2167,29 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         }
 
         if !misses.is_empty() {
-            let attrs = self
-                .store
-                .batch_stat(&misses)
-                .instrument(tracing::trace_span!(
-                    "batch_stat.store",
-                    count = misses.len()
-                ))
-                .await?;
-            for (idx, attr) in miss_indexes.iter().zip(attrs.iter()) {
-                results[*idx] = attr.clone();
-            }
-            for (ino, attr) in misses.iter().zip(attrs.into_iter()) {
-                if let Some(attr) = attr {
-                    self.inode_cache.insert_node(*ino, attr, None).await;
+            // Chunk the store call so very large directories do not build one
+            // oversized MGET/IN request; 512 inodes per call keeps memory and
+            // network spikes bounded while preserving input order.
+            const BATCH_STAT_CHUNK: usize = 512;
+            for (chunk_misses, chunk_indexes) in misses
+                .chunks(BATCH_STAT_CHUNK)
+                .zip(miss_indexes.chunks(BATCH_STAT_CHUNK))
+            {
+                let attrs = self
+                    .store
+                    .batch_stat(chunk_misses)
+                    .instrument(tracing::trace_span!(
+                        "batch_stat.store",
+                        count = chunk_misses.len()
+                    ))
+                    .await?;
+                for (idx, attr) in chunk_indexes.iter().zip(attrs.iter()) {
+                    results[*idx] = attr.clone();
+                }
+                for (ino, attr) in chunk_misses.iter().zip(attrs.into_iter()) {
+                    if let Some(attr) = attr {
+                        self.inode_cache.insert_node(*ino, attr, None).await;
+                    }
                 }
             }
         }
