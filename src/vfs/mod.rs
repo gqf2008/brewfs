@@ -25,6 +25,7 @@ pub mod sdk;
 pub mod stats;
 pub(crate) mod stats_snapshot;
 pub(crate) mod stats_timer;
+pub(crate) mod stats_writeback;
 pub(crate) use inode::Inode;
 
 const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
