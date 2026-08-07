@@ -57,7 +57,7 @@ where
         f(&guard)
     }
 
-    pub(crate) fn can_write(
+    fn can_write(
         &self,
         offset: u64,
         len: usize,
@@ -66,11 +66,11 @@ where
         self.with_ref(|s| s.can_write(offset, len, allow_gap_from))
     }
 
-    pub(crate) fn has_written_overlap(&self, offset: u64, len: usize) -> bool {
+    fn has_written_overlap(&self, offset: u64, len: usize) -> bool {
         self.with_ref(|s| s.write_range_has_written_overlap(offset, len))
     }
 
-    pub(crate) fn rejects_dispatched_prefix(&self, offset: u64, len: usize) -> bool {
+    fn rejects_dispatched_prefix(&self, offset: u64, len: usize) -> bool {
         self.with_ref(|s| {
             if !matches!(s.state, SliceStatus::Writable) || offset < s.offset {
                 return false;
@@ -88,11 +88,11 @@ where
         })
     }
 
-    pub(crate) fn can_freeze_for_max_unflushed(&self) -> bool {
+    fn can_freeze_for_max_unflushed(&self) -> bool {
         self.with_ref(|s| matches!(s.state, SliceStatus::Writable) && s.has_idle_block())
     }
 
-    pub(crate) fn try_write(
+    fn try_write(
         &self,
         offset: u64,
         buf: &[u8],
@@ -119,7 +119,7 @@ where
         self.freeze_with_reason_and_auto_trigger(SliceFreezeReason::Auto, Some(trigger))
     }
 
-    pub(crate) fn freeze_with_reason_and_auto_trigger(
+    fn freeze_with_reason_and_auto_trigger(
         &self,
         reason: SliceFreezeReason,
         auto_trigger: Option<AutoFreezeTrigger>,
@@ -217,7 +217,7 @@ where
     }
 
     /// Legacy advance_upload for backward compatibility with single-batch callers.
-    pub(crate) fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
+    fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
         let made_progress = self.with_mut(|s| {
             let previous_uploaded = s.uploaded;
             let previous_state = s.state;
@@ -250,7 +250,7 @@ where
         }
     }
 
-    pub(crate) fn clear_recent_pending_accounting(&self, s: &mut SliceState) {
+    fn clear_recent_pending_accounting(&self, s: &mut SliceState) {
         if !s.recent_pending_accounted {
             return;
         }
@@ -266,13 +266,13 @@ where
         self.shared.recent_pending_upload.notify.notify_waiters();
     }
 
-    pub(crate) fn clear_recent_pending_if_complete(&self, s: &mut SliceState) {
+    fn clear_recent_pending_if_complete(&self, s: &mut SliceState) {
         if s.upload_complete() {
             self.clear_recent_pending_accounting(s);
         }
     }
 
-    pub(crate) fn should_freeze(&self) -> bool {
+    fn should_freeze(&self) -> bool {
         self.with_ref(|s| {
             let ready_len = s.upload_ready_len();
             if ready_len < s.data.len() {
@@ -652,7 +652,7 @@ where
 {
     /// Find or create the next slice which can be written.
     /// A slice is append-only.
-    pub(crate) fn find_slice_or_create(
+    fn find_slice_or_create(
         &mut self,
         offset: u64,
         len: usize,
@@ -975,7 +975,7 @@ where
         }
     }
 
-    pub(crate) fn record_writeback_error(&self, err: String) {
+    fn record_writeback_error(&self, err: String) {
         let mut guard = self.writeback_error.lock();
         if guard.is_none() {
             *guard = Some(err);
@@ -1113,7 +1113,7 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    pub(crate) fn chunk_ids(&self) -> Vec<u64> {
+    fn chunk_ids(&self) -> Vec<u64> {
         self.chunks.keys().copied().collect()
     }
 

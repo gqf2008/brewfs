@@ -122,20 +122,20 @@ pub(crate) struct SliceState {
     pub(crate) recent_pending_accounted_bytes: u64,
     /// Bytes successfully persisted to the local writeback stage for this
     /// slice.
-    pub(crate) writeback_persisted_bytes: u64,
+    writeback_persisted_bytes: u64,
     /// True while a task is writing the recoverable local dirty record.
     pub(crate) writeback_record_sealing: bool,
     /// Commit-before-upload may publish metadata only after staged data covers
     /// the whole sealed slice and this recoverable dirty record is sealed.
     pub(crate) writeback_record_sealed: bool,
     pub(crate) data: CacheSlice,
-    pub(crate) usage: UsageGuard,
-    pub(crate) memory_usage: Option<MemoryUsageGuard>,
+    usage: UsageGuard,
+    memory_usage: Option<MemoryUsageGuard>,
     /// Error occurred at background thread.
     pub(crate) err: Option<String>,
     pub(crate) notify: Arc<Notify>,
     pub(crate) started: Instant,
-    pub(crate) last_mod: Instant,
+    last_mod: Instant,
     /// Inode data_epoch captured when this slice is frozen.
     /// If the inode epoch advances (truncate/setattr), stale commits are skipped.
     pub(crate) frozen_epoch: u64,
@@ -159,7 +159,7 @@ pub(crate) struct SliceState {
     /// prevent an older concurrent write from overwriting newer data.
     pub(crate) max_write_unique: u64,
     /// Bitmask of write paths that have successfully appended to this slice.
-    pub(crate) write_origin_mask: u8,
+    write_origin_mask: u8,
 }
 
 impl SliceState {
@@ -221,7 +221,7 @@ impl SliceState {
         self.writeback_persisted_bytes >= self.data.len()
     }
 
-    pub(crate) fn writeback_fully_persisted(&self) -> bool {
+    fn writeback_fully_persisted(&self) -> bool {
         self.writeback_data_fully_persisted() && self.writeback_record_sealed
     }
 
@@ -280,7 +280,7 @@ impl SliceState {
         }
     }
 
-    pub(crate) fn data_range(&self) -> Option<(u64, u64)> {
+    fn data_range(&self) -> Option<(u64, u64)> {
         let len = self.data.len();
         if len == 0 {
             return None;
@@ -289,7 +289,7 @@ impl SliceState {
         Some((self.offset, self.offset + len))
     }
 
-    pub(crate) fn can_coalesce_cached_writable(&self) -> bool {
+    fn can_coalesce_cached_writable(&self) -> bool {
         matches!(self.state, SliceStatus::Writable)
             && self.slice_id.is_none()
             && self.uploaded == 0
@@ -328,7 +328,7 @@ impl SliceState {
             .has_written_overlap(overlap_start - slice_start, overlap_end - overlap_start)
     }
 
-    pub(crate) fn can_overlay_read(&self) -> bool {
+    fn can_overlay_read(&self) -> bool {
         match self.state {
             SliceStatus::Writable
             | SliceStatus::Readonly
@@ -405,10 +405,10 @@ pub(crate) struct ChunkState {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CachedCoalesceCandidate {
-    pub(crate) index: usize,
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+struct CachedCoalesceCandidate {
+    index: usize,
+    start: u64,
+    end: u64,
 }
 
 impl ChunkState {
