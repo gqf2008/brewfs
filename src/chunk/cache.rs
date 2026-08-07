@@ -411,10 +411,22 @@ impl DiskStorage {
     fn record_access(&self, key: &str) {
         let now = std::time::Instant::now();
         self.access_index.insert(key.to_owned(), now);
-        self.eviction_queue
-            .lock()
-            .unwrap()
-            .push(std::cmp::Reverse((now, key.to_owned())));
+        let mut queue = self.eviction_queue.lock().unwrap();
+        queue.push(std::cmp::Reverse((now, key.to_owned())));
+        // Bound the queue: entries are only consumed by eviction, so caches that
+        // never exceed their budget would otherwise grow the heap forever.
+        // Rebuild the heap from the access-index snapshot, dropping stale
+        // entries (re-accessed keys appear once, removed keys disappear).
+        let live = self.access_index.len();
+        if queue.len() > live.saturating_mul(16).saturating_add(1024) {
+            let snapshot: Vec<_> = self
+                .access_index
+                .iter()
+                .map(|entry| std::cmp::Reverse((*entry.value(), entry.key().clone())))
+                .collect();
+            queue.clear();
+            queue.extend(snapshot);
+        }
     }
 
     /// Scan directory to calculate total size of cached files
@@ -619,50 +631,56 @@ impl DiskStorage {
             to_free as f64 / 1048576.0
         );
 
-        // Indexed path: pop candidates from the in-memory LRU queue (lazily
-        // validated against the access index), avoiding a full directory scan
-        // and sorting on every eviction.
+        // Indexed path: pop candidates one at a time from the in-memory LRU queue
+        // (lazily validated against the access index), avoiding a full directory
+        // scan and sorting on every eviction. Candidates are only popped once
+        // they are actually processed, so a small eviction never drains the
+        // queue: the remaining entries stay available for the next eviction.
         let mut freed = 0u64;
         let mut scanned = 0usize;
         loop {
-            let batch = {
+            let candidate = {
                 let mut queue = self.eviction_queue.lock().unwrap();
-                let mut out = Vec::with_capacity(1024);
-                while out.len() < 1024 {
-                    match queue.pop() {
-                        Some(std::cmp::Reverse((ts, key))) => out.push((ts, key)),
-                        None => break,
-                    }
-                }
-                out
+                queue.pop()
             };
-            if batch.is_empty() {
+            let Some(std::cmp::Reverse((ts, key))) = candidate else {
+                break;
+            };
+            scanned += 1;
+            // Lazy validation: skip if the key was re-accessed or removed since
+            // this queue entry was pushed.
+            let valid = match self.access_index.get(&key) {
+                Some(current) => *current == ts,
+                None => false,
+            };
+            if !valid {
+                continue;
+            }
+            let filepath = self.base_dir.join(Self::key_to_filename(&key));
+            let Ok(meta) = tokio::fs::metadata(&filepath).await else {
+                self.access_index.remove(&key);
+                continue;
+            };
+            // Re-check before deleting: a concurrent load may have re-accessed
+            // this key while we awaited metadata (TOCTOU). Prefer keeping a hot
+            // entry over freeing a few bytes.
+            let still_valid = match self.access_index.get(&key) {
+                Some(current) => *current == ts,
+                None => false,
+            };
+            if !still_valid {
+                continue;
+            }
+            if tokio::fs::remove_file(&filepath).await.is_ok() {
+                freed += meta.len();
+                self.saturating_fetch_sub_bytes(meta.len());
+                self.access_index.remove(&key);
+                trace!("Evicted cache file: {:?} ({} bytes)", filepath, meta.len());
+            }
+            if freed >= to_free {
                 break;
             }
-            for (ts, key) in batch {
-                scanned += 1;
-                // Lazy validation: skip if the key was re-accessed or removed
-                // since this queue entry was pushed.
-                match self.access_index.get(&key) {
-                    Some(current) if *current == ts => {}
-                    _ => continue,
-                }
-                let filepath = self.base_dir.join(Self::key_to_filename(&key));
-                let Ok(meta) = tokio::fs::metadata(&filepath).await else {
-                    self.access_index.remove(&key);
-                    continue;
-                };
-                if tokio::fs::remove_file(&filepath).await.is_ok() {
-                    freed += meta.len();
-                    self.saturating_fetch_sub_bytes(meta.len());
-                    self.access_index.remove(&key);
-                    trace!("Evicted cache file: {:?} ({} bytes)", filepath, meta.len());
-                }
-                if freed >= to_free {
-                    break;
-                }
-            }
-            if freed >= to_free || scanned >= 10_000 {
+            if scanned >= 10_000 {
                 break;
             }
         }
@@ -684,6 +702,12 @@ impl DiskStorage {
     /// host atime, same as the original implementation.
     /// Returns the number of bytes freed.
     async fn evict_lru_fallback(&self, needed_bytes: u64) -> u64 {
+        // Files owned by the indexed LRU path must never be evicted here.
+        let indexed: std::collections::HashSet<String> = self
+            .access_index
+            .iter()
+            .map(|entry| Self::key_to_filename(entry.key()))
+            .collect();
         // Collect files with their access times
         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
@@ -694,6 +718,14 @@ impl DiskStorage {
             if let Ok(meta) = entry.metadata().await
                 && meta.is_file()
             {
+                // Never evict entries still tracked by the in-memory access
+                // index: they are owned by the indexed LRU path. The fallback
+                // only handles legacy files that predate the index.
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy();
+                if indexed.contains(filename.as_ref()) {
+                    continue;
+                }
                 let atime = meta
                     .accessed()
                     .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -2291,7 +2323,9 @@ impl ChunksCache {
         // forcing run_pending_tasks here would add a hot-path cost without
         // changing eventual eviction-listener delivery. hot_bytes may lag
         // slightly behind evictions until the next auto-maintenance batch;
-        // this is bounded and self-correcting.
+        // this is bounded and self-correcting. hot_bytes is observability-only
+        // and must NOT be used for budget decisions (use weighted_size() after
+        // maintenance, or the moka eviction listener).
         self.hot_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
@@ -3023,6 +3057,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disk_eviction_small_eviction_does_not_drain_queue() {
+        let temp_dir = tempdir().unwrap();
+        // Budget large enough that 1200 x 1 KiB entries never trigger eviction
+        // while storing, so the LRU queue accumulates all of them.
+        let storage = DiskStorage::new(temp_dir.path(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data = vec![7u8; 1024];
+        for i in 0..1200 {
+            storage.store(&format!("k{i}"), &data).await.unwrap();
+        }
+        // Access the newest key so it is definitely not the victim.
+        let _ = storage.load("k1199").await.unwrap();
+        let queue_before = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            queue_before > 1100,
+            "queue should hold stored entries; got {queue_before}"
+        );
+
+        // Force an eviction that frees exactly one entry (to_free = 1 byte):
+        // target = max - needed = current - 1.
+        let current = storage.bytes_used();
+        storage.evict_lru(2 * 1024 * 1024 - current + 1).await;
+
+        let queue_after = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            queue_after > queue_before - 8,
+            "a small eviction must not drain the LRU queue (before={queue_before}, after={queue_after})"
+        );
+        assert!(
+            storage.load("k1199").await.is_ok(),
+            "recently accessed key must survive"
+        );
+        assert!(
+            storage.load("k0").await.is_err(),
+            "oldest indexed key should have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_eviction_queue_stays_bounded_under_repeated_access() {
+        let (storage, _temp_dir) = setup_test_storage().await;
+        // Simulate a hot cache that never exceeds its budget: record_access
+        // runs constantly but evict_lru never fires. The heap must stay
+        // bounded by the access-index snapshot compaction.
+        for _ in 0..200_000 {
+            storage.record_access("hot-key");
+        }
+        let len = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            len < 5000,
+            "eviction queue must stay bounded; observed len={len}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_disk_eviction_index_handles_removed_keys_lazily() {
         let temp_dir = tempdir().unwrap();
         let storage = DiskStorage::new(temp_dir.path(), 512 * 1024).await.unwrap();
@@ -3036,6 +3126,7 @@ mod tests {
         // Re-access k2 so its older queue entries become stale too.
         let _ = storage.load("k2").await.unwrap();
 
+        // remove("k1") already deducted 100 KiB from bytes_used, so
         // current = 200 KiB (k2+k3). evict_lru(320 KiB) sets target = 192 KiB,
         // so to_free = 8 KiB and exactly one entry must be evicted. k1's stale
         // entry and k2's stale entries are skipped lazily; k3 is now the
