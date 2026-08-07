@@ -1070,14 +1070,24 @@ mod tests {
             .await
             .unwrap();
 
-        let mut kinds = Vec::new();
-        while let Some(item) = stream.next().await {
-            let ev = item.unwrap();
-            kinds.push(Kind::try_from(ev.kind).unwrap());
-            if kinds.len() >= 3 {
-                break;
+        // Collect until both kinds appear (mkdir/create emit multiple events
+        // per call since parent dirs are invalidated too).
+        let collect = async {
+            let mut kinds = Vec::new();
+            while let Some(item) = stream.next().await {
+                let ev = item.unwrap();
+                kinds.push(Kind::try_from(ev.kind).unwrap());
+                if kinds.contains(&Kind::InodeInvalidate)
+                    && kinds.contains(&Kind::ChunkSlicesInvalidate)
+                {
+                    break;
+                }
             }
-        }
+            kinds
+        };
+        let kinds = tokio::time::timeout(Duration::from_secs(10), collect)
+            .await
+            .unwrap();
         assert!(kinds.contains(&Kind::InodeInvalidate));
         assert!(kinds.contains(&Kind::ChunkSlicesInvalidate));
     }
