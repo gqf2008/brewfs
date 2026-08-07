@@ -53,8 +53,8 @@ pub(crate) struct SliceState {
     /// the whole sealed slice and this recoverable dirty record is sealed.
     pub(crate) writeback_record_sealed: bool,
     pub(crate) data: CacheSlice,
-    pub(crate) usage: UsageGuard,
-    pub(crate) memory_usage: Option<MemoryUsageGuard>,
+    usage: UsageGuard,
+    memory_usage: Option<MemoryUsageGuard>,
     /// Error occurred at background thread.
     pub(crate) err: Option<String>,
     pub(crate) notify: Arc<Notify>,
