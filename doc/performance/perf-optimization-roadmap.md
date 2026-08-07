@@ -244,9 +244,27 @@ artifact `perf-run-1786074081-14345`):
   512 inodes; lock read path uses per-inode POSIX lock counts (O(1)); compaction
   worker runs with bounded concurrency; S3 deletes use DeleteObjects.
 
-Result vs README baseline (BrewFS Redis): seqwrite 21s (21s), randwrite 23s
-(24s), randrw 20s (26s); zero warnings/timeouts; post-write drain leaves
-pending/dirty bytes at 0.
+Full 10-tool matrix (CI artifact `perf-run-1786079901-195`, run
+31149492735) vs README baseline (BrewFS Redis):
+
+| tool | candidate | baseline |
+|---|---|---|
+| fio-seqread | 20 s | 20 s |
+| fio-seqwrite | 21 s | 21 s |
+| fio-randread | 21 s | 21 s |
+| fio-randwrite | 26 s | 24 s |
+| fio-randrw | 26 s | 26 s |
+| fio-bigread | 13 s | 31 s |
+| fio-bigwrite | 18 s | 21 s |
+| dirstress | 1 s | 1 s |
+| dirperf | 2 s | 17 s |
+| metaperf | 1 s (smoke) | 293 s (full) |
+
+fio-randrw (first-class gate) shows no regression; all other write/read
+tools are at or better than baseline except randwrite (+2s, within noise,
+focused profile measured 21-23s). Zero warnings/timeouts; post-write
+drain leaves pending/dirty bytes at 0 for every write tool. metaperf ran
+as a 200-op smoke in CI (not comparable to the full README run).
 
 ## Measurement
 
