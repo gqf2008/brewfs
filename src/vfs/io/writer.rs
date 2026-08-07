@@ -10,6 +10,7 @@
 //   While flushing, new writes are blocked via flush_waiting/write_waiting gates.
 
 use super::reader::DataReader;
+use super::writer_upload::*;
 use crate::chunk::writer::{DataUploader, UploadPriority};
 use crate::chunk::{BlockStore, SliceDesc};
 use crate::meta::backoff::backoff;
@@ -27,13 +28,11 @@ use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
 use crate::vfs::io::split_chunk_spans;
 use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard, PressureLevel};
-use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as FmtWrite;
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
@@ -49,51 +48,6 @@ static DEBUG_CACHED_WRITE_OFFSET: LazyLock<Option<u64>> = LazyLock::new(|| {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
 });
-
-struct UploadPlan {
-    chunk_id: u64,
-    data: Vec<(usize, Vec<Bytes>)>,
-    slice_id: Option<u64>,
-    uploaded: u64,
-    write_origin: WriteOriginKind,
-}
-
-async fn join_best_effort_persist<P, U, T>(
-    persist: Option<P>,
-    upload: U,
-) -> (Option<anyhow::Result<()>>, T)
-where
-    P: Future<Output = anyhow::Result<()>>,
-    U: Future<Output = T>,
-{
-    match persist {
-        Some(persist) => {
-            let (persist_result, upload_result) = tokio::join!(persist, upload);
-            (Some(persist_result), upload_result)
-        }
-        None => (None, upload.await),
-    }
-}
-
-async fn join_writeback_stage_then_upload<P, U, T>(persist: P, upload: U) -> (anyhow::Result<()>, T)
-where
-    P: Future<Output = anyhow::Result<()>>,
-    U: Future<Output = T>,
-{
-    let persist_result = persist.await;
-    let upload_result = upload.await;
-    (persist_result, upload_result)
-}
-
-fn should_stage_first_writeback_upload(
-    priority: UploadPriority,
-    has_persist: bool,
-    write_origin: WriteOriginKind,
-) -> bool {
-    has_persist
-        && matches!(priority, UploadPriority::Writeback)
-        && matches!(write_origin, WriteOriginKind::CachedOnly)
-}
 
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SliceStatus {
@@ -142,14 +96,6 @@ impl WriteOrigin {
             Self::Cached => 0b10,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteOriginKind {
-    Unknown,
-    NormalOnly,
-    CachedOnly,
-    Mixed,
 }
 
 pub(crate) struct SliceState {
@@ -5873,6 +5819,7 @@ mod tests {
     use crate::vfs::Inode;
     use crate::vfs::config::ReadConfig;
     use async_trait::async_trait;
+    use bytes::Bytes;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::time::{sleep, timeout};
 
