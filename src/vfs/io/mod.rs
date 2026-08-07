@@ -7,6 +7,7 @@ pub(crate) mod writer_accounting;
 pub(crate) mod writer_cached_write;
 pub(crate) mod writer_handle;
 pub(crate) mod writer_policy;
+pub(crate) mod writer_state;
 pub(crate) mod writer_upload;
 
 pub(crate) use reader::DataReader;
