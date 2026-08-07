@@ -670,7 +670,7 @@ impl DiskStorage {
         // Fallback for entries that predate the access index (e.g., files
         // written by an older process): full directory scan with atime sort.
         if freed < to_free {
-            self.evict_lru_fallback(to_free - freed).await;
+            freed += self.evict_lru_fallback(to_free - freed).await;
         }
         debug!(
             "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
@@ -682,12 +682,13 @@ impl DiskStorage {
     /// Legacy eviction path used only when the in-memory LRU index has no more
     /// candidates (pre-index cache files). Scans the directory and sorts by
     /// host atime, same as the original implementation.
-    async fn evict_lru_fallback(&self, needed_bytes: u64) {
+    /// Returns the number of bytes freed.
+    async fn evict_lru_fallback(&self, needed_bytes: u64) -> u64 {
         // Collect files with their access times
         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return 0,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Ok(meta) = entry.metadata().await
@@ -722,6 +723,7 @@ impl DiskStorage {
             freed,
             freed as f64 / 1048576.0
         );
+        freed
     }
 
     pub async fn load(&self, key: &str) -> anyhow::Result<bytes::Bytes> {
@@ -3028,16 +3030,21 @@ mod tests {
 
         storage.store("k1", &data).await.unwrap();
         storage.store("k2", &data).await.unwrap();
+        storage.store("k3", &data).await.unwrap();
         // Remove k1 explicitly; its stale queue entry must be skipped lazily.
         storage.remove("k1").await.unwrap();
+        // Re-access k2 so its older queue entries become stale too.
+        let _ = storage.load("k2").await.unwrap();
 
-        storage.evict_lru(300 * 1024).await;
+        // current = 200 KiB (k2+k3). evict_lru(320 KiB) sets target = 192 KiB,
+        // so to_free = 8 KiB and exactly one entry must be evicted. k1's stale
+        // entry and k2's stale entries are skipped lazily; k3 is now the
+        // oldest valid entry and is evicted, while re-accessed k2 survives.
+        storage.evict_lru(320 * 1024).await;
 
         assert!(storage.load("k1").await.is_err());
-        assert!(
-            storage.load("k2").await.is_ok(),
-            "lazy queue validation must skip removed k1 and evict nothing else"
-        );
+        assert!(storage.load("k2").await.is_ok());
+        assert!(storage.load("k3").await.is_err());
     }
 
     #[tokio::test]
