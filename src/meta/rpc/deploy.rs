@@ -151,7 +151,7 @@ mod tests {
     use crate::meta::store::MetaError;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    async fn spawn_test_server(token: Option<&str>) -> String {
+    async fn spawn_test_server(token: Option<String>) -> String {
         let meta_handle = crate::meta::factory::create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap();
@@ -165,10 +165,10 @@ mod tests {
             .set_service_status("brewfs.meta.v1.MetaService", ServingStatus::Serving)
             .await;
         tokio::spawn(async move {
-            let server = Server::builder();
+            let mut server = Server::builder();
             match token {
                 Some(token) => {
-                    let token: &'static str = Box::leak(token.to_string().into_boxed_str());
+                    let token: &'static str = Box::leak(token.into_boxed_str());
                     server
                         .add_service(
                             brewfs_meta_proto::v1::meta_service_server::MetaServiceServer::with_interceptor(
@@ -211,9 +211,12 @@ mod tests {
         assert!(rpc.lookup(1, "d").await.unwrap().is_some());
         assert_eq!(dir_ino, 2);
 
-        let mut health = tonic_health::pb::health_client::HealthClient::connect(endpoint)
+        let channel = tonic::transport::Channel::from_shared(endpoint.clone())
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
         let resp = health
             .check(tonic_health::pb::HealthCheckRequest {
                 service: "brewfs.meta.v1.MetaService".into(),
@@ -229,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn meta_serve_token_auth_enforced() {
-        let endpoint = spawn_test_server(Some("secret")).await;
+        let endpoint = spawn_test_server(Some("secret".to_string())).await;
 
         // Without token: unauthenticated (mapped to a generic RPC error).
         let rpc = RpcMetaStore::connect(endpoint.clone()).await.unwrap();
