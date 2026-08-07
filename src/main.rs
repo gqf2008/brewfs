@@ -99,6 +99,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Info(args) => info_cmd(args).await,
         Command::Unmount(args) => unmount_cmd(args).await,
         Command::Console(args) => console::serve_cmd(args).await,
+        Command::MetaServe(args) => {
+            crate::meta::rpc::deploy::meta_serve_cmd(crate::meta::rpc::deploy::MetaServeOptions {
+                meta_url: args.meta_url,
+                listen: args.listen,
+                token: args.token,
+                leader_ttl_secs: args.leader_ttl_secs,
+            })
+            .await
+        }
         Command::ObjectPutBench(args) => object_put_bench_cmd(args).await,
     };
     shutdown_flame();

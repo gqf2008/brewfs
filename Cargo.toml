@@ -306,6 +306,7 @@ lz4_flex = { workspace = true }
 brewfs-meta-proto = { workspace = true }
 tonic = { workspace = true, features = ["transport", "server", "channel", "codegen"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
+tonic-health = "0.14"
 zstd = { workspace = true }
 governor = { workspace = true }
 

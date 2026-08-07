@@ -67,6 +67,10 @@ pub enum Command {
     /// Run the BrewFS web console.
     Console(ConsoleArgs),
 
+    /// Run the standalone metadata service (gRPC) as an independent process.
+    #[command(name = "meta-serve")]
+    MetaServe(MetaServeArgs),
+
     /// Run a direct S3 object PUT benchmark without going through FUSE.
     #[command(hide = true)]
     ObjectPutBench(ObjectPutBenchArgs),
@@ -223,6 +227,29 @@ pub struct ConsoleArgs {
     /// Enable read-only Kubernetes CSI dashboard endpoints.
     #[arg(long, default_value_t = false)]
     pub enable_csi_dashboard: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MetaServeArgs {
+    /// Metadata backend URL (sqlite:///path, sqlite::memory:, redis://..., etcd://..., tikv://...).
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = "sqlite:///tmp/brewfs/meta-service.db"
+    )]
+    pub meta_url: String,
+
+    /// gRPC listen address, e.g. 127.0.0.1:7001 or [::1]:7001.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7001")]
+    pub listen: String,
+
+    /// Optional bearer token enforced by a gRPC interceptor (no TLS in v1).
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+
+    /// Leader lease TTL in seconds (uses the backend global lock).
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    pub leader_ttl_secs: u64,
 }
 
 #[derive(Args, Debug, Clone)]
