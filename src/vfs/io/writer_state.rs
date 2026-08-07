@@ -4,6 +4,19 @@
 //! state machine, chunk state and the cached-coalesce candidate helper. Pure
 //! code motion — no behavior changes.
 
+use crate::utils::UsageGuard;
+use crate::vfs::cache::page::CacheSlice;
+use crate::vfs::cache::page::WriteAction as PageWriteAction;
+use crate::vfs::config::WriteConfig;
+use crate::vfs::io::writer_upload::WriteOriginKind;
+use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard};
+use parking_lot::Mutex as ParkingMutex;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
+use tokio::sync::Notify;
+
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SliceStatus {
     /// Writable: slice is writable and there may be uploaded blocks.
@@ -52,19 +65,6 @@ impl WriteOrigin {
         }
     }
 }
-
-use crate::utils::UsageGuard;
-use crate::vfs::cache::page::CacheSlice;
-use crate::vfs::cache::page::WriteAction as PageWriteAction;
-use crate::vfs::config::WriteConfig;
-use crate::vfs::io::writer_upload::WriteOriginKind;
-use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard};
-use parking_lot::Mutex as ParkingMutex;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::time::Instant;
-use tokio::sync::Notify;
 
 pub(crate) struct SliceState {
     pub(crate) state: SliceStatus,
