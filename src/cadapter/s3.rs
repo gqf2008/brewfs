@@ -8,6 +8,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::{Client, config::Region};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -247,8 +248,59 @@ impl S3Backend {
         }
     }
 
-    /// Handle multipart upload for large objects
+    /// Handle multipart upload for large objects.
     async fn multipart_upload(&self, key: &str, data: &[u8]) -> Result<()> {
+        let mut parts: Vec<Vec<Bytes>> = Vec::new();
+        let mut idx = 0usize;
+        while idx < data.len() {
+            let end = (idx + self.config.part_size).min(data.len());
+            parts.push(vec![Bytes::copy_from_slice(&data[idx..end])]);
+            idx = end;
+        }
+        self.multipart_upload_parts(key, parts).await
+    }
+
+    /// Vectored multipart upload: coalesces `chunks` into part-sized groups
+    /// then delegates to the shared multipart pipeline.
+    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, parts))]
+    async fn multipart_upload_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
+        let mut parts: Vec<Vec<Bytes>> = Vec::new();
+        let mut cur_part: Vec<Bytes> = Vec::new();
+        let mut cur_len: usize = 0;
+
+        for chunk in chunks.into_iter() {
+            let mut offset = 0usize;
+            while offset < chunk.len() {
+                let remaining_part = self.config.part_size - cur_len;
+                let remaining_chunk = chunk.len() - offset;
+                let take = remaining_part.min(remaining_chunk);
+                cur_part.push(chunk.slice(offset..offset + take));
+                cur_len += take;
+                offset += take;
+
+                if cur_len == self.config.part_size {
+                    parts.push(std::mem::take(&mut cur_part));
+                    cur_len = 0;
+                }
+            }
+        }
+
+        if cur_len > 0 {
+            parts.push(cur_part);
+        }
+
+        self.multipart_upload_parts(key, parts).await
+    }
+
+    /// Shared multipart pipeline: create upload, upload `parts` concurrently
+    /// with bounded concurrency and per-part retries, then complete. Also used
+    /// by the single-buffer path, so validation, retry and cleanup live in one
+    /// place. `parts` must be non-empty and each part <= `part_size`.
+    async fn multipart_upload_parts(&self, key: &str, parts: Vec<Vec<Bytes>>) -> Result<()> {
+        if parts.is_empty() {
+            return Err(anyhow!("multipart upload requires at least one part"));
+        }
+
         // Create multipart upload
         let create = self
             .client
@@ -271,162 +323,8 @@ impl S3Backend {
             upload_id: upload_id.clone(),
         };
 
-        let data_arc = Arc::new(data.to_vec());
         let sem = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrency));
-
-        // Concurrent upload of parts
-        let mut parts = Vec::new();
-        let total = data.len();
-        let mut idx = 0usize;
-        let mut part_number = 1i32;
-
-        while idx < total {
-            let end = (idx + self.config.part_size).min(total);
-            let chunk_vec = data_arc.as_slice()[idx..end].to_vec();
-            let client = self.client.clone();
-            let bucket = self.config.bucket.clone();
-            let key = key.to_string();
-            let upload_id_cloned = upload_id.clone();
-            let pn = part_number;
-            let sem_cloned = sem.clone();
-            let enable_md5 = self.config.enable_md5;
-            let max_retries = self.config.max_retries;
-            let retry_base_delay = self.config.retry_base_delay;
-            let disable_payload_checksum = self.config.disable_payload_checksum;
-
-            let fut = async move {
-                // Concurrency control
-                let _permit = sem_cloned
-                    .acquire_owned()
-                    .await
-                    .with_context(|| "Multipart upload semaphore closed unexpectedly");
-                let mut attempt = 0;
-
-                loop {
-                    attempt += 1;
-                    let mut request = client
-                        .upload_part()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .upload_id(&upload_id_cloned)
-                        .part_number(pn)
-                        .body(SdkBody::from(chunk_vec.clone()).into());
-
-                    if enable_md5 {
-                        let part_md5 = Self::md5_base64(&chunk_vec);
-                        request = request.content_md5(part_md5);
-                    }
-
-                    let result = if disable_payload_checksum {
-                        request.customize().disable_payload_signing().send().await
-                    } else {
-                        request.send().await
-                    };
-
-                    match result {
-                        Ok(ok) => break Ok((pn, ok.e_tag().map(|s| s.to_string()))),
-                        Err(_e) if attempt < max_retries => {
-                            let delay = retry_base_delay * (1 << (attempt - 1));
-                            sleep(Duration::from_millis(delay)).await;
-                            continue;
-                        }
-                        Err(e) => break Err(e),
-                    }
-                }
-            };
-            parts.push(fut);
-
-            idx = end;
-            part_number += 1;
-        }
-
-        // Execute all parts concurrently
-        let results: Vec<(i32, Option<String>)> = match futures::future::try_join_all(parts).await {
-            Ok(v) => v,
-            Err(e) => return Err(e.into()),
-        };
-
-        // Build completed parts
-        let completed_parts = results
-            .into_iter()
-            .map(|(pn, etag)| {
-                aws_sdk_s3::types::CompletedPart::builder()
-                    .part_number(pn)
-                    .set_e_tag(etag)
-                    .build()
-            })
-            .collect::<Vec<_>>();
-
-        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
-
-        // Complete multipart upload
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.config.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await?;
-
-        // Disarm cleanup guard since upload succeeded
-        std::mem::forget(cleanup_on_drop);
-
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, parts))]
-    async fn multipart_upload_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
-        let create = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.config.bucket)
-            .key(key)
-            .send()
-            .await?;
-
-        let upload_id = create
-            .upload_id()
-            .ok_or_else(|| anyhow!("Missing upload_id in create_multipart_upload response"))?
-            .to_string();
-
-        let cleanup_on_drop = MultipartCleanupGuard {
-            client: self.client.clone(),
-            bucket: self.config.bucket.clone(),
-            key: key.to_string(),
-            upload_id: upload_id.clone(),
-        };
-
-        let mut parts: Vec<Vec<Bytes>> = Vec::new();
-        let mut cur_part: Vec<Bytes> = Vec::new();
-        let mut cur_len: usize = 0;
-
-        for chunk in chunks.into_iter() {
-            let mut offset = 0usize;
-            while offset < chunk.len() {
-                let remaining_part = self.config.part_size - cur_len;
-                let remaining_chunk = chunk.len() - offset;
-                let take = remaining_part.min(remaining_chunk);
-                cur_part.push(chunk.slice(offset..offset + take));
-                cur_len += take;
-                offset += take;
-
-                if cur_len == self.config.part_size {
-                    parts.push(cur_part);
-                    cur_part = Vec::new();
-                    cur_len = 0;
-                }
-            }
-        }
-
-        if cur_len > 0 {
-            parts.push(cur_part);
-        }
-
-        let sem = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrency));
-        let mut futures = Vec::new();
+        let mut futures = Vec::with_capacity(parts.len());
 
         for (idx, part_chunks) in parts.into_iter().enumerate() {
             let part_len = part_chunks.iter().map(|c| c.len()).sum::<usize>();
@@ -447,7 +345,10 @@ impl S3Backend {
             let disable_payload_checksum = self.config.disable_payload_checksum;
 
             let fut = async move {
-                let _permit = sem_cloned.acquire_owned().await;
+                let _permit = sem_cloned
+                    .acquire_owned()
+                    .await
+                    .with_context(|| "Multipart upload semaphore closed unexpectedly");
                 let mut attempt = 0;
 
                 loop {
@@ -486,12 +387,14 @@ impl S3Backend {
             futures.push(fut);
         }
 
+        // Execute all parts concurrently
         let results: Vec<(i32, Option<String>)> = match futures::future::try_join_all(futures).await
         {
             Ok(v) => v,
             Err(e) => return Err(e.into()),
         };
 
+        // Build completed parts
         let completed_parts = results
             .into_iter()
             .map(|(pn, etag)| {
@@ -506,6 +409,7 @@ impl S3Backend {
             .set_parts(Some(completed_parts))
             .build();
 
+        // Complete multipart upload
         self.client
             .complete_multipart_upload()
             .bucket(&self.config.bucket)
@@ -515,7 +419,9 @@ impl S3Backend {
             .send()
             .await?;
 
+        // Disarm cleanup guard since upload succeeded
         std::mem::forget(cleanup_on_drop);
+
         Ok(())
     }
 }
@@ -678,6 +584,70 @@ impl ObjectBackend for S3Backend {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Batch delete via S3 `DeleteObjects` (up to 1000 keys per request).
+    /// Missing objects are treated as success (S3 semantics); per-key errors
+    /// returned by the server are surfaced as a single `Err` so the caller
+    /// can retry the whole batch.
+    #[tracing::instrument(level = "debug", skip(self, keys), fields(count = keys.len()))]
+    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        const S3_MAX_DELETE_KEYS: usize = 1000;
+
+        for chunk in keys.chunks(S3_MAX_DELETE_KEYS) {
+            let objects = chunk
+                .iter()
+                .map(|key| {
+                    ObjectIdentifier::builder()
+                        .key(key.clone())
+                        .build()
+                        .map_err(|e| anyhow!("invalid S3 delete key {key}: {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .map_err(|e| anyhow!("failed to build S3 DeleteObjects request: {e}"))?;
+
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.config.bucket)
+                    .delete(delete.clone())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let errors = resp.errors();
+                        if errors.is_empty() {
+                            break;
+                        }
+                        let detail = errors
+                            .iter()
+                            .map(|e| {
+                                format!(
+                                    "{}:{}",
+                                    e.key().unwrap_or("<unknown>"),
+                                    e.code().unwrap_or("<unknown>")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(anyhow!("S3 DeleteObjects partial failure: {detail}"));
+                    }
+                    Err(_e) if attempt < self.config.max_retries => {
+                        let delay = self.config.retry_base_delay * (1 << (attempt - 1));
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

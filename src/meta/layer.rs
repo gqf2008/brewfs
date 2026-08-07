@@ -45,6 +45,19 @@ pub trait MetaLayer: Send + Sync {
     // ---------- Core path operations ----------
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
 
+    /// Batch query attributes for multiple inodes. Returns attributes in the
+    /// same order as the input, with `None` for inodes that do not exist.
+    /// The default implementation falls back to sequential `stat`; layered
+    /// clients with caches and backends with native batch support should
+    /// override this (Redis `MGET`, database `IN`).
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        let mut out = Vec::with_capacity(inodes.len());
+        for &ino in inodes {
+            out.push(self.stat(ino).await?);
+        }
+        Ok(out)
+    }
+
     /// Do `stat` but bypass the inode cache.
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
 

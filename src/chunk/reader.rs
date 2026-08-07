@@ -217,31 +217,6 @@ where
         Ok(buf)
     }
 
-    /// Zero-copy variant: fill `buf` directly from the block store without
-    /// an intermediate allocation.  Used on the hot read path.
-    #[tracing::instrument(
-        name = "DataFetcher.read_at_into",
-        level = "trace",
-        skip(self, buf),
-        fields(chunk_id = self.id, offset = offset.0, len = buf.len())
-    )]
-    #[allow(dead_code)]
-    pub(crate) async fn read_at_into(&mut self, offset: ChunkOffset, buf: &mut [u8]) -> Result<()> {
-        ensure!(
-            self.prepared,
-            "DataFetcher::read_at_into requires prepare_slices() to run first"
-        );
-        Self::read_at_into_from_slices(
-            self.layout,
-            self.id,
-            self.backend,
-            &self.slices,
-            offset,
-            buf,
-        )
-        .await
-    }
-
     pub(crate) async fn read_at_into_from_slices(
         layout: ChunkLayout,
         chunk_id: u64,
@@ -467,7 +442,16 @@ mod tests {
         let mut out = vec![0xff; layout.block_size as usize];
         let mut r = DataFetcher::new(layout, 7, backend.as_ref());
         r.prepare_slices().await.unwrap();
-        r.read_at_into(off.into(), &mut out).await.unwrap();
+        DataFetcher::read_at_into_from_slices(
+            layout,
+            7,
+            backend.as_ref(),
+            &r.slices,
+            off.into(),
+            &mut out,
+        )
+        .await
+        .unwrap();
 
         assert!(
             out[..(layout.block_size / 2) as usize]

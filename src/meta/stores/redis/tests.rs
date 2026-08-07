@@ -2471,6 +2471,58 @@ async fn test_meta_client_new_directory_negative_lookup_stays_local() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_meta_client_batch_stat_batches_misses_with_mget() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    let mut inos = Vec::new();
+    for idx in 0..4 {
+        // Create via the store directly so the MetaClient inode cache stays
+        // cold; then invalidate the store node cache so the batch actually
+        // reaches Redis instead of being served from the store cache.
+        let ino = store
+            .create_file(root, format!("batch_stat_{idx}.txt"))
+            .await
+            .unwrap();
+        inos.push(ino);
+        store.node_cache.invalidate(&ino).await;
+    }
+
+    reset_redis_commandstats(&store).await;
+    let attrs = client.batch_stat(&inos).await.unwrap();
+    assert_eq!(attrs.len(), 4);
+    assert!(
+        attrs.iter().all(|a| a.is_some()),
+        "all created inodes should resolve"
+    );
+    assert_eq!(
+        redis_command_calls(&store, "mget").await,
+        1,
+        "client batch_stat should fetch all cold misses with one Redis MGET"
+    );
+
+    // Warm cache: the second batch must not touch Redis.
+    reset_redis_commandstats(&store).await;
+    let attrs2 = client.batch_stat(&inos).await.unwrap();
+    assert!(attrs2.iter().all(|a| a.is_some()));
+    assert_eq!(
+        redis_command_calls(&store, "mget").await,
+        0,
+        "fully cached batch_stat should be served from memory"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_lookup_with_attr_returns_inode_attr_and_warms_node_cache() {
     let store = new_test_store().await;
     let root = store.root_ino();

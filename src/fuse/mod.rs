@@ -4,7 +4,6 @@
 //! to the operating system via the FUSE protocol.
 //!
 //! Main components:
-//! - `adapter`: Contains the FUSE adapter implementation.
 //! - `mount`: Handles mounting the virtual filesystem using FUSE.
 //! - Implementation of the `Filesystem` trait for `VFS`, enabling translation of FUSE requests
 //!   into virtual filesystem operations.
@@ -12,7 +11,6 @@
 //!
 //! The module also includes platform-specific tests for mounting and basic operations,
 //! and provides utilities for mapping VFS metadata to FUSE attributes.
-pub(crate) mod adapter;
 pub mod mount;
 use crate::chunk::store::BlockStore;
 use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};
@@ -1283,8 +1281,14 @@ where
             }
         };
 
+        // Batch-fetch child attributes in one request (Redis MGET / DB IN)
+        // instead of issuing one stat per entry, which dominates readdirplus
+        // latency for large directories.
+        let child_inos: Vec<i64> = entries.iter().map(|e| e.ino).collect();
+        let child_attrs = self.stat_inos(&child_inos).await;
+
         for (i, e) in entries.iter().enumerate() {
-            let Some(cattr) = self.stat_ino(e.ino).await else {
+            let Some(cattr) = child_attrs.get(i).and_then(Clone::clone) else {
                 continue;
             };
             let fattr = vfs_to_fuse_attr(&cattr, &req, self.blocks_for_attr(&cattr));
@@ -3761,7 +3765,7 @@ mod fuse_init_tests {
             Request::default(),
             1,
             OsStr::new("pipe"),
-            libc::S_IFIFO | 0o644,
+            (libc::S_IFIFO as u32) | 0o644,
             0,
         )
         .await
@@ -3784,7 +3788,7 @@ mod fuse_init_tests {
             Request::default(),
             1,
             OsStr::new("tty"),
-            libc::S_IFCHR | 0o600,
+            (libc::S_IFCHR as u32) | 0o600,
             0x0103,
         )
         .await

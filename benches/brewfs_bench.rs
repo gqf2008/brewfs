@@ -21,6 +21,7 @@ use brewfs::{
     DatabaseMetaStore, DatabaseType, EtcdMetaStore, LocalFsBackend, MetaClient, MetaStore,
     MetaStoreFactory, ObjectBlockStore, ObjectClient, RedisMetaStore, S3Backend, S3Config,
     TiKvMetaStore, VFS,
+    chunk::cache::{ChunksCache, ChunksCacheConfig},
 };
 
 const MB: usize = 1024 * 1024;
@@ -1052,6 +1053,46 @@ fn bench_small_stats(c: &mut Criterion) {
     group.finish();
 }
 
+/// A/B harness for issue #11: measure `insert_hot` without a forced
+/// `run_pending_tasks` on the hot path, under eviction churn. Run with
+/// `--bench insert_hot` to compare against a baseline build.
+fn bench_insert_hot(c: &mut Criterion) {
+    let runtime = tokio_runtime(2);
+    let mut group = c.benchmark_group("brewfs_insert_hot");
+    group.sample_size(30);
+    group.throughput(Throughput::Elements(1000));
+
+    let make_cache = || {
+        let dir = tempfile::tempdir().unwrap();
+        runtime
+            .block_on(ChunksCache::new_with_config(
+                ChunksCacheConfig::with_budgets(
+                    256 * 1024, // small hot tier forces constant eviction churn
+                    16 * 1024 * 1024,
+                    dir.path().to_path_buf(),
+                ),
+            ))
+            .unwrap()
+    };
+
+    group.bench_function("insert_hot", |b| {
+        b.iter_custom(|iters| {
+            let cache = make_cache();
+            let key = "hot-bench-key".to_string();
+            let data = Bytes::from(vec![1u8; 4096]);
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                runtime.block_on(cache.insert_hot(&key, data.clone()));
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
 fn build_criterion() -> Criterion {
     let cfg = BenchConfig::from_env();
     let mut crit = Criterion::default().configure_from_args();
@@ -1065,6 +1106,6 @@ fn build_criterion() -> Criterion {
 criterion_group! {
     name = brewfs_benches;
     config = build_criterion();
-    targets = bench_big_files, bench_small_files, bench_small_stats, bench_object_direct
+    targets = bench_big_files, bench_small_files, bench_small_stats, bench_object_direct, bench_insert_hot
 }
 criterion_main!(brewfs_benches);

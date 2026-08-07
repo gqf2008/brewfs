@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 //! Unix-only: uses qlean QEMU VM orchestration (vsock) which is not available on Windows.
 use std::path::{Path, PathBuf};
 use std::sync::Once;

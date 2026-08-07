@@ -348,7 +348,19 @@ struct DiskStorage {
     /// Semaphore for write/store operations
     write_sem: Arc<Semaphore>,
     integrity_mode: CacheIntegrityMode,
+    /// In-memory last-access index for disk cache entries. Replaces host atime,
+    /// which reads intentionally never update (updating atime would add
+    /// metadata syscalls to every block hit and distort LRU ordering).
+    access_index: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// Lazy min-heap of `(last_access, key)` used to pick eviction victims
+    /// without scanning the cache directory. Entries may be stale (key
+    /// re-accessed or removed); `evict_lru` validates lazily.
+    eviction_queue: Arc<EvictionQueue>,
 }
+
+/// Lazy min-heap of `(last_access, key)` used for disk-cache LRU eviction.
+type EvictionQueue =
+    std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>>;
 
 impl DiskStorage {
     pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
@@ -389,7 +401,32 @@ impl DiskStorage {
             read_sem: Arc::new(Semaphore::new(DISK_CACHE_READ_CONCURRENCY)),
             write_sem: Arc::new(Semaphore::new(DISK_CACHE_WRITE_CONCURRENCY)),
             integrity_mode,
+            access_index: Arc::new(dashmap::DashMap::new()),
+            eviction_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
         })
+    }
+
+    /// Record a cache access (or store) so LRU eviction can pick victims from
+    /// the in-memory index instead of scanning the directory / trusting atime.
+    fn record_access(&self, key: &str) {
+        let now = std::time::Instant::now();
+        self.access_index.insert(key.to_owned(), now);
+        let mut queue = self.eviction_queue.lock().unwrap();
+        queue.push(std::cmp::Reverse((now, key.to_owned())));
+        // Bound the queue: entries are only consumed by eviction, so caches that
+        // never exceed their budget would otherwise grow the heap forever.
+        // Rebuild the heap from the access-index snapshot, dropping stale
+        // entries (re-accessed keys appear once, removed keys disappear).
+        let live = self.access_index.len();
+        if queue.len() > live.saturating_mul(16).saturating_add(1024) {
+            let snapshot: Vec<_> = self
+                .access_index
+                .iter()
+                .map(|entry| std::cmp::Reverse((*entry.value(), entry.key().clone())))
+                .collect();
+            queue.clear();
+            queue.extend(snapshot);
+        }
     }
 
     /// Scan directory to calculate total size of cached files
@@ -558,6 +595,7 @@ impl DiskStorage {
             return Err(e);
         }
 
+        self.record_access(key);
         Ok(())
     }
 
@@ -593,16 +631,101 @@ impl DiskStorage {
             to_free as f64 / 1048576.0
         );
 
+        // Indexed path: pop candidates one at a time from the in-memory LRU queue
+        // (lazily validated against the access index), avoiding a full directory
+        // scan and sorting on every eviction. Candidates are only popped once
+        // they are actually processed, so a small eviction never drains the
+        // queue: the remaining entries stay available for the next eviction.
+        let mut freed = 0u64;
+        let mut scanned = 0usize;
+        loop {
+            let candidate = {
+                let mut queue = self.eviction_queue.lock().unwrap();
+                queue.pop()
+            };
+            let Some(std::cmp::Reverse((ts, key))) = candidate else {
+                break;
+            };
+            scanned += 1;
+            // Lazy validation: skip if the key was re-accessed or removed since
+            // this queue entry was pushed.
+            let valid = match self.access_index.get(&key) {
+                Some(current) => *current == ts,
+                None => false,
+            };
+            if !valid {
+                continue;
+            }
+            let filepath = self.base_dir.join(Self::key_to_filename(&key));
+            let Ok(meta) = tokio::fs::metadata(&filepath).await else {
+                self.access_index.remove(&key);
+                continue;
+            };
+            // Re-check before deleting: a concurrent load may have re-accessed
+            // this key while we awaited metadata (TOCTOU). Prefer keeping a hot
+            // entry over freeing a few bytes.
+            let still_valid = match self.access_index.get(&key) {
+                Some(current) => *current == ts,
+                None => false,
+            };
+            if !still_valid {
+                continue;
+            }
+            if tokio::fs::remove_file(&filepath).await.is_ok() {
+                freed += meta.len();
+                self.saturating_fetch_sub_bytes(meta.len());
+                self.access_index.remove(&key);
+                trace!("Evicted cache file: {:?} ({} bytes)", filepath, meta.len());
+            }
+            if freed >= to_free {
+                break;
+            }
+            if scanned >= 10_000 {
+                break;
+            }
+        }
+
+        // Fallback for entries that predate the access index (e.g., files
+        // written by an older process): full directory scan with atime sort.
+        if freed < to_free {
+            freed += self.evict_lru_fallback(to_free - freed).await;
+        }
+        debug!(
+            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
+            freed,
+            freed as f64 / 1048576.0
+        );
+    }
+
+    /// Legacy eviction path used only when the in-memory LRU index has no more
+    /// candidates (pre-index cache files). Scans the directory and sorts by
+    /// host atime, same as the original implementation.
+    /// Returns the number of bytes freed.
+    async fn evict_lru_fallback(&self, needed_bytes: u64) -> u64 {
+        // Files owned by the indexed LRU path must never be evicted here.
+        let indexed: std::collections::HashSet<String> = self
+            .access_index
+            .iter()
+            .map(|entry| Self::key_to_filename(entry.key()))
+            .collect();
         // Collect files with their access times
         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => return 0,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Ok(meta) = entry.metadata().await
                 && meta.is_file()
             {
+                // Never evict entries still tracked by the in-memory access
+                // index: they are owned by the indexed LRU path. The fallback
+                // only handles legacy files that predate the index.
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy();
+                if indexed.contains(filename.as_ref()) {
+                    continue;
+                }
                 let atime = meta
                     .accessed()
                     .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -618,7 +741,7 @@ impl DiskStorage {
 
         let mut freed = 0u64;
         for (path, size, _) in &files {
-            if freed >= to_free {
+            if freed >= needed_bytes {
                 break;
             }
             if tokio::fs::remove_file(path).await.is_ok() {
@@ -628,10 +751,11 @@ impl DiskStorage {
             }
         }
         debug!(
-            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
+            "Disk cache eviction fallback: freed {} bytes ({:.1} MiB)",
             freed,
             freed as f64 / 1048576.0
         );
+        freed
     }
 
     pub async fn load(&self, key: &str) -> anyhow::Result<bytes::Bytes> {
@@ -651,7 +775,10 @@ impl DiskStorage {
 
         // Decode with CRC32C verification (handles legacy unencoded files too)
         match super::cache_integrity::decode_bytes(raw) {
-            Some(data) => Ok(data),
+            Some(data) => {
+                self.record_access(key);
+                Ok(data)
+            }
             None => {
                 // Corrupted — delete the file and return error
                 let _ = tokio::fs::remove_file(&filepath).await;
@@ -682,6 +809,7 @@ impl DiskStorage {
         match self.load_range(key, offset, buf).await {
             Ok(read_len) => {
                 self.health.record_success();
+                self.record_access(key);
                 Ok(Some(read_len))
             }
             Err(err) => {
@@ -865,6 +993,61 @@ impl DiskStorage {
                 Err(e.into())
             }
         }
+    }
+
+    /// Remove the cache file for `key` if it exists, plus any leftover
+    /// temporary files for the same key. Unlike [`Self::remove`], a missing
+    /// cache file is not an error, so higher layers (e.g. `ChunksCache::remove`)
+    /// can treat removal as idempotent.
+    pub async fn remove_if_exists(&self, key: &str) -> anyhow::Result<()> {
+        let filename = Self::key_to_filename(key);
+        let filepath = self.base_dir.join(&filename);
+
+        if !filepath.exists() {
+            trace!("No disk cache file to remove for key '{}'", key);
+            return Ok(());
+        }
+
+        let file_size = tokio::fs::metadata(&filepath)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let _permit = self.write_sem.clone().acquire_owned().await?;
+        match tokio::fs::remove_file(&filepath).await {
+            Ok(_) => {
+                self.saturating_fetch_sub_bytes(file_size);
+                debug!("Successfully removed file for key '{}'", key);
+            }
+            Err(e) => {
+                error!("Failed to remove file for key '{}': {}", key, e);
+                return Err(e.into());
+            }
+        }
+
+        // Best-effort cleanup of leftover tmp files (e.g. after a crash during
+        // store_with_permit). Failure to clean a tmp file is not correctness-
+        // relevant; it will be reclaimed by eviction or a later remove.
+        let tmp_prefix = format!(".{}.", filename);
+        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                trace!(key, error = ?e, "failed to scan disk cache dir for tmp cleanup");
+                return Ok(());
+            }
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&tmp_prefix)
+                && name.ends_with(".tmp")
+                && let Err(e) = tokio::fs::remove_file(entry.path()).await
+            {
+                trace!(key, path = %entry.path().display(), error = ?e, "failed to remove leftover tmp cache file");
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2135,7 +2318,14 @@ impl ChunksCache {
     pub async fn insert_hot(&self, key: &str, data: bytes::Bytes) {
         let len = data.len() as u64;
         self.hot_cache.insert(key.to_owned(), data).await;
-        self.hot_cache.run_pending_tasks().await;
+        // moka runs maintenance (and thus eviction listeners) automatically
+        // on write ops (see base_cache::apply_reads_writes_if_needed), so
+        // forcing run_pending_tasks here would add a hot-path cost without
+        // changing eventual eviction-listener delivery. hot_bytes may lag
+        // slightly behind evictions until the next auto-maintenance batch;
+        // this is bounded and self-correcting. hot_bytes is observability-only
+        // and must NOT be used for budget decisions (use weighted_size() after
+        // maintenance, or the moka eviction listener).
         self.hot_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
@@ -2238,7 +2428,9 @@ impl ChunksCache {
         debug!("Cache REMOVE request for key: {}", key);
         trace!("Invalidating from hot cache: {}", key);
         self.hot_cache.invalidate(key).await;
-        // self.disk_storage.remove(key).await?;
+        if let Err(err) = self.disk_storage.remove_if_exists(key).await {
+            warn!(key, error = ?err, "failed to remove disk cache file; ignoring");
+        }
         trace!("Invalidating from cold cache: {}", key);
         self.cold_cache.invalidate(key).await;
 
@@ -2756,6 +2948,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chunks_cache_remove_deletes_disk_file() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "remove-deletes-disk-file".to_string();
+        cache
+            .disk_storage
+            .store(&key, b"disk-resident data")
+            .await
+            .unwrap();
+        cache.cold_cache.insert(key.clone(), ()).await;
+        assert!(cache.is_disk_cached(&key).await);
+
+        let filepath = cache
+            .disk_storage
+            .base_dir
+            .join(DiskStorage::key_to_filename(&key));
+        assert!(
+            filepath.exists(),
+            "disk cache file should exist before remove"
+        );
+
+        cache.remove(&key).await.unwrap();
+
+        assert!(
+            !filepath.exists(),
+            "disk cache file should be deleted by ChunksCache::remove"
+        );
+        assert!(
+            !cache.is_disk_cached(&key).await,
+            "cold cache entry should be invalidated by ChunksCache::remove"
+        );
+        assert!(
+            cache.get(&key).await.is_none(),
+            "hot cache entry should be invalidated by ChunksCache::remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chunks_cache_remove_missing_disk_file_is_idempotent() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        // Key was never stored on disk: remove must not fail.
+        cache
+            .remove(&"never-on-disk-key".to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_remove_if_exists_cleans_leftover_tmp_files() {
+        let (storage, _temp_dir) = setup_test_storage().await;
+        let key = "remove-if-exists-tmp-key";
+        storage.store(key, b"data").await.unwrap();
+
+        // Simulate a leftover tmp file from an interrupted store.
+        let filename = DiskStorage::key_to_filename(key);
+        let tmp_path = storage.base_dir.join(format!(".{}.42.tmp", filename));
+        tokio::fs::write(&tmp_path, b"partial").await.unwrap();
+
+        storage.remove_if_exists(key).await.unwrap();
+
+        let filepath = storage.base_dir.join(filename);
+        assert!(!filepath.exists(), "cache file should be removed");
+        assert!(!tmp_path.exists(), "leftover tmp file should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_disk_eviction_index_picks_oldest_and_keeps_recently_accessed() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path(), 512 * 1024).await.unwrap();
+        let data = vec![1u8; 100 * 1024];
+
+        storage.store("k1", &data).await.unwrap();
+        storage.store("k2", &data).await.unwrap();
+        storage.store("k3", &data).await.unwrap();
+        assert!(storage.load("k1").await.is_ok());
+        assert!(storage.load("k2").await.is_ok());
+        assert!(storage.load("k3").await.is_ok());
+
+        // Access k2 so it becomes the most-recently-used entry; k1 stays the
+        // oldest in the in-memory access index.
+        let _ = storage.load("k2").await.unwrap();
+
+        // Need to free 88 KiB: exactly one 100 KiB entry must be evicted.
+        storage.evict_lru(300 * 1024).await;
+
+        assert!(
+            storage.load("k1").await.is_err(),
+            "oldest entry (k1) should be evicted first via the access index"
+        );
+        assert!(storage.load("k2").await.is_ok());
+        assert!(storage.load("k3").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_disk_eviction_small_eviction_does_not_drain_queue() {
+        let temp_dir = tempdir().unwrap();
+        // Budget large enough that 1200 x 1 KiB entries never trigger eviction
+        // while storing, so the LRU queue accumulates all of them.
+        let storage = DiskStorage::new(temp_dir.path(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data = vec![7u8; 1024];
+        for i in 0..1200 {
+            storage.store(&format!("k{i}"), &data).await.unwrap();
+        }
+        // Access the newest key so it is definitely not the victim.
+        let _ = storage.load("k1199").await.unwrap();
+        let queue_before = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            queue_before > 1100,
+            "queue should hold stored entries; got {queue_before}"
+        );
+
+        // Force an eviction that frees exactly one entry (to_free = 1 byte):
+        // target = max - needed = current - 1.
+        let current = storage.bytes_used();
+        storage.evict_lru(2 * 1024 * 1024 - current + 1).await;
+
+        let queue_after = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            queue_after > queue_before - 8,
+            "a small eviction must not drain the LRU queue (before={queue_before}, after={queue_after})"
+        );
+        assert!(
+            storage.load("k1199").await.is_ok(),
+            "recently accessed key must survive"
+        );
+        assert!(
+            storage.load("k0").await.is_err(),
+            "oldest indexed key should have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_eviction_queue_stays_bounded_under_repeated_access() {
+        let (storage, _temp_dir) = setup_test_storage().await;
+        // Simulate a hot cache that never exceeds its budget: record_access
+        // runs constantly but evict_lru never fires. The heap must stay
+        // bounded by the access-index snapshot compaction.
+        for _ in 0..200_000 {
+            storage.record_access("hot-key");
+        }
+        let len = storage.eviction_queue.lock().unwrap().len();
+        assert!(
+            len < 5000,
+            "eviction queue must stay bounded; observed len={len}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_eviction_index_handles_removed_keys_lazily() {
+        let temp_dir = tempdir().unwrap();
+        let storage = DiskStorage::new(temp_dir.path(), 512 * 1024).await.unwrap();
+        let data = vec![1u8; 100 * 1024];
+
+        storage.store("k1", &data).await.unwrap();
+        storage.store("k2", &data).await.unwrap();
+        storage.store("k3", &data).await.unwrap();
+        // Remove k1 explicitly; its stale queue entry must be skipped lazily.
+        storage.remove("k1").await.unwrap();
+        // Re-access k2 so its older queue entries become stale too.
+        let _ = storage.load("k2").await.unwrap();
+
+        // remove("k1") already deducted 100 KiB from bytes_used, so
+        // current = 200 KiB (k2+k3). evict_lru(320 KiB) sets target = 192 KiB,
+        // so to_free = 8 KiB and exactly one entry must be evicted. k1's stale
+        // entry and k2's stale entries are skipped lazily; k3 is now the
+        // oldest valid entry and is evicted, while re-accessed k2 survives.
+        storage.evict_lru(320 * 1024).await;
+
+        assert!(storage.load("k1").await.is_err());
+        assert!(storage.load("k2").await.is_ok());
+        assert!(storage.load("k3").await.is_err());
+    }
+
+    #[tokio::test]
     async fn disk_hit_promotes_to_hot_cache_when_hot_tier_has_room() {
         let temp_dir = tempdir().unwrap();
         let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
@@ -2838,6 +3221,9 @@ mod tests {
         cache
             .insert_hot("hot-filler", bytes::Bytes::from(vec![1u8; 3 * 1024 * 1024]))
             .await;
+        // weighted_size() is approximate until moka maintenance runs; insert_hot
+        // no longer forces run_pending_tasks on the hot path (see insert_hot).
+        cache.hot_cache.run_pending_tasks().await;
         assert!(cache.hot_cache.weighted_size() > cache.config.max_hot_bytes * 700 / 1000);
 
         let key = "disk-hit-budget-key".to_string();
