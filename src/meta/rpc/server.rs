@@ -18,20 +18,75 @@ use crate::meta::store::{
 use brewfs_meta_proto::v1::{
     self as proto, FileLockType as ProtoFileLockType, FileType as ProtoFileType,
     OpenFlags as ProtoOpenFlags, SetAttrFlags as ProtoSetAttrFlags,
-    meta_service_server::MetaService,
+    meta_service_server::MetaService, meta_watch_server,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 /// gRPC server implementing the metadata service contract over a `MetaStore`.
-#[derive(Clone)]
 pub struct MetaServiceImpl<S> {
     store: Arc<S>,
+    /// Invalidation event broadcast for `MetaWatch` subscribers (#20).
+    events: broadcast::Sender<proto::WatchEvent>,
+    /// Monotonic event sequence (never reused; used for reconnect decisions).
+    seq: Arc<AtomicU64>,
+}
+
+/// Invalidation event channel capacity. Subscribers that fall this far behind
+/// get `Lagged` and must rebuild their cache (safe fallback).
+const WATCH_CHANNEL_CAPACITY: usize = 1024;
+
+impl<S> Clone for MetaServiceImpl<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            events: self.events.clone(),
+            seq: Arc::clone(&self.seq),
+        }
+    }
 }
 
 impl<S> MetaServiceImpl<S> {
     pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+        let (events, _) = broadcast::channel(WATCH_CHANNEL_CAPACITY);
+        Self {
+            store,
+            events,
+            seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Publish an invalidation event. Missing subscribers are fine (no-op).
+    fn emit(&self, kind: proto::watch_event::Kind, ino: i64, chunk_index: u64, path: String) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let event = proto::WatchEvent {
+            kind: kind as i32,
+            seq: seq as i64,
+            ino,
+            chunk_index,
+            path,
+        };
+        let _ = self.events.send(event);
+    }
+
+    fn emit_inode(&self, ino: i64, path: String) {
+        self.emit(proto::watch_event::Kind::InodeInvalidate, ino, 0, path);
+    }
+
+    fn emit_slices(&self, ino: i64, chunk_index: u64) {
+        self.emit(
+            proto::watch_event::Kind::ChunkSlicesInvalidate,
+            ino,
+            chunk_index,
+            String::new(),
+        );
+    }
+
+    fn emit_removed(&self, ino: i64, path: String) {
+        self.emit(proto::watch_event::Kind::InodeRemoved, ino, 0, path);
     }
 }
 
@@ -346,15 +401,23 @@ where
             .mkdir(req.parent, req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(ino, String::new());
         Ok(Response::new(proto::MkdirResponse { ino }))
     }
 
     async fn rmdir(&self, request: Request<proto::RmdirRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        let ino = self
+            .store
+            .lookup(req.parent, &req.name)
+            .await
+            .ok()
+            .flatten();
         self.store
             .rmdir(req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_removed(ino.unwrap_or(0), req.name);
         Ok(Response::new(()))
     }
 
@@ -368,25 +431,42 @@ where
             .create_file(req.parent, req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(ino, String::new());
         Ok(Response::new(proto::CreateFileResponse { ino }))
     }
 
     async fn unlink(&self, request: Request<proto::UnlinkRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        let ino = self
+            .store
+            .lookup(req.parent, &req.name)
+            .await
+            .ok()
+            .flatten();
         self.store
             .unlink(req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_removed(ino.unwrap_or(0), req.name);
         Ok(Response::new(()))
     }
 
     async fn rename(&self, request: Request<proto::RenameRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let _ = (req.noreplace, req.exchange);
+        let new_name = req.new_name.clone();
+        let ino = self
+            .store
+            .lookup(req.old_parent, &req.old_name)
+            .await
+            .ok()
+            .flatten();
         self.store
             .rename(req.old_parent, &req.old_name, req.new_parent, req.new_name)
             .await
             .map_err(status)?;
+        self.emit_removed(ino.unwrap_or(0), req.old_name.to_string());
+        self.emit_inode(ino.unwrap_or(0), new_name);
         Ok(Response::new(()))
     }
 
@@ -400,6 +480,7 @@ where
             .link(req.ino, req.parent, &req.name)
             .await
             .map_err(status)?;
+        self.emit_inode(attr.ino, String::new());
         Ok(Response::new(proto::LinkResponse {
             attr: Some(file_attr_to_proto(&attr)),
         }))
@@ -415,6 +496,7 @@ where
             .symlink(req.parent, &req.name, &req.target)
             .await
             .map_err(status)?;
+        self.emit_inode(ino, String::new());
         Ok(Response::new(proto::SymlinkResponse { ino }))
     }
 
@@ -433,6 +515,7 @@ where
     ) -> Result<Response<proto::ChmodResponse>, Status> {
         let req = request.into_inner();
         let attr = self.store.chmod(req.ino, req.mode).await.map_err(status)?;
+        self.emit_inode(attr.ino, String::new());
         Ok(Response::new(proto::ChmodResponse {
             attr: Some(file_attr_to_proto(&attr)),
         }))
@@ -456,6 +539,7 @@ where
             )
             .await
             .map_err(status)?;
+        self.emit_inode(attr.ino, String::new());
         Ok(Response::new(proto::SetAttrResponse {
             attr: Some(file_attr_to_proto(&attr)),
         }))
@@ -491,6 +575,7 @@ where
             .set_file_size(req.ino, req.size)
             .await
             .map_err(status)?;
+        self.emit_inode(req.ino, String::new());
         Ok(Response::new(()))
     }
 
@@ -503,6 +588,7 @@ where
             .truncate(req.ino, req.size, req.chunk_size)
             .await
             .map_err(status)?;
+        self.emit_inode(req.ino, String::new());
         Ok(Response::new(()))
     }
 
@@ -548,6 +634,8 @@ where
             .append_slice(req.chunk_id, slice_desc_from_proto(slice))
             .await
             .map_err(status)?;
+        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(req.chunk_id);
+        self.emit_slices(ino, chunk_index);
         Ok(Response::new(()))
     }
 
@@ -721,6 +809,34 @@ where
 
 /// Serve the metadata service on `addr` backed by `store`.
 ///
+/// Streaming invalidation events for connected clients.
+///
+/// Events are not persisted: a client that reconnects (or falls behind the
+/// broadcast buffer) must rebuild its caches rather than replay history.
+#[tonic::async_trait]
+impl<S> meta_watch_server::MetaWatch for MetaServiceImpl<S>
+where
+    S: MetaStore + Send + Sync + 'static,
+{
+    type WatchEventsStream =
+        futures_util::stream::BoxStream<'static, Result<proto::WatchEvent, Status>>;
+
+    async fn watch_events(
+        &self,
+        _request: Request<proto::WatchEventsRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        use futures_util::StreamExt;
+        let rx = self.events.subscribe();
+        let stream = BroadcastStream::new(rx).map(|item| match item {
+            Ok(event) => Ok(event),
+            Err(_) => Err(Status::aborted(
+                "watch channel lagged; client must rebuild its caches",
+            )),
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
 /// Process-internal deployment mode: the same binary can start this server
 /// next to a FUSE mount. Independent-process and HA deployment land in
 /// gqf2008/brewfs#21.
@@ -731,10 +847,12 @@ pub async fn serve<S>(
 where
     S: MetaStore + Send + Sync + 'static,
 {
+    let svc = MetaServiceImpl::new(store);
     tonic::transport::Server::builder()
         .add_service(proto::meta_service_server::MetaServiceServer::new(
-            MetaServiceImpl::new(store),
+            svc.clone(),
         ))
+        .add_service(proto::meta_watch_server::MetaWatchServer::new(svc))
         .serve(addr)
         .await
 }
@@ -745,10 +863,14 @@ mod tests {
     use crate::meta::factory::create_meta_store_from_url;
     use brewfs_meta_proto::v1::meta_service_client::MetaServiceClient;
     use brewfs_meta_proto::v1::meta_service_server;
+    use brewfs_meta_proto::v1::meta_watch_client::MetaWatchClient;
+    use brewfs_meta_proto::v1::watch_event::Kind;
     use brewfs_meta_proto::v1::{
         AppendSliceRequest, CreateFileRequest, GetSlicesRequest, LookupRequest, MkdirRequest,
-        ReaddirRequest, RenameRequest, SliceDesc, StatRequest, UnlinkRequest,
+        ReaddirRequest, RenameRequest, SliceDesc, StatRequest, UnlinkRequest, WatchEventsRequest,
     };
+    use futures_util::StreamExt;
+    use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
 
     async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -894,5 +1016,59 @@ mod tests {
         assert_eq!(batch[0].ino, 1);
         assert_eq!(batch[1].ino, 0);
         assert_eq!(batch[2].ino, dir_ino);
+    }
+
+    #[tokio::test]
+    async fn watch_events_broadcast() {
+        let (endpoint, _handle) = start_server().await;
+        let mut watch = MetaWatchClient::connect(endpoint.clone()).await.unwrap();
+        let mut stream = watch
+            .watch_events(WatchEventsRequest { last_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        // Let the subscription be established before mutating.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client = MetaServiceClient::connect(endpoint).await.unwrap();
+        let dir_ino = client
+            .mkdir(MkdirRequest {
+                parent: 1,
+                name: "d".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .ino;
+        client
+            .create_file(CreateFileRequest {
+                parent: dir_ino,
+                name: "f".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .append_slice(AppendSliceRequest {
+                chunk_id: 42,
+                slice: Some(SliceDesc {
+                    slice_id: 7,
+                    chunk_id: 42,
+                    offset: 0,
+                    length: 4096,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let mut kinds = Vec::new();
+        while let Some(item) = stream.next().await {
+            let ev = item.unwrap();
+            kinds.push(Kind::try_from(ev.kind).unwrap());
+            if kinds.len() >= 3 {
+                break;
+            }
+        }
+        assert!(kinds.contains(&Kind::InodeInvalidate));
+        assert!(kinds.contains(&Kind::ChunkSlicesInvalidate));
     }
 }

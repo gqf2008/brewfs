@@ -799,10 +799,12 @@ impl MetaStore for RpcMetaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::client::MetaClientOptions;
     use crate::meta::factory::create_meta_store_from_url;
     use crate::meta::layer::MetaLayer;
     use crate::meta::rpc::server::MetaServiceImpl;
     use brewfs_meta_proto::v1::meta_service_server;
+    use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
 
     /// Start a metadata service over an in-memory sqlite store.
@@ -919,5 +921,43 @@ mod tests {
         let entries = MetaLayer::readdir(&*client, dir_ino).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ino, file_ino);
+    }
+
+    #[tokio::test]
+    async fn watch_driven_cache_invalidation_between_clients() {
+        let endpoint = start_server().await;
+        let ttl = crate::meta::config::CacheTtl {
+            inode_ttl: Duration::from_secs(300),
+            path_ttl: Duration::from_secs(300),
+        };
+        let make_client = |endpoint: String| async move {
+            let opts = MetaClientOptions {
+                watch_endpoint: Some(endpoint.clone()),
+                ..Default::default()
+            };
+            crate::meta::client::MetaClient::with_options(
+                Arc::new(RpcMetaStore::connect(endpoint).await.unwrap()),
+                crate::meta::config::CacheCapacity::default(),
+                ttl.clone(),
+                opts,
+            )
+        };
+        let a = make_client(endpoint.clone()).await;
+        let b = make_client(endpoint.clone()).await;
+        MetaLayer::initialize(&*a).await.unwrap();
+        MetaLayer::initialize(&*b).await.unwrap();
+
+        // A creates a directory; B warms its (empty) readdir cache.
+        let dir_ino = MetaLayer::mkdir(&*a, 1, "d".to_string()).await.unwrap();
+        assert!(MetaLayer::readdir(&*b, dir_ino).await.unwrap().is_empty());
+
+        // A adds a file; the invalidation event must expire B's cached listing.
+        MetaLayer::create_file(&*a, dir_ino, "f".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let entries = MetaLayer::readdir(&*b, dir_ino).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "f");
     }
 }

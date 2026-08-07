@@ -305,7 +305,7 @@ rkyv = { workspace = true, optional = true, features = ["uuid-1"] }
 lz4_flex = { workspace = true }
 brewfs-meta-proto = { workspace = true }
 tonic = { workspace = true, features = ["transport", "server", "channel", "codegen"] }
-tokio-stream = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true, features = ["net", "sync"] }
 zstd = { workspace = true }
 governor = { workspace = true }
 
