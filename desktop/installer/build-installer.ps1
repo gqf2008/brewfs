@@ -48,9 +48,13 @@ if (-not (Test-Path $trayExe)) { throw "missing $trayExe" }
 if (-not (Test-Path $ossmountExe)) { throw "missing $ossmountExe" }
 
 $wix = Get-Command wix -ErrorAction Stop | Select-Object -First 1
-if (-not $wix) { throw "wix tool not found; run: dotnet tool install --global wix" }
-wix extension add WixToolset.BootstrapperApplications.wixext -g 2>$null
-wix extension add WixToolset.Util.wixext -g 2>$null
+if (-not $wix) { throw "wix tool not found; run: dotnet tool install --global wix --version 4.0.6" }
+# 扩展版本必须与工具版本一致：不带 -v 会装最新（如 7.x），与 v4 工具不兼容（WIX0144）。
+$wixVersion = "4.0.6"
+wix extension add WixToolset.BootstrapperApplications.wixext -v $wixVersion -g
+if ($LASTEXITCODE -ne 0) { throw "wix extension add BootstrapperApplications failed" }
+wix extension add WixToolset.Util.wixext -v $wixVersion -g
+if ($LASTEXITCODE -ne 0) { throw "wix extension add Util failed" }
 
 $appMsi = Join-Path $buildDir "brewfs-app.msi"
 $readme = Join-Path $installerDir "README.txt"
