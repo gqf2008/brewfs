@@ -130,11 +130,11 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install WiX Toolset
+      - name: Install WiX Toolset (pinned to v4; v7 requires OSMF EULA and breaks v4 schema)
         shell: pwsh
         run: |
-          dotnet tool install --global wix 2>$null
-          if ($LASTEXITCODE -ne 0) { dotnet tool update --global wix }
+          dotnet tool install --global wix --version 4.0.6 2>$null
+          if ($LASTEXITCODE -ne 0) { dotnet tool update --global wix --version 4.0.6 }
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
           wix --version
           if ($LASTEXITCODE -ne 0) { throw "wix install failed" }

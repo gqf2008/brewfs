@@ -65,8 +65,8 @@ Windows 上运行托盘应用会直接以无控制台窗口方式启动（`windo
 
 ## Windows 安装包
 
-`desktop/installer/build-installer.ps1` 用 **WiX Toolset**（`dotnet tool install --global wix`）
-构建安装程序，自动完成：
+`desktop/installer/build-installer.ps1` 用 **WiX Toolset v4**（`dotnet tool install --global wix --version 4.0.6`；
+注意 v7 需要接受 OSMF EULA 且不兼容本仓库 v4 schema）构建安装程序，自动完成：
 
 1. 构建 release 版 `brewfs-tray.exe` + `ossmount.exe`
 2. 打 **WinFsp 2.1**（`desktop/installer/winfsp-2.1.25156.msi`，2MB）进 Burn bundle：
