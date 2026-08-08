@@ -70,7 +70,7 @@ esac
 export PKG_CONFIG_PATH
 
 CERT_DIR="${CERT_DIR:-$HOME/Documents/Apple Certificates}"
-APPLE_ID="${APPLE_ID:-}"
+APPLE_ID="${APPLE_ID:-$(cat "$CERT_DIR/apple-id.txt" 2>/dev/null || true)}"
 APPLE_TEAM_ID="${APPLE_TEAM_ID:-$(cat "$CERT_DIR/team-id.txt" 2>/dev/null || true)}"
 APPLE_PASSWORD="${APPLE_PASSWORD:-$(cat "$CERT_DIR/app-specific-passwd.txt" 2>/dev/null || true)}"
 
