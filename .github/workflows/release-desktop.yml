@@ -80,6 +80,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: |
           set -euo pipefail
           if [ -n "$APPLE_CERT_P12" ]; then
@@ -149,6 +150,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
