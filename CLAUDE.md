@@ -70,7 +70,8 @@ These are the acceptance gates for filesystem behavior; they need Docker and
 bash docker/compose-xfstests/run_redis_xfstests.sh --cases "generic/001"
 bash docker/compose-xfstests/run_redis_pjdfstest.sh
 bash docker/compose-xfstests/run_redis_ltp.sh
-# TiKV / etcd / sqlite variants exist as run_{tikv,etcd,sqlite}_{xfstests,ltp,pjdfstest}.sh
+# Variants: run_tikv_{xfstests,ltp,pjdfstest}.sh and run_{etcd,sqlite}_{xfstests,ltp}.sh
+# (only redis and tikv have pjdfstest runners)
 ```
 
 ### Performance acceptance
@@ -137,7 +138,9 @@ locks for compaction.
   BrewFS metadata.
 - **`tools/stats/` (`brewfs-stats`)** — real-time TUI stats viewer (like
   `juicefs stats`) reading the FUSE `.stats` file.
-- **`web/console/`** — web console assets.
+- **`web/console/`** — web console (React 19 + Vite + TypeScript) served by
+  `brewfs console` from the built `web/console/dist/`. Separate npm toolchain:
+  `npm run dev` / `npm run build` (tsc + vite) / `npm run test` (vitest).
 
 ## Conventions
 
