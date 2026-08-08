@@ -165,6 +165,11 @@ target/release/brewfs mount /tmp/brewfs-mnt \
 
 生产部署、调优 profile、升级与卸载参数请参考：[二进制部署文档](doc/operations/binary-deployment.md) 与 [配置说明](doc/operations/configuration.md)。
 
+> **桌面端安装包（macOS / Windows）**：到 [gqf2008/brewfs Releases](https://github.com/gqf2008/brewfs/releases)
+> 下载 `BrewFS-*.dmg`（macOS：打开后把 BrewFS.app 拖入「应用程序」）或 `BrewFS-Setup-*.exe`
+> （Windows：运行安装，从开始菜单启动托盘）。托盘应用可直接把 S3/OSS Bucket 挂载为盘符/目录，
+> 无需命令行，详见 [desktop/README.md](desktop/README.md)。
+
 ## Architecture
 
 BrewFS 将文件系统接口、元数据与对象数据通道解耦：

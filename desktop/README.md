@@ -16,6 +16,10 @@
 > 挂载模式选择框默认 **OSS 直挂（多机，推荐）**；切到 **BrewFS（元数据）** 时表单会
 > 显示黄色风险提示框。普通网盘/多机共享场景请保持 OSS 直挂。
 
+> **下载安装**：正式安装包发布在 [gqf2008/brewfs Releases](https://github.com/gqf2008/brewfs/releases)——
+> macOS 为 `BrewFS-*.dmg`（打开后拖入「应用程序」），Windows 为 `BrewFS-Setup-*.exe`
+> （运行安装，从开始菜单启动 BrewFS 托盘）。
+
 ## 两种挂载模式
 
 ### OSS 直挂（默认，推荐）—— 多机网盘，无本地元数据

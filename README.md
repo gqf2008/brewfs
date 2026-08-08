@@ -246,6 +246,11 @@ target/release/brewfs mount /tmp/brewfs-mnt \
 
 See the [binary deployment guide](doc/operations/binary-deployment.md) and [configuration reference](doc/operations/configuration.md) for production backends, tuning profiles, upgrades, and uninstall steps.
 
+> **Desktop apps (macOS / Windows)**: grab `BrewFS-*.dmg` (macOS: drag BrewFS.app into Applications) or
+> `BrewFS-Setup-*.exe` (Windows: run the installer, then launch the tray app from the Start menu) from
+> [gqf2008/brewfs Releases](https://github.com/gqf2008/brewfs/releases). The tray app mounts an S3/OSS
+> bucket as a drive/folder without the CLI; see [desktop/README.md](desktop/README.md).
+
 ## Architecture
 
 BrewFS separates the filesystem interface, metadata, and object data paths:
