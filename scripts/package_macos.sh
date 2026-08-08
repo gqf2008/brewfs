@@ -18,7 +18,7 @@
 #     create ~/Documents/Apple Certificates/{app-specific-passwd.txt,team-id.txt}
 #
 # Usage:
-#   bash scripts/package_macos.sh [--skip-notarize]
+#   bash scripts/package_macos.sh [--skip-notarize] [--skip-sign]
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -75,9 +75,11 @@ APPLE_TEAM_ID="${APPLE_TEAM_ID:-$(cat "$CERT_DIR/team-id.txt" 2>/dev/null || tru
 APPLE_PASSWORD="${APPLE_PASSWORD:-$(cat "$CERT_DIR/app-specific-passwd.txt" 2>/dev/null || true)}"
 
 SKIP_NOTARIZE=0
+SKIP_SIGN=0
 for arg in "$@"; do
   case "$arg" in
     --skip-notarize) SKIP_NOTARIZE=1 ;;
+    --skip-sign) SKIP_SIGN=1 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -188,19 +190,24 @@ fi
 chmod +x "$APP/Contents/MacOS/"*
 
 # ---- 3. sign ----
-echo "==> Signing with $IDENTITY"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
-  "$APP/Contents/MacOS/brewfs"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
-  "$APP/Contents/MacOS/ossmount"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
-  "$APP/Contents/MacOS/brewfs-tray"
-codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
-codesign --verify --deep --strict --verbose=2 "$APP"
+if [[ "$SKIP_SIGN" == "1" ]]; then
+  echo "==> Skipping codesign (--skip-sign); app/DMG will be unsigned"
+  SKIP_NOTARIZE=1
+else
+  echo "==> Signing with $IDENTITY"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    "$APP/Contents/MacOS/brewfs"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    "$APP/Contents/MacOS/ossmount"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    "$APP/Contents/MacOS/brewfs-tray"
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+fi
 
 # ---- 4. notarize the app (zip) and staple ----
 if [[ "$SKIP_NOTARIZE" == "0" ]]; then
@@ -246,7 +253,9 @@ elif [[ -d dist/macos/macfuse ]]; then
 fi
 echo "==> Creating DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_ROOT" -ov -format UDZO -fs HFS+ "$DMG"
-codesign --force --sign "$IDENTITY" "$DMG"
+if [[ "$SKIP_SIGN" == "0" ]]; then
+  codesign --force --sign "$IDENTITY" "$DMG"
+fi
 
 if [[ "$SKIP_NOTARIZE" == "0" ]]; then
   echo "==> Notarizing DMG"
