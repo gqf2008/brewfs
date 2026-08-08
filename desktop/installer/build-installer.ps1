@@ -24,6 +24,11 @@ $root = Resolve-Path (Join-Path $installerDir "..\..")
 $buildDir = Join-Path $installerDir "build"
 $targetDir = Join-Path $root "target\release"
 
+# brewfs workspace 的 etcd-client 构建脚本需要 protoc（prost-build）。
+if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+    throw "protoc not found; install it first (e.g. choco install protoc -y or scoop install protobuf)"
+}
+
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
 Write-Host "==> Building release binaries (this can take a while)..." -ForegroundColor Cyan

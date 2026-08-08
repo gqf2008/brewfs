@@ -47,7 +47,8 @@
 
 ## 构建
 
-需要 Rust stable（本仓库为 edition 2024）与 brewfs 的 WinFsp 构建：
+需要 Rust stable（本仓库为 edition 2024）、`protoc`（`etcd-client` 构建依赖，
+可用 `choco install protoc -y` 安装）与 brewfs 的 WinFsp 构建：
 
 ```powershell
 # 1. 构建 ossmount（WinFsp 后端）

@@ -138,6 +138,12 @@ jobs:
           wix --version
           if ($LASTEXITCODE -ne 0) { throw "wix install failed" }
 
+      - name: Install protoc (etcd-client build dependency)
+        shell: pwsh
+        run: |
+          choco install protoc -y --no-progress
+          protoc --version
+
       - name: Build installer
         shell: pwsh
         env:
