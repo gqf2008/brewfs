@@ -138,6 +138,8 @@ jobs:
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
           wix --version
           if ($LASTEXITCODE -ne 0) { throw "wix install failed" }
+          # runner 镜像可能预置 7.x 扩展缓存，v4 工具会解析到它并报 WIX0144；清掉让脚本装 4.0.6
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.wix\extensions" -ErrorAction SilentlyContinue
 
       - name: Install protoc (etcd-client build dependency)
         shell: pwsh

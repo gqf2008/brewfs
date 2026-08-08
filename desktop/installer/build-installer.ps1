@@ -60,6 +60,12 @@ $appMsi = Join-Path $buildDir "brewfs-app.msi"
 $readme = Join-Path $installerDir "README.txt"
 $icon = Join-Path $installerDir "..\assets\brewfs.ico"
 
+# 显式指定 4.0.6 扩展 DLL，避免 wix build 解析到预置的 7.x 扩展目录（WIX0144）
+$bootExt = Join-Path $HOME ".wix\extensions\WixToolset.BootstrapperApplications.wixext\$wixVersion\wixext4\WixToolset.BootstrapperApplications.wixext.dll"
+$utilExt = Join-Path $HOME ".wix\extensions\WixToolset.Util.wixext\$wixVersion\wixext4\WixToolset.Util.wixext.dll"
+if (-not (Test-Path $bootExt)) { throw "missing $bootExt" }
+if (-not (Test-Path $utilExt)) { throw "missing $utilExt" }
+
 Write-Host "==> Building app MSI..." -ForegroundColor Cyan
 & $wix.Source build (Join-Path $installerDir "brewfs-app.wxs") -arch x64 `
     -d "Version=$Version" `
@@ -74,8 +80,8 @@ $winfspMsi = Join-Path $installerDir "winfsp-2.1.25156.msi"
 
 Write-Host "==> Building installer bundle..." -ForegroundColor Cyan
 & $wix.Source build (Join-Path $installerDir "brewfs-bundle.wxs") `
-    -ext WixToolset.BootstrapperApplications.wixext `
-    -ext WixToolset.Util.wixext `
+    -ext $bootExt `
+    -ext $utilExt `
     -d "Version=$Version" `
     -d "AppMsi=$appMsi" `
     -d "WinFspMsi=$winfspMsi" `
