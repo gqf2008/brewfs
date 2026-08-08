@@ -38,3 +38,6 @@ desktop/installer/build/
 
 # AppleDouble metadata (ExFAT/macOS artifact), never commit
 ._*
+
+# Redis dump dropped in repo root by local test instances
+*.rdb
