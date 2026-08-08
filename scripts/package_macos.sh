@@ -195,17 +195,24 @@ if [[ "$SKIP_SIGN" == "1" ]]; then
   SKIP_NOTARIZE=1
 else
   echo "==> Signing with $IDENTITY"
+  # CI 用临时钥匙串签名：build 可能耗时较长，签名前再 unlock 一次并显式指定
+  # --keychain，避免钥匙串自动上锁后 codesign 弹密码框挂起。
+  KEYCHAIN_ARGS=()
+  if [[ -n "${CODESIGN_KEYCHAIN:-}" ]]; then
+    security unlock-keychain -p "${CODESIGN_KEYCHAIN_PASSWORD:-}" "$CODESIGN_KEYCHAIN"
+    KEYCHAIN_ARGS=(--keychain "$CODESIGN_KEYCHAIN")
+  fi
   codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
     "$APP/Contents/MacOS/brewfs"
   codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
     "$APP/Contents/MacOS/ossmount"
   codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" \
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
     "$APP/Contents/MacOS/brewfs-tray"
   codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
+    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
 fi
 
@@ -254,7 +261,7 @@ fi
 echo "==> Creating DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_ROOT" -ov -format UDZO -fs HFS+ "$DMG"
 if [[ "$SKIP_SIGN" == "0" ]]; then
-  codesign --force --sign "$IDENTITY" "$DMG"
+  codesign --force --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" "$DMG"
 fi
 
 if [[ "$SKIP_NOTARIZE" == "0" ]]; then
