@@ -1,0 +1,194 @@
+name: Build & Release (Desktop)
+
+# 与 ../abb 相同的发布方式：打 v* tag 时自动构建 macOS DMG 与 Windows 安装包，
+# 签名/公证后发 GitHub Release；也可手动触发（只出产物，不发 Release）。
+# 目标仓库：gqf2008/brewfs（本仓库即 fork 后的发布源）。
+#
+# 密钥说明（运行时判断，缺失时优雅降级）：
+#   APPLE_CERT_P12 / APPLE_CERT_PASSWORD / APPLE_TEAM_ID / APPLE_ID / APPLE_APP_PASSWORD
+#     → macOS 签名 + 公证；未配置时产出未签名 DMG（Gatekeeper 会提示，需用户放行）。
+#   WIN_SIGN_PFX / WIN_SIGN_PASSWORD
+#     → Windows 安装包签名；未配置时跳过（SmartScreen 会提示）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────── macOS（Apple Silicon）───────────────────────────
+  macos:
+    runs-on: macos-14 # arm64，与本地 aarch64 产物一致
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies (protobuf + FUSE-T)
+        run: |
+          set -euo pipefail
+          brew install protobuf
+          brew install --cask fuse-t
+          # 准备 ossmount 链接用的 FUSE-T prefix（布局与 scripts/package_macos.sh 一致）
+          FUSE_T_PREFIX="$HOME/brewfs-deps/fuse-t"
+          mkdir -p "$FUSE_T_PREFIX/lib/pkgconfig" "$FUSE_T_PREFIX/include"
+          if [ -d /usr/local/include/fuse ]; then
+            cp -R /usr/local/include/fuse "$FUSE_T_PREFIX/include/fuse"
+          else
+            echo "::error::FUSE-T headers not found under /usr/local/include/fuse" >&2
+            exit 1
+          fi
+          FUSE_T_LIB="$(find /usr/local/lib -maxdepth 1 -name 'libfuse-t-*.dylib' 2>/dev/null | head -1 || true)"
+          if [ -z "$FUSE_T_LIB" ]; then
+            echo "::error::FUSE-T dylib not found under /usr/local/lib" >&2
+            exit 1
+          fi
+          cp "$FUSE_T_LIB" "$FUSE_T_PREFIX/lib/"
+          ln -sf "$(basename "$FUSE_T_LIB")" "$FUSE_T_PREFIX/lib/libfuse-t.dylib"
+          cat > "$FUSE_T_PREFIX/lib/pkgconfig/fuse.pc" <<EOF
+          prefix=$FUSE_T_PREFIX
+          exec_prefix=\${prefix}
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include/fuse
+
+          Name: fuse
+          Description: FUSE-T libfuse2-compatible shim for fuser
+          Version: 2.9.9
+          Libs: -L\${libdir} -Wl,-rpath,\${libdir} -lfuse-t
+          Cflags: -I\${includedir}
+          EOF
+          echo "FUSE-T prefix ready at $FUSE_T_PREFIX"
+
+      - name: Package DMG (sign + notarize when credentials available)
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APPLE_CERT_P12" ]; then
+            echo "==> Importing Developer ID certificate"
+            echo "$APPLE_CERT_P12" | base64 --decode > /tmp/brewfs-cert.p12
+            security create-keychain -p temp /tmp/brewfs-signing.keychain
+            security default-keychain -s /tmp/brewfs-signing.keychain
+            security unlock-keychain -p temp /tmp/brewfs-signing.keychain
+            security import /tmp/brewfs-cert.p12 -k /tmp/brewfs-signing.keychain \
+              -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k temp /tmp/brewfs-signing.keychain
+            IDENTITY="$(security find-identity -v -p codesigning \
+              | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+            echo "IDENTITY=$IDENTITY"
+            export IDENTITY
+            CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 bash scripts/package_macos.sh
+          else
+            echo "==> APPLE_CERT_P12 未配置，构建未签名 DMG（可在仓库 Secrets 补齐后重跑）"
+            CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+              bash scripts/package_macos.sh --skip-sign --skip-notarize
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: dist/macos/BrewFS-*.dmg
+          if-no-files-found: error
+
+  # ─────────────────────────── Windows（x64 + WiX Burn）───────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix 2>$null
+          if ($LASTEXITCODE -ne 0) { dotnet tool update --global wix }
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          wix --version
+          if ($LASTEXITCODE -ne 0) { throw "wix install failed" }
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "VERSION=$version"
+          & powershell -ExecutionPolicy Bypass -File desktop\installer\build-installer.ps1 -Version $version
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+
+      # Windows 代码签名：有证书时启用，否则跳过（secrets 不能出现在 if 里，运行时判断）。
+      - name: Sign installer (optional)
+        shell: pwsh
+        env:
+          WIN_SIGN_PFX: ${{ secrets.WIN_SIGN_PFX }}
+          WIN_SIGN_PASSWORD: ${{ secrets.WIN_SIGN_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WIN_SIGN_PFX)) {
+            Write-Host "未配置 WIN_SIGN_PFX，跳过 Windows 代码签名"
+            exit 0
+          }
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool not found" }
+          $pfx = [IO.File]::WriteAllBytes("$env:TEMP\brewfs-cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
+          $exe = Get-ChildItem desktop\installer\build\BrewFS-Setup-*.exe | Select-Object -First 1
+          & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: desktop/installer/build/BrewFS-Setup-*.exe
+          if-no-files-found: error
+
+  # ─────────────────────────── 汇总发 Release ───────────────────────────
+  release:
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v') # 只有打 tag 才发 Release；手动跑只出产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
