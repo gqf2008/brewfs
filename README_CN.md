@@ -82,6 +82,9 @@ ossmount mount --bucket my-bucket \
 | `--gid N` | 所有对象显示的属组 gid（0 = 当前挂载用户） |
 | `--dir-mode M` | 目录权限位，八进制（默认 `755`） |
 | `--file-mode M` | 文件权限位，八进制（默认 `644`） |
+| `--no-rename-dir` | 禁用目录递归重命名 |
+| `--rename-dir-limit N` | 单次目录重命名最多拷贝的对象数（默认 `2000000`，`0` = 不限制） |
+| `--max-upload-bytes N` | 限制同时在途的写上传字节数（`0` = 不限制） |
 
 凭据来自环境变量（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`）或 AWS 共享配置；托盘会把密钥注入其拉起的 `ossmount` 进程。
 

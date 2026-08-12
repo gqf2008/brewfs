@@ -57,6 +57,19 @@ pub struct OssConfig {
     pub gid: u32,
     pub dir_mode: u32,
     pub file_mode: u32,
+    /// Allow directory renames. Directory rename is implemented as a
+    /// recursive copy + delete; disabling it avoids unbounded tree copies
+    /// (mirrors aliyun/ossfs `allow_rename_dir`).
+    pub allow_rename_dir: bool,
+    /// Maximum number of objects copied by a single directory rename.
+    /// `None` (or `Some(0)`) means unlimited. Mirrors aliyun/ossfs
+    /// `rename_dir_limit`.
+    pub rename_dir_limit: Option<u64>,
+    /// Cap on aggregate bytes of in-flight object writes (whole-object PUT
+    /// and multipart uploads). `None` (or `Some(0)`) means unlimited.
+    /// Rounded up to 1 MiB units internally. Mirrors aliyun/ossfs
+    /// `total_mem_limit` (the write-upload portion).
+    pub max_upload_bytes: Option<usize>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -146,6 +159,22 @@ const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
 /// part also takes a global request-limit permit, so global in-flight stays
 /// bounded.
 const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
+/// Unit size for the in-flight write-byte budget. The semaphore counts
+/// whole MiB units, so the bound is accurate to within one MiB while keeping
+/// permit counts small.
+const UPLOAD_BUDGET_UNIT: usize = 1 << 20;
+
+/// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
+/// Returns `None` when the budget is disabled. Values above what a single
+/// acquire call can represent are clamped.
+fn upload_budget_units(max_bytes: Option<usize>) -> Option<usize> {
+    let bytes = max_bytes?;
+    if bytes == 0 {
+        return None;
+    }
+    let units = bytes.div_ceil(UPLOAD_BUDGET_UNIT).min(u32::MAX as usize);
+    Some(units.max(1))
+}
 
 pub struct ObjectFs {
     client: Client,
@@ -161,6 +190,14 @@ pub struct ObjectFs {
     read_only: bool,
     /// POSIX ownership / permission defaults for the FUSE adapters.
     mount_attr: MountAttr,
+    /// Whether directory renames are allowed at all.
+    allow_rename_dir: bool,
+    /// Max object count for one directory rename; `None` = unlimited.
+    rename_dir_limit: Option<u64>,
+    /// In-flight write-byte budget (MiB-unit semaphore); `None` = unlimited.
+    upload_budget: Option<Arc<Semaphore>>,
+    /// Total MiB units available when [`Self::upload_budget`] is set.
+    upload_budget_units: usize,
 }
 
 impl ObjectFs {
@@ -181,6 +218,7 @@ impl ObjectFs {
             builder = builder.force_path_style(true);
         }
         let client = Client::from_conf(builder.build());
+        let upload_budget_units = upload_budget_units(config.max_upload_bytes);
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -197,6 +235,10 @@ impl ObjectFs {
                 dir_mode: config.dir_mode,
                 file_mode: config.file_mode,
             },
+            allow_rename_dir: config.allow_rename_dir,
+            rename_dir_limit: config.rename_dir_limit,
+            upload_budget: upload_budget_units.map(|units| Arc::new(Semaphore::new(units))),
+            upload_budget_units: upload_budget_units.unwrap_or(0),
         })
     }
 
@@ -208,6 +250,33 @@ impl ObjectFs {
     /// POSIX ownership / permission defaults applied by the FUSE adapters.
     pub fn mount_attr(&self) -> MountAttr {
         self.mount_attr
+    }
+
+    /// Acquire the in-flight write-byte budget for `data_len` bytes.
+    /// Returns a permit that must be held for the whole upload.
+    async fn acquire_upload_budget(
+        &self,
+        data_len: usize,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let Some(sem) = &self.upload_budget else {
+            return Ok(None);
+        };
+        let units = data_len.div_ceil(UPLOAD_BUDGET_UNIT);
+        if units > self.upload_budget_units {
+            anyhow::bail!(
+                "write of {data_len} bytes exceeds max-upload-bytes budget ({})",
+                self.upload_budget_units.saturating_mul(UPLOAD_BUDGET_UNIT)
+            );
+        }
+        if units == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            sem.clone()
+                .acquire_many_owned(units as u32)
+                .await
+                .map_err(|_| anyhow::anyhow!("upload budget closed"))?,
+        ))
     }
 
     /// Reject mutations when mounted read-only.
@@ -510,6 +579,7 @@ impl ObjectFs {
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.invalidate_stat(path);
+        let _budget = self.acquire_upload_budget(data.len()).await?;
         if data.len() as u64 > MULTIPART_THRESHOLD {
             self.write_multipart(path, data).await
         } else {
@@ -758,7 +828,27 @@ impl ObjectFs {
         let new_key = self.key_for(new);
         let source = format!("{}/{}", self.bucket, old_key);
 
-        if old.ends_with('/') {
+        // Determine directory-ness from S3 instead of assuming a trailing
+        // slash: WinFsp/FUSE rename paths for directories arrive without a
+        // trailing slash.
+        let is_dir = self
+            .stat_uncached_impl(old)
+            .await?
+            .map(|e| e.is_dir)
+            .unwrap_or(false);
+
+        if is_dir {
+            if !self.allow_rename_dir {
+                anyhow::bail!("directory rename is disabled");
+            }
+            if let Some(limit) = self.rename_dir_limit {
+                let count = self.count_tree_entries(&old_key, limit).await?;
+                if count > limit {
+                    anyhow::bail!(
+                        "directory {old} has {count} entries, exceeding rename-dir-limit {limit}"
+                    );
+                }
+            }
             // Directory: copy the marker + every child recursively.
             self.copy_tree(&old_key, &new_key).await?;
             self.delete_dir_recursive_impl(old).await
@@ -775,8 +865,43 @@ impl ObjectFs {
         }
     }
 
+    /// Count objects under the `old_key` directory prefix, failing as soon as
+    /// the count exceeds `limit` so an oversized rename is rejected before any
+    /// copy work starts.
+    async fn count_tree_entries(&self, old_key: &str, limit: u64) -> Result<u64> {
+        let prefix = dir_object_prefix(old_key);
+        let mut count = 0u64;
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(tok) = token.as_deref() {
+                req = req.continuation_token(tok);
+            }
+            let resp = req.send().await.context("s3 list for rename count")?;
+            count += resp.contents().len() as u64;
+            if count > limit {
+                anyhow::bail!(
+                    "directory exceeds rename-dir-limit {limit} ({count} entries so far)"
+                );
+            }
+            if resp.is_truncated() == Some(true) {
+                token = resp.next_continuation_token().map(str::to_string);
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
     async fn copy_tree(&self, old_key: &str, new_key: &str) -> Result<()> {
-        let prefix = format!("{old_key}/");
+        let prefix = dir_object_prefix(old_key);
         let mut token: Option<String> = None;
         loop {
             let mut req = self
@@ -791,7 +916,7 @@ impl ObjectFs {
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
                     let suffix = key.strip_prefix(&prefix).unwrap_or(key);
-                    let dst = format!("{new_key}/{suffix}");
+                    let dst = format!("{}/{suffix}", new_key.trim_end_matches('/'));
                     self.client
                         .copy_object()
                         .bucket(&self.bucket)
@@ -815,8 +940,12 @@ impl ObjectFs {
         self.client
             .copy_object()
             .bucket(&self.bucket)
-            .key(format!("{new_key}/"))
-            .copy_source(format!("{}/{}/", self.bucket, old_key))
+            .key(format!("{}/", new_key.trim_end_matches('/')))
+            .copy_source(format!(
+                "{}/{}/",
+                self.bucket,
+                old_key.trim_end_matches('/')
+            ))
             .send()
             .await
             .context("s3 copy marker")?;
@@ -855,6 +984,13 @@ fn is_s3_invalid_range(
         }
         _ => false,
     }
+}
+
+/// Normalize an object key so its directory prefix is `<base>/`, never
+/// `<base>//`. Used by directory rename copy/count paths.
+fn dir_object_prefix(key: &str) -> String {
+    let base = key.trim_end_matches('/');
+    format!("{base}/")
 }
 
 /// Strip the leading slash from a normalized path; `"/"` -> `""`.
@@ -934,6 +1070,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: "ossfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
@@ -948,6 +1088,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
@@ -973,6 +1117,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: true,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         assert!(fs.ensure_writable().is_err());
@@ -981,6 +1129,27 @@ mod tests {
         assert!(fs.delete("/a").await.is_err());
         assert!(fs.delete_dir_recursive("/d").await.is_err());
         assert!(fs.rename("/a", "/b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_budget_rejects_object_larger_than_limit() {
+        let fs = ObjectFs {
+            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
+            bucket: "b".into(),
+            stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: Some(Arc::new(Semaphore::new(1))),
+            upload_budget_units: 1,
+            prefix: String::new(),
+        };
+        let data = vec![0u8; 2 * UPLOAD_BUDGET_UNIT];
+        let err = fs.write("/large.bin", &data).await.unwrap_err();
+        assert!(err.to_string().contains("max-upload-bytes budget"));
     }
 
     #[test]
@@ -997,6 +1166,9 @@ mod tests {
             gid: 0,
             dir_mode: 0o755,
             file_mode: 0o644,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -1013,6 +1185,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1047,6 +1223,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -1075,6 +1255,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1102,6 +1286,10 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1351,7 +1539,36 @@ mod s3_mock_tests {
             limiter: Arc::new(Semaphore::new(limit)),
             read_only: false,
             mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_dir_disabled_rejects_directory_rename() {
+        let entries = vec![("dir/a.txt".to_string(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(0)).await;
+        let mut fs = test_fs(port, 8);
+        fs.allow_rename_dir = false;
+        let err = fs.rename("/dir", "/newdir").await.unwrap_err();
+        assert!(err.to_string().contains("directory rename is disabled"));
+        drop(mock);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_dir_limit_exceeded_rejects_before_copy() {
+        let entries = vec![
+            ("dir/a.txt".to_string(), false),
+            ("dir/b.txt".to_string(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(0)).await;
+        let mut fs = test_fs(port, 8);
+        fs.rename_dir_limit = Some(1);
+        let err = fs.rename("/dir", "/newdir").await.unwrap_err();
+        assert!(err.to_string().contains("rename-dir-limit"));
+        drop(mock);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -97,6 +97,9 @@ region / access key → *Save* → *Mount*.
 | `--gid N` | Owner gid shown on every object (0 = mounting user) |
 | `--dir-mode M` | Directory permission bits, octal (default `755`) |
 | `--file-mode M` | File permission bits, octal (default `644`) |
+| `--no-rename-dir` | Disable recursive directory rename |
+| `--rename-dir-limit N` | Max objects copied by one directory rename (default `2000000`, `0` = unlimited) |
+| `--max-upload-bytes N` | Cap aggregate in-flight write bytes (`0` = unlimited) |
 
 Credentials come from the environment (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`) or the AWS shared config. The tray injects them into

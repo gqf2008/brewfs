@@ -27,6 +27,7 @@ fn usage() -> ! {
         "usage: ossmount --bucket BUCKET [--endpoint URL] [--region REGION]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
+                 [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -60,6 +61,9 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut gid: u32 = 0;
     let mut dir_mode: u32 = 0o755;
     let mut file_mode: u32 = 0o644;
+    let mut allow_rename_dir = true;
+    let mut rename_dir_limit: Option<u64> = Some(2_000_000);
+    let mut max_upload_bytes: Option<usize> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
@@ -95,6 +99,21 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
                     .and_then(|v| parse_mode(&v))
                     .unwrap_or_else(|| usage());
             }
+            "--no-rename-dir" => allow_rename_dir = false,
+            "--rename-dir-limit" => {
+                let v: u64 = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                rename_dir_limit = if v == 0 { None } else { Some(v) };
+            }
+            "--max-upload-bytes" => {
+                let v: usize = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                max_upload_bytes = if v == 0 { None } else { Some(v) };
+            }
             "--refresh-secs" => {
                 refresh_secs = args
                     .next()
@@ -122,6 +141,9 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             gid,
             dir_mode,
             file_mode,
+            allow_rename_dir,
+            rename_dir_limit,
+            max_upload_bytes,
         },
         mount_point,
         refresh_secs,
