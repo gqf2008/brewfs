@@ -105,8 +105,29 @@ fn winfsp_delayload() {
     winfsp::build::winfsp_link_delayload();
 }
 
+/// Windows: widen the thread stack reserve of the final PE image.
+///
+/// WinFsp creates its host/worker threads with the process default stack
+/// size (`CreateThread` with `dwStackSize = 0`), i.e. the PE
+/// `SizeOfStackReserve` of the executable. ossmount drives AWS SDK futures
+/// (hyper + rustls) through `Handle::block_on` on those threads; the deep
+/// async stack can exhaust the linker default 1 MiB reserve under heavy
+/// concurrent I/O, and Rust then aborts the whole process with
+/// 0xc0000409 (FAST_FAIL_FATAL_APP_EXIT). Reserve 16 MiB (commit 1 MiB)
+/// so every WinFsp callback thread inherits a safe stack.
+#[cfg(windows)]
+fn widen_thread_stack() {
+    match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg=/STACK:16777216,1048576"),
+        Ok("gnu") => println!("cargo:rustc-link-arg=-Wl,--stack,16777216"),
+        _ => {}
+    }
+}
+
 fn main() {
     brewfs_git_env();
     #[cfg(windows)]
     winfsp_delayload();
+    #[cfg(windows)]
+    widen_thread_stack();
 }

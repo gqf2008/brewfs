@@ -25,8 +25,9 @@ use anyhow::{Context as _, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, config::BehaviorVersion};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// S3-compatible object store configuration.
 #[derive(Debug, Clone)]
@@ -41,6 +42,10 @@ pub struct OssConfig {
     /// Optional namespace prefix under the bucket (e.g. `brewfs/`). All keys
     /// are stored under it. Must be empty or end with `/`.
     pub prefix: String,
+    /// Optional in-flight S3 request cap. `None` (or `Some(0)`) uses the
+    /// default [`MAX_CONCURRENT_S3_REQUESTS`]; explicit values let high-RTT
+    /// or low-memory mounts tune the bound (0/None = default, never disable).
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl OssConfig {
@@ -70,6 +75,11 @@ pub struct DirEntry {
 const STAT_TTL: Duration = Duration::from_secs(3);
 /// Upper bound on cached stat entries; the cache is cleared when exceeded.
 const MAX_STAT_ENTRIES: usize = 4096;
+/// Upper bound on in-flight S3 requests issued by one mount. Bounds peak
+/// memory (every list/head materializes full results) and remote pressure
+/// during I/O storms such as `find /` recursing into the mounted network
+/// drive; without it the process can OOM-abort (0xc0000409).
+const MAX_CONCURRENT_S3_REQUESTS: usize = 32;
 
 pub struct ObjectFs {
     client: Client,
@@ -77,6 +87,8 @@ pub struct ObjectFs {
     prefix: String,
     /// Short-TTL attribute cache: path -> (cached_at, entry).
     stats: Mutex<HashMap<String, (Instant, DirEntry)>>,
+    /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
+    limiter: Arc<Semaphore>,
 }
 
 impl ObjectFs {
@@ -102,7 +114,24 @@ impl ObjectFs {
             bucket: config.bucket,
             prefix: config.prefix,
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(effective_max_concurrent_requests(
+                config.max_concurrent_requests,
+            ))),
         })
+    }
+
+    /// Acquire a permit bounding in-flight S3 operations. Every public
+    /// S3-facing method takes exactly one permit for its whole body (mkdir
+    /// takes one indirectly via write); internal `*_impl` helpers never
+    /// acquire, so cross-calls cannot deadlock even when the pool is
+    /// saturated. Keep this invariant: public methods acquire, `*_impl`
+    /// helpers never do.
+    async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))
     }
 
     /// Full object key for a normalized POSIX path (see module docs).
@@ -126,6 +155,11 @@ impl ObjectFs {
 
     /// List the immediate children of `dir`.
     pub async fn list(&self, dir: &str) -> Result<Vec<DirEntry>> {
+        let _permit = self.acquire().await?;
+        self.list_impl(dir).await
+    }
+
+    async fn list_impl(&self, dir: &str) -> Result<Vec<DirEntry>> {
         let prefix = self.list_prefix(dir);
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -202,7 +236,8 @@ impl ObjectFs {
                 }
             }
         }
-        let result = self.stat_uncached(path).await?;
+        let _permit = self.acquire().await?;
+        let result = self.stat_uncached_impl(path).await?;
         if let Some(entry) = &result {
             self.cache_insert(path, entry.clone());
         }
@@ -226,8 +261,9 @@ impl ObjectFs {
     }
 
     /// The actual S3 lookup behind [`Self::stat`] (HEAD, then directory-marker
-    /// HEAD, then prefix scan as a last resort).
-    async fn stat_uncached(&self, path: &str) -> Result<Option<DirEntry>> {
+    /// HEAD, then prefix probe as a last resort). Caller must hold a limiter
+    /// permit.
+    async fn stat_uncached_impl(&self, path: &str) -> Result<Option<DirEntry>> {
         if path == "/" {
             return Ok(Some(DirEntry {
                 name: String::new(),
@@ -280,21 +316,38 @@ impl ObjectFs {
                     }
                 }
                 // Implied directory (children exist under the prefix).
-                if !path.ends_with('/') {
-                    let children = self.list(path).await?;
-                    if !children.is_empty() {
-                        return Ok(Some(DirEntry {
-                            name: basename(path),
-                            is_dir: true,
-                            size: 0,
-                            mtime_secs: 0,
-                        }));
-                    }
+                // Probe with max_keys=1 instead of materializing a full
+                // listing: stat storms on missing paths otherwise allocate a
+                // whole directory just to learn "has children".
+                if !path.ends_with('/') && self.has_children_impl(path).await? {
+                    return Ok(Some(DirEntry {
+                        name: basename(path),
+                        is_dir: true,
+                        size: 0,
+                        mtime_secs: 0,
+                    }));
                 }
                 Ok(None)
             }
             Err(e) => Err(e).context("s3 head"),
         }
+    }
+
+    /// Cheap existence probe: does `dir` have any child object? Uses
+    /// `max_keys = 1` so a missing implied directory costs one tiny request
+    /// instead of a full listing. Caller must hold a limiter permit.
+    async fn has_children_impl(&self, dir: &str) -> Result<bool> {
+        let prefix = self.list_prefix(dir);
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .context("s3 probe children")?;
+        Ok(!resp.contents().is_empty())
     }
 
     /// Read `len` bytes starting at `offset`. Returns fewer bytes near EOF,
@@ -303,6 +356,7 @@ impl ObjectFs {
         if len == 0 {
             return Ok(Vec::new());
         }
+        let _permit = self.acquire().await?;
         let key = self.key_for(path);
         let end = offset.saturating_add(len as u64);
         let range = if offset == 0 && len == usize::MAX {
@@ -329,6 +383,11 @@ impl ObjectFs {
 
     /// Overwrite an object with `data` (whole-object write).
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        let _permit = self.acquire().await?;
+        self.write_impl(path, data).await
+    }
+
+    async fn write_impl(&self, path: &str, data: &[u8]) -> Result<()> {
         self.invalidate_stat(path);
         let key = self.key_for(path);
         self.client
@@ -355,6 +414,11 @@ impl ObjectFs {
 
     /// Delete a single object.
     pub async fn delete(&self, path: &str) -> Result<()> {
+        let _permit = self.acquire().await?;
+        self.delete_impl(path).await
+    }
+
+    async fn delete_impl(&self, path: &str) -> Result<()> {
         self.invalidate_stat(path);
         let key = self.key_for(path);
         self.client
@@ -369,6 +433,11 @@ impl ObjectFs {
 
     /// Recursively delete a directory tree (objects under the dir prefix).
     pub async fn delete_dir_recursive(&self, dir: &str) -> Result<()> {
+        let _permit = self.acquire().await?;
+        self.delete_dir_recursive_impl(dir).await
+    }
+
+    async fn delete_dir_recursive_impl(&self, dir: &str) -> Result<()> {
         self.invalidate_stat(dir);
         let prefix = self.list_prefix(dir);
         let mut token: Option<String> = None;
@@ -422,6 +491,11 @@ impl ObjectFs {
     /// Rename a file or directory. Directories are copied recursively; the
     /// operation is intentionally non-atomic (object storage semantics).
     pub async fn rename(&self, old: &str, new: &str) -> Result<()> {
+        let _permit = self.acquire().await?;
+        self.rename_impl(old, new).await
+    }
+
+    async fn rename_impl(&self, old: &str, new: &str) -> Result<()> {
         self.invalidate_stat(old);
         self.invalidate_stat(new);
         let old_key = self.key_for(old);
@@ -431,7 +505,7 @@ impl ObjectFs {
         if old.ends_with('/') {
             // Directory: copy the marker + every child recursively.
             self.copy_tree(&old_key, &new_key).await?;
-            self.delete_dir_recursive(old).await
+            self.delete_dir_recursive_impl(old).await
         } else {
             self.client
                 .copy_object()
@@ -441,7 +515,7 @@ impl ObjectFs {
                 .send()
                 .await
                 .context("s3 copy")?;
-            self.delete(old).await
+            self.delete_impl(old).await
         }
     }
 
@@ -562,6 +636,15 @@ pub fn request_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// Effective in-flight S3 request cap: explicit config wins, `None`/`0`
+/// fall back to the default bound (0 never means "unlimited", which would
+/// reintroduce the unbounded-concurrency OOM this limiter prevents).
+fn effective_max_concurrent_requests(configured: Option<usize>) -> usize {
+    configured
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_CONCURRENT_S3_REQUESTS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +674,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: "brewfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "brewfs/docs/a.txt");
@@ -601,6 +685,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
@@ -616,6 +701,7 @@ mod tests {
             endpoint: None,
             force_path_style: false,
             prefix: "brewfs".into(),
+            max_concurrent_requests: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "brewfs/");
@@ -628,6 +714,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -658,6 +745,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -682,6 +770,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -705,6 +794,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -724,5 +814,238 @@ mod tests {
         let cache = fs.stats.lock().unwrap();
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key("/overflow"));
+    }
+
+    #[test]
+    fn max_concurrent_requests_default_and_override() {
+        assert_eq!(
+            effective_max_concurrent_requests(None),
+            MAX_CONCURRENT_S3_REQUESTS
+        );
+        assert_eq!(
+            effective_max_concurrent_requests(Some(0)),
+            MAX_CONCURRENT_S3_REQUESTS
+        );
+        assert_eq!(effective_max_concurrent_requests(Some(4)), 4);
+    }
+}
+
+#[cfg(test)]
+mod s3_mock_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Minimal in-process S3 mock: counts concurrent in-flight requests,
+    /// records request targets, and serves a canned ListBucketResult so the
+    /// AWS SDK can round-trip. Used to prove the request limiter is actually
+    /// wired and that implied-directory probes use `max_keys=1`.
+    struct MockS3 {
+        active: Arc<AtomicUsize>,
+        max_concurrent: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
+        delay: Duration,
+        entries: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    impl MockS3 {
+        async fn start(entries: Vec<(String, bool)>, delay: Duration) -> (Arc<Self>, u16) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mock = Arc::new(MockS3 {
+                active: Arc::new(AtomicUsize::new(0)),
+                max_concurrent: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delay,
+                entries: Arc::new(Mutex::new(entries)),
+            });
+            let server = Arc::clone(&mock);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(ok) => ok,
+                        Err(_) => break,
+                    };
+                    let mock = Arc::clone(&server);
+                    tokio::spawn(async move {
+                        handle_conn(stream, mock).await;
+                    });
+                }
+            });
+            (mock, port)
+        }
+    }
+
+    async fn handle_conn(mut stream: TcpStream, mock: Arc<MockS3>) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let n = match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+            }
+        }
+        let head = String::from_utf8_lossy(&buf[..header_end.unwrap()]);
+        let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let target = parts.next().unwrap_or("").to_string();
+        let query = target.split('?').nth(1).unwrap_or("").to_lowercase();
+
+        let in_flight = mock.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut cur = mock.max_concurrent.load(Ordering::SeqCst);
+        while in_flight > cur {
+            match mock.max_concurrent.compare_exchange(
+                cur,
+                in_flight,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        mock.requests.lock().unwrap().push(target.clone());
+
+        tokio::time::sleep(mock.delay).await;
+
+        let response = if query.contains("list-type=2") {
+            let entries = mock.entries.lock().unwrap().clone();
+            let body = list_xml(&entries);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        } else if method == "HEAD" {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+        mock.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn list_xml(entries: &[(String, bool)]) -> String {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+        );
+        body.push_str("<Name>bucket</Name><Prefix></Prefix><KeyCount>");
+        body.push_str(&entries.len().to_string());
+        body.push_str("</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>");
+        for (key, is_dir) in entries {
+            if *is_dir {
+                body.push_str(&format!(
+                    "<CommonPrefixes><Prefix>{key}</Prefix></CommonPrefixes>"
+                ));
+            } else {
+                body.push_str(&format!(
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>5</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                ));
+            }
+        }
+        body.push_str("</ListBucketResult>");
+        body
+    }
+
+    fn test_fs(port: u16, limit: usize) -> ObjectFs {
+        let client = Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .endpoint_url(format!("http://127.0.0.1:{port}"))
+                .force_path_style(true)
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "ak", "sk", None, None, "test",
+                ))
+                .behavior_version(BehaviorVersion::latest())
+                .build(),
+        );
+        ObjectFs {
+            client,
+            bucket: "b".into(),
+            prefix: String::new(),
+            stats: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(limit)),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_concurrency_is_bounded_by_limiter() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(30)).await;
+        let fs = Arc::new(test_fs(port, 2));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let fs = Arc::clone(&fs);
+            handles.push(tokio::spawn(async move { fs.list("/").await }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap().is_ok(), "list failed");
+        }
+        let max = mock.max_concurrent.load(Ordering::SeqCst);
+        assert!(
+            max <= 2,
+            "limiter not honored: observed {max} concurrent S3 requests with limit 2"
+        );
+        assert!(
+            max >= 2,
+            "test is vacuous: never saw concurrency ({max}), mock/delay broken?"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_probes_implied_dir_with_max_keys_1() {
+        let (mock, port) = MockS3::start(
+            vec![("implied/f.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+        let got = fs.stat("/implied").await.expect("stat");
+        let entry = got.expect("implied directory should exist via probe");
+        assert!(entry.is_dir, "probe must report an implied directory");
+        let reqs = mock.requests.lock().unwrap();
+        let list_reqs: Vec<&String> = reqs
+            .iter()
+            .filter(|t| t.to_lowercase().contains("list-type=2"))
+            .collect();
+        assert!(!list_reqs.is_empty(), "expected a probe LIST request");
+        assert!(
+            list_reqs
+                .iter()
+                .any(|t| t.to_lowercase().contains("max-keys=1")),
+            "probe must use max_keys=1, got: {list_reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_missing_path_returns_none_via_probe() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let got = fs.stat("/nope").await.expect("stat");
+        assert!(got.is_none(), "missing path must be None");
+        assert!(!mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_parses_common_prefixes_and_objects() {
+        let (mock, port) = MockS3::start(
+            vec![("docs/sub/".into(), true), ("docs/a.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+        let entries = fs.list("/docs").await.expect("list");
+        let names: Vec<(String, bool)> =
+            entries.iter().map(|e| (e.name.clone(), e.is_dir)).collect();
+        assert_eq!(
+            names,
+            vec![("sub".to_string(), true), ("a.txt".to_string(), false)]
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 }

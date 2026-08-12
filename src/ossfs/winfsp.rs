@@ -44,6 +44,11 @@ const REFRESH_INTERVAL_MS: u32 = 10_000;
 /// Upper bound on the number of directories the periodic change-notification
 /// pass refreshes (root always included; oldest non-root evicted on overflow).
 const MAX_TRACKED_DIRS: usize = 64;
+/// Total-entry budget for the persisted notify snapshots. Browsing a huge
+/// tree (e.g. `find /` recursion into the mounted network drive) otherwise
+/// keeps full per-directory listings alive in `snapshots`, growing memory
+/// without bound and OOM-aborting the process (0xc0000409).
+const MAX_SNAPSHOT_ENTRIES: usize = 50_000;
 
 // Win32 change-notification constants (fileapi.h).
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
@@ -163,6 +168,9 @@ struct RefreshState {
     /// Recently-browsed directories to refresh, most recent last. Root is
     /// always present and never evicted; bounded by MAX_TRACKED_DIRS.
     dirs: Vec<String>,
+    /// Total-entry budget for `snapshots` (see [`MAX_SNAPSHOT_ENTRIES`]);
+    /// kept as a field so tests can shrink it.
+    snapshot_budget: usize,
 }
 
 impl RefreshState {
@@ -171,7 +179,51 @@ impl RefreshState {
             snapshots: HashMap::new(),
             seeded: HashSet::new(),
             dirs: vec!["/".to_string()],
+            snapshot_budget: MAX_SNAPSHOT_ENTRIES,
         }
+    }
+
+    /// Number of entries currently persisted across all snapshots.
+    fn snapshot_entries(&self) -> usize {
+        self.snapshots.values().map(|snap| snap.len()).sum()
+    }
+
+    /// Enforce the total-entry budget: evict the largest non-root snapshot
+    /// until the total fits. Root is always kept so the volume-root watch
+    /// keeps a baseline; an evicted directory simply re-seeds on the next
+    /// notify pass (no change events fire for it in the meantime).
+    fn enforce_snapshot_budget(&mut self) {
+        while self.snapshot_entries() > self.snapshot_budget {
+            let victim = self
+                .snapshots
+                .iter()
+                .filter(|(dir, _)| dir.as_str() != "/")
+                .max_by_key(|(_, snap)| snap.len())
+                .map(|(dir, _)| dir.clone());
+            let Some(victim) = victim else { break };
+            if self.snapshots.remove(&victim).is_some() {
+                self.seeded.remove(&victim);
+            }
+        }
+    }
+
+    /// Persist a directory listing as the notify-change baseline. Directories
+    /// whose listing alone exceeds the budget are **not** persisted (storing
+    /// one would blow the bound; the next pass re-seeds it, so no spurious
+    /// change events fire). Afterwards the total budget is enforced.
+    fn store_snapshot(&mut self, dir: &str, entries: &[DirEntry]) {
+        if entries.len() > self.snapshot_budget {
+            self.snapshots.remove(dir);
+            self.seeded.remove(dir);
+            return;
+        }
+        let snap: HashMap<String, (bool, u64, i64)> = entries
+            .iter()
+            .map(|e| (e.name.clone(), (e.is_dir, e.size, e.mtime_secs)))
+            .collect();
+        self.snapshots.insert(dir.to_string(), snap);
+        self.seeded.insert(dir.to_string());
+        self.enforce_snapshot_budget();
     }
 
     /// Mark `dir` as recently browsed (move to the most-recent position,
@@ -216,12 +268,7 @@ impl OssMountContext {
     fn record_browsed(&self, dir: &str, entries: &[DirEntry]) {
         let mut state = self.refresh.lock().unwrap();
         state.record_browsed(dir);
-        let snap: HashMap<String, (bool, u64, i64)> = entries
-            .iter()
-            .map(|e| (e.name.clone(), (e.is_dir, e.size, e.mtime_secs)))
-            .collect();
-        state.snapshots.insert(dir.to_string(), snap);
-        state.seeded.insert(dir.to_string());
+        state.store_snapshot(dir, entries);
     }
 
     /// Lazily fetch the object's current content into the write buffer on
@@ -327,12 +374,7 @@ impl OssMountContext {
         // snapshot is a valid baseline (empty directory), not a missing one.
         if !state.seeded.contains(dir) {
             debug!(dir, count = current.len(), "[notify] seeding baseline");
-            let snap = state.snapshots.entry(dir.to_string()).or_default();
-            *snap = current
-                .into_iter()
-                .map(|e| (e.name, (e.is_dir, e.size, e.mtime_secs)))
-                .collect();
-            state.seeded.insert(dir.to_string());
+            state.store_snapshot(dir, &current);
             return;
         }
         let snap = state.snapshots.entry(dir.to_string()).or_default();
@@ -381,10 +423,12 @@ impl OssMountContext {
             notify_change(notifier, &path, FILE_ACTION_REMOVED, filter);
             snap.remove(&name);
         }
-        *snap = current
-            .into_iter()
-            .map(|e| (e.name, (e.is_dir, e.size, e.mtime_secs)))
-            .collect();
+        // Persist the new baseline through the same budget-enforcing path as
+        // seeding: a directory that grows past the budget mid-session is not
+        // kept (re-seeded next pass) and the total-entry budget is never
+        // exceeded even after diffs. (`snap`'s borrow ends after the removed
+        // loop above; NLL releases it before this new mutable borrow.)
+        state.store_snapshot(dir, &current);
     }
 }
 
@@ -934,47 +978,67 @@ impl AsyncFileSystemContext for OssMountContext {
         self.record_browsed(&context.path, &entries);
 
         let is_root = context.path == "/";
-        let mut listing: Vec<(String, DirEntry)> = Vec::with_capacity(entries.len() + 2);
-        if !is_root {
-            if let Ok(Some(dot)) = self.fs.stat(&context.path).await {
-                listing.push((".".to_string(), dot));
-            }
-            let parent = parent_posix(&context.path);
-            if let Ok(Some(dotdot)) = self.fs.stat(&parent).await {
-                listing.push(("..".to_string(), dotdot));
-            }
-        }
-        for entry in entries {
-            listing.push((entry.name.clone(), entry));
-        }
-
         let pat = pattern.map(|p| p.to_string_lossy());
-        if let Some(pat) = pat.as_deref() {
-            listing.retain(|(name, _)| wildcard_match(pat, name));
-        }
 
+        // Resume from the marker entry if present. Entries are streamed
+        // straight into the WinFsp buffer (no second full Vec is built), so
+        // a huge directory costs one listing allocation instead of two.
         let start = match marker.inner() {
             Some(name) => {
                 let name = String::from_utf16_lossy(name);
-                listing
+                entries
                     .iter()
-                    .position(|(n, _)| *n == name)
+                    .position(|e| e.name == name)
                     .map(|i| i + 1)
                     .unwrap_or(0)
             }
             None => 0,
         };
 
+        let matches = |name: &str| pat.as_deref().is_none_or(|p| wildcard_match(p, name));
+
+        // Fetch "." / ".." attributes BEFORE acquiring the DirBuffer lock:
+        // these stat calls wait on the S3 limiter and do network I/O, which
+        // must not happen while holding the kernel-side directory buffer
+        // lock. Only the first page (start == 0) emits them, matching the
+        // original listing where the dots preceded every real entry.
+        let mut dots: Vec<(String, DirEntry)> = Vec::new();
+        if !is_root && start == 0 {
+            if matches(".")
+                && let Ok(Some(dot)) = self.fs.stat(&context.path).await
+            {
+                dots.push((".".to_string(), dot));
+            }
+            let parent = parent_posix(&context.path);
+            if matches("..")
+                && let Ok(Some(dotdot)) = self.fs.stat(&parent).await
+            {
+                dots.push(("..".to_string(), dotdot));
+            }
+        }
+
         let lock = context
             .dir_buffer
             .acquire(marker.is_none(), Some(buffer.len() as u32))?;
-        for (name, entry) in listing.iter().skip(start) {
+
+        for (name, dot) in dots {
             let mut di = DirInfo::<255>::new();
-            if let Err(e) = di.set_name(name) {
-                debug!(name, error = ?e, "ossfs readdir entry name too long");
+            if di.set_name(&name).is_ok() {
+                *di.file_info_mut() = file_info_from(&dot, file_index(&name));
+                lock.write(&mut di)?;
+            }
+        }
+
+        for entry in entries.iter().skip(start) {
+            if !matches(&entry.name) {
                 continue;
             }
-            *di.file_info_mut() = file_info_from(entry, file_index(name));
+            let mut di = DirInfo::<255>::new();
+            if let Err(e) = di.set_name(&entry.name) {
+                debug!(name = %entry.name, error = ?e, "ossfs readdir entry name too long");
+                continue;
+            }
+            *di.file_info_mut() = file_info_from(entry, file_index(&entry.name));
             lock.write(&mut di)?;
         }
         drop(lock);
@@ -1044,5 +1108,106 @@ fn ensure_winfsp_dll_discoverable() {
             }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir: false,
+            size: 0,
+            mtime_secs: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_budget_evicts_largest_non_root() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 100;
+        state.store_snapshot("/", &[entry("root.txt")]);
+
+        let big: Vec<DirEntry> = (0..60).map(|i| entry(&format!("f{i}"))).collect();
+        let mid: Vec<DirEntry> = (0..40).map(|i| entry(&format!("g{i}"))).collect();
+        let small: Vec<DirEntry> = (0..30).map(|i| entry(&format!("h{i}"))).collect();
+        state.store_snapshot("/big", &big);
+        state.store_snapshot("/mid", &mid);
+        state.store_snapshot("/small", &small);
+
+        // 60 + 40 + 30 = 130 > 100 budget -> the largest (60) is evicted.
+        assert!(state.snapshot_entries() <= 100, "budget exceeded");
+        assert!(!state.snapshots.contains_key("/big"));
+        assert!(!state.seeded.contains("/big"));
+        // Root baseline is always kept.
+        assert!(state.snapshots.contains_key("/"));
+        assert!(state.snapshots.contains_key("/mid"));
+        assert!(state.snapshots.contains_key("/small"));
+    }
+
+    #[test]
+    fn snapshot_skips_directory_larger_than_budget() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 10;
+        let huge: Vec<DirEntry> = (0..11).map(|i| entry(&format!("f{i}"))).collect();
+        state.store_snapshot("/huge", &huge);
+        assert!(!state.snapshots.contains_key("/huge"));
+        assert!(!state.seeded.contains("/huge"));
+    }
+
+    #[test]
+    fn refresh_growth_evicts_largest_when_total_exceeds_budget() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 100;
+        let a60: Vec<DirEntry> = (0..60).map(|i| entry(&format!("a{i}"))).collect();
+        let b40: Vec<DirEntry> = (0..40).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/a", &a60);
+        state.store_snapshot("/b", &b40);
+        assert_eq!(state.snapshot_entries(), 100);
+        // /b grows to 50 -> total 110 > 100 -> largest non-root (/a, 60)
+        // is evicted, mirroring the refresh_dir diff path (which now goes
+        // through store_snapshot).
+        let b50: Vec<DirEntry> = (0..50).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/b", &b50);
+        assert!(
+            state.snapshot_entries() <= 100,
+            "budget exceeded after growth"
+        );
+        assert!(!state.snapshots.contains_key("/a"));
+        assert!(state.snapshots.contains_key("/b"));
+    }
+
+    #[test]
+    fn refresh_growth_past_single_dir_cap_drops_snapshot() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 20;
+        let small: Vec<DirEntry> = (0..5).map(|i| entry(&format!("a{i}"))).collect();
+        state.store_snapshot("/d", &small);
+        assert!(state.snapshots.contains_key("/d"));
+        // The directory grows past the whole budget mid-session: the
+        // baseline must be dropped (re-seed next pass), not persisted.
+        let big: Vec<DirEntry> = (0..30).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/d", &big);
+        assert!(!state.snapshots.contains_key("/d"));
+        assert!(!state.seeded.contains("/d"));
+        assert!(state.snapshot_entries() <= 20);
+    }
+
+    #[test]
+    fn record_browsed_keeps_dirs_bounded() {
+        let mut state = RefreshState::new();
+        for i in 0..MAX_TRACKED_DIRS {
+            let dir = format!("/d{i}");
+            state.record_browsed(&dir);
+            state.store_snapshot(&dir, &[entry(&format!("f{i}"))]);
+        }
+        assert!(state.dirs.len() <= MAX_TRACKED_DIRS);
+        // Oldest non-root dirs are evicted from both the refresh list and
+        // the snapshot map as new dirs are browsed.
+        assert!(!state.dirs.contains(&"/d0".to_string()));
+        assert!(!state.snapshots.contains_key("/d0"));
+        assert!(state.dirs.contains(&"/".to_string()));
     }
 }
