@@ -202,9 +202,6 @@ else
   fi
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-    "$APP/Contents/MacOS/ossfs"
-  codesign --force --options runtime --timestamp \
-    --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
     "$APP/Contents/MacOS/ossmount"
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \

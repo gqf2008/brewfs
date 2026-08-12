@@ -38,10 +38,9 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install dependencies (protobuf + FUSE-T)
+      - name: Install dependencies (FUSE-T)
         run: |
           set -euo pipefail
-          brew install protobuf
           brew install --cask fuse-t
           # 准备 ossmount 链接用的 FUSE-T prefix（布局与 scripts/package_macos.sh 一致）
           FUSE_T_PREFIX="$HOME/ossfs-deps/fuse-t"
