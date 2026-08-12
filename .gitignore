@@ -25,3 +25,8 @@ desktop/installer/build/
 
 # Redis dump dropped in repo root by local test instances
 *.rdb
+
+# Local agent tooling (skills installed for Codex / Claude Code), never commit
+.agents/
+.claude/
+skills-lock.json
