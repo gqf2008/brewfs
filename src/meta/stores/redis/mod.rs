@@ -477,6 +477,8 @@ const STATFS_SCAN_COUNT: i64 = 1000;
 const STATFS_MGET_BATCH: usize = 500;
 /// TTL for the stat_fs result cache. statfs/df is not hot; caching bounds
 /// the O(N) SCAN walk to once per TTL (documented bounded lag, issue #2).
+/// Note: the VFS layer also caches statfs (5s), so end-to-end lag through
+/// the FUSE path can reach ~10s when the two caches are phase-misaligned.
 const STATFS_CACHE_TTL: Duration = Duration::from_secs(5);
 const UNCOMMITTED_KEY_PREFIX: &str = "uc";
 const UNCOMMITTED_PENDING_INDEX_KEY: &str = "uc_pending_idx";
@@ -3116,9 +3118,11 @@ impl MetaStore for RedisMetaStore {
         // Enumerate node keys with a non-blocking SCAN cursor instead of
         // KEYS (KEYS is O(N) and blocks Redis while it walks the keyspace).
         let mut keys: Vec<String> = Vec::new();
-        let mut cursor: i64 = 0;
+        // Redis SCAN cursors are unsigned 64-bit; use u64 so huge keyspaces
+        // cannot overflow the parse.
+        let mut cursor: u64 = 0;
         loop {
-            let (next, batch): (i64, Vec<String>) = redis::cmd("SCAN")
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(format!("{NODE_KEY_PREFIX}*"))

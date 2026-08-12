@@ -225,9 +225,15 @@ where
 /// include INCRBY/HSET/ZADD.
 fn assert_delayed_written_inside_single_eval(client_cmds: &[String], lua_cmds: &[String]) {
     let client_joined = client_cmds.join("\n").to_lowercase();
-    assert!(
-        client_joined.contains("eval") || client_joined.contains("evalsha"),
-        "CAS must run as a single script; client cmds: {client_cmds:?}"
+    let script_count = client_cmds
+        .iter()
+        .filter(|c| {
+            c.to_lowercase().contains("\"eval\"") || c.to_lowercase().contains("\"evalsha\"")
+        })
+        .count();
+    assert_eq!(
+        script_count, 1,
+        "the list swap AND the delayed ledger must run in exactly one EVAL; client cmds: {client_cmds:?}"
     );
     // Only the delayed-GC ledger commands must stay inside the EVAL; the
     // versioned variant legitimately issues MULTI/DEL/ZREM afterwards for
@@ -4376,6 +4382,72 @@ async fn test_compact_replace_versioned_creates_delayed_in_single_eval() {
         .await
         .unwrap();
     assert_eq!(counter, 1);
+    let ver_after: Option<i64> = redis::cmd("GET")
+        .arg(store.chunk_version_key(chunk_id))
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        ver_after,
+        Some(2),
+        "chunk version must bump on successful replace"
+    );
+}
+
+// The n=0 branch: a replace with NO delayed slices must still swap the
+// list and bump the version, and must not touch the delayed ledger.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_compact_replace_without_delayed_records() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_nodelay.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 801,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, old_slice).await.unwrap();
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 802,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store
+        .replace_slices_for_compact(chunk_id, &[new_slice], &[])
+        .await
+        .unwrap();
+    // Empty delayed means "no old slices to remove": the old slice is kept
+    // and the new one appended (kept + new), with no delayed ledger.
+    let slices = store.get_slices(chunk_id).await.unwrap();
+    assert_eq!(slices.len(), 2);
+    assert_eq!(slices[0].slice_id, 801);
+    assert_eq!(slices[1].slice_id, 802);
+    let ver_after: Option<i64> = redis::cmd("GET")
+        .arg(store.chunk_version_key(chunk_id))
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(ver_after, Some(2), "chunk version must bump even with n=0");
+    let counter: Option<i64> = redis::cmd("GET")
+        .arg(super::DELAYED_COUNTER_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(counter, None, "no delayed counter may be created when n=0");
+    let idx_len: i64 = redis::cmd("ZCARD")
+        .arg(super::DELAYED_INDEX_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(idx_len, 0);
 }
 
 // Conflict: a stale expected version must abort with zero side effects — the
@@ -4450,7 +4522,26 @@ async fn test_compact_cas_conflict_writes_nothing() {
         .query_async(&mut store.conn.clone())
         .await
         .unwrap();
-    assert_eq!(after.len(), before.len(), "chunk list must be unchanged");
+    assert_eq!(after, before, "chunk list must be byte-for-byte unchanged");
+    let ver_after: Option<i64> = redis::cmd("GET")
+        .arg(&version_key)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        ver_after,
+        Some(99),
+        "version key must be untouched on conflict"
+    );
+    let ds_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("ds*")
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert!(
+        ds_keys.is_empty(),
+        "no delayed hashes may be created on conflict"
+    );
     let counter: Option<i64> = redis::cmd("GET")
         .arg(super::DELAYED_COUNTER_KEY)
         .query_async(&mut store.conn.clone())
