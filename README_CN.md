@@ -87,6 +87,7 @@ ossmount mount --bucket my-bucket \
 | `--max-upload-bytes N` | 限制同时在途的写上传字节数（`0` = 不限制） |
 | `--read-ahead-bytes N` | 顺序读预取窗口字节数（默认 `8388608`，`0` = 关闭） |
 | `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
+| `--max-dirty-bytes N` | 限制聚合的整文件写缓冲脏字节数（`0` = 不限制） |
 
 FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无需额外 stat 往返。
 

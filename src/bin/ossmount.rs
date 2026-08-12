@@ -29,6 +29,7 @@ fn usage() -> ! {
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync]\n\
+                 [--max-dirty-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -67,6 +68,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut max_upload_bytes: Option<usize> = None;
     let mut read_ahead_bytes: Option<usize> = Some(8 * 1024 * 1024);
     let mut ignore_fsync = true;
+    let mut max_dirty_bytes: Option<usize> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
@@ -125,6 +127,13 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
                 read_ahead_bytes = if v == 0 { None } else { Some(v) };
             }
             "--no-ignore-fsync" => ignore_fsync = false,
+            "--max-dirty-bytes" => {
+                let v: usize = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                max_dirty_bytes = if v == 0 { None } else { Some(v) };
+            }
             "--refresh-secs" => {
                 refresh_secs = args
                     .next()
@@ -157,6 +166,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             max_upload_bytes,
             read_ahead_bytes,
             ignore_fsync,
+            max_dirty_bytes,
         },
         mount_point,
         refresh_secs,

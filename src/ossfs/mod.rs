@@ -79,6 +79,10 @@ pub struct OssConfig {
     /// buffer on every sync (mirrors aliyun/ossfs `ignore_fsync`). The write
     /// is still pushed on flush/release.
     pub ignore_fsync: bool,
+    /// Cap on aggregate dirty whole-file write-buffer bytes held by the
+    /// mount adapters. `None`/`Some(0)` disables the cap. Rounded up to 1 MiB
+    /// units. Mirrors aliyun/ossfs `total_mem_limit` (the dirty-buffer part).
+    pub max_dirty_bytes: Option<usize>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -180,6 +184,8 @@ const READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_CACHE_MAX_ENTRIES: usize = 256;
 /// Upper bound on tracked sequential-read hints; cleared when exceeded.
 const MAX_READ_SEQ_ENTRIES: usize = 4096;
+/// Unit size for the dirty-buffer budget (whole MiB permits).
+const DIRTY_BUDGET_UNIT: usize = 1 << 20;
 
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
@@ -191,6 +197,63 @@ fn upload_budget_units(max_bytes: Option<usize>) -> Option<usize> {
     }
     let units = bytes.div_ceil(UPLOAD_BUDGET_UNIT).min(u32::MAX as usize);
     Some(units.max(1))
+}
+
+/// Shared, bounded budget for whole-file dirty write buffers held by the
+/// WinFsp/FUSE adapters. The budget is a semaphore of whole-MiB permits; each
+/// open write handle keeps permits for its high-water buffer size and releases
+/// them when the handle is closed.
+#[derive(Clone)]
+pub struct DirtyBudget {
+    sem: Arc<Semaphore>,
+    unit: usize,
+    max_units: usize,
+}
+
+impl DirtyBudget {
+    pub fn new(max_bytes: usize) -> Option<Self> {
+        if max_bytes == 0 {
+            return None;
+        }
+        let unit = DIRTY_BUDGET_UNIT;
+        let max_units = max_bytes.div_ceil(unit).min(u32::MAX as usize).max(1);
+        Some(Self {
+            sem: Arc::new(Semaphore::new(max_units)),
+            unit,
+            max_units,
+        })
+    }
+
+    pub fn unit(&self) -> usize {
+        self.unit
+    }
+
+    pub fn max_units(&self) -> usize {
+        self.max_units
+    }
+
+    /// Acquire `units` MiB permits. Returns an RAII permit that releases them
+    /// on drop. `units == 0` returns an empty permit.
+    pub async fn acquire_units(&self, units: usize) -> Result<DirtyPermit> {
+        if units == 0 {
+            return Ok(DirtyPermit { _permit: None });
+        }
+        let permit = self
+            .sem
+            .clone()
+            .acquire_many_owned(units as u32)
+            .await
+            .map_err(|_| anyhow::anyhow!("dirty buffer budget closed"))?;
+        Ok(DirtyPermit {
+            _permit: Some(permit),
+        })
+    }
+}
+
+/// RAII permit returned by [`DirtyBudget::acquire_units`]. Dropping it
+/// releases the reserved MiB permits back to the budget.
+pub struct DirtyPermit {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// One cached read-ahead window for a path.
@@ -236,6 +299,8 @@ pub struct ObjectFs {
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
     ignore_fsync: bool,
+    /// Dirty-buffer budget for the adapters; `None` when unlimited.
+    dirty_budget: Option<DirtyBudget>,
 }
 
 impl ObjectFs {
@@ -259,6 +324,7 @@ impl ObjectFs {
         let upload_budget_units = upload_budget_units(config.max_upload_bytes);
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         let ignore_fsync = config.ignore_fsync;
+        let dirty_budget = DirtyBudget::new(config.max_dirty_bytes.unwrap_or(0));
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -283,6 +349,7 @@ impl ObjectFs {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
+            dirty_budget,
         })
     }
 
@@ -294,6 +361,11 @@ impl ObjectFs {
     /// Whether FUSE fsync should be ignored (whole-file buffered write model).
     pub fn ignore_fsync(&self) -> bool {
         self.ignore_fsync
+    }
+
+    /// Shared dirty-buffer budget for the adapters, when configured.
+    pub fn dirty_budget(&self) -> Option<DirtyBudget> {
+        self.dirty_budget.clone()
     }
 
     /// POSIX ownership / permission defaults applied by the FUSE adapters.
@@ -1251,6 +1323,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: "ossfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
@@ -1273,6 +1346,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
@@ -1306,6 +1380,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         assert!(fs.ensure_writable().is_err());
@@ -1334,6 +1409,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         let data = vec![0u8; 2 * UPLOAD_BUDGET_UNIT];
@@ -1367,6 +1443,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         fs.insert_read_cache("/a", 0, (0..1024u32).map(|v| v as u8).collect::<Vec<_>>());
@@ -1374,6 +1451,23 @@ mod tests {
         assert_eq!(fs.read_cache_hit("/a", 2048, 4), None);
         fs.invalidate_read_cache("/a");
         assert_eq!(fs.read_cache_hit("/a", 10, 4), None);
+    }
+
+    #[test]
+    fn dirty_budget_rounds_up_and_disables_on_zero() {
+        assert!(DirtyBudget::new(0).is_none());
+        let budget = DirtyBudget::new(DIRTY_BUDGET_UNIT + 1).unwrap();
+        assert_eq!(budget.max_units(), 2);
+    }
+
+    #[tokio::test]
+    async fn dirty_budget_acquire_and_drop_releases_permits() {
+        let budget = DirtyBudget::new(2 * DIRTY_BUDGET_UNIT).unwrap();
+        assert_eq!(budget.max_units(), 2);
+        let permit = budget.acquire_units(2).await.unwrap();
+        assert_eq!(budget.sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(budget.sem.available_permits(), 2);
     }
 
     #[test]
@@ -1395,6 +1489,7 @@ mod tests {
             max_upload_bytes: None,
             read_ahead_bytes: None,
             ignore_fsync: true,
+            max_dirty_bytes: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -1419,6 +1514,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1461,6 +1557,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -1497,6 +1594,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1532,6 +1630,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1789,6 +1888,7 @@ mod s3_mock_tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            dirty_budget: None,
         }
     }
 

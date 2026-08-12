@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::future::Future;
 use std::io::Error as IoError;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
@@ -23,7 +23,7 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, U16CStr};
 
-use super::{DirEntry, ObjectFs};
+use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
@@ -143,6 +143,10 @@ pub struct OssFileContext {
     dirty: AtomicBool,
     delete_on_close: AtomicBool,
     dir_buffer: DirBuffer,
+    /// High-water MiB units reserved from [`OssMountContext::dirty_budget`].
+    budget_units: AtomicUsize,
+    /// RAII permits for every reservation made by this handle.
+    budget_permits: Mutex<Vec<DirtyPermit>>,
 }
 
 impl OssFileContext {
@@ -252,6 +256,8 @@ pub struct OssMountContext {
     /// Per-directory last-seen listings + recently-browsed dirs used by the
     /// periodic change-notification diff.
     refresh: Mutex<RefreshState>,
+    /// Optional mount-wide dirty-buffer budget.
+    dirty_budget: Option<DirtyBudget>,
 }
 
 impl OssMountContext {
@@ -260,6 +266,32 @@ impl OssMountContext {
         F: Future,
     {
         self.rt.block_on(fut)
+    }
+
+    /// Reserve dirty-buffer budget for `bytes`, if the mount configured one.
+    /// Tracks the handle's high-water mark so a file that later shrinks does
+    /// not need to release and reacquire permits.
+    async fn reserve_dirty(&self, context: &OssFileContext, bytes: usize) -> winfsp::Result<()> {
+        let Some(budget) = &self.dirty_budget else {
+            return Ok(());
+        };
+        let new_units = bytes.div_ceil(budget.unit());
+        if new_units > budget.max_units() {
+            return Err(FspError::from(IoError::other(format!(
+                "dirty buffer {bytes} bytes exceeds max-dirty-bytes budget"
+            ))));
+        }
+        let current = context.budget_units.load(Ordering::Acquire);
+        if new_units <= current {
+            return Ok(());
+        }
+        let permit = budget
+            .acquire_units(new_units - current)
+            .await
+            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        context.budget_permits.lock().unwrap().push(permit);
+        context.budget_units.store(new_units, Ordering::Release);
+        Ok(())
     }
 
     /// Remember that the user browsed `dir` and seed its baseline snapshot
@@ -281,6 +313,7 @@ impl OssMountContext {
         let data = self
             .block_on(self.fs.read_range(&context.path, 0, usize::MAX))
             .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        self.block_on(self.reserve_dirty(context, data.len()))?;
         let mut guard = context.write_buf.lock().unwrap();
         let Some(buf) = guard.as_mut() else {
             return Ok(false);
@@ -455,11 +488,13 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
 
     let rt = Handle::current();
     let read_only = fs.read_only();
+    let dirty_budget = fs.dirty_budget();
     let context = OssMountContext {
         fs,
         rt,
         mount_point: mount_point.to_path_buf(),
         refresh: Mutex::new(RefreshState::new()),
+        dirty_budget,
     };
     let params = FileSystemParams::default_params(build_volume_params(read_only));
     let mut host = FileSystemHost::new_with_timer_async::<(), REFRESH_INTERVAL_MS>(params, context)
@@ -584,6 +619,8 @@ impl FileSystemContext for OssMountContext {
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
             dir_buffer: DirBuffer::new(),
+            budget_units: AtomicUsize::new(0),
+            budget_permits: Mutex::new(Vec::new()),
         })
     }
 
@@ -624,6 +661,8 @@ impl FileSystemContext for OssMountContext {
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
             dir_buffer: DirBuffer::new(),
+            budget_units: AtomicUsize::new(0),
+            budget_permits: Mutex::new(Vec::new()),
         })
     }
 
@@ -837,6 +876,7 @@ impl FileSystemContext for OssMountContext {
                 WIN32_NOT_SUPPORTED,
             )));
         }
+        self.block_on(self.reserve_dirty(context, new_size as usize))?;
         let mut guard = context.write_buf.lock().unwrap();
         let Some(buf) = guard.as_mut() else {
             return Err(FspError::from(IoError::from_raw_os_error(
@@ -933,6 +973,7 @@ impl AsyncFileSystemContext for OssMountContext {
                 .read_range(&context.path, 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            self.reserve_dirty(context, data.len()).await?;
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
@@ -945,8 +986,8 @@ impl AsyncFileSystemContext for OssMountContext {
             }
         }
         let new_size = {
-            let mut guard = context.write_buf.lock().unwrap();
-            let Some(buf) = guard.as_mut() else {
+            let guard = context.write_buf.lock().unwrap();
+            let Some(buf) = guard.as_ref() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
                     WIN32_ACCESS_DENIED,
                 )));
@@ -956,18 +997,31 @@ impl AsyncFileSystemContext for OssMountContext {
             } else {
                 offset
             };
-            let start = effective as usize;
+            (effective as usize).saturating_add(buffer.len())
+        };
+        self.reserve_dirty(context, new_size).await?;
+        {
+            let mut guard = context.write_buf.lock().unwrap();
+            let Some(buf) = guard.as_mut() else {
+                return Err(FspError::from(IoError::from_raw_os_error(
+                    WIN32_ACCESS_DENIED,
+                )));
+            };
+            let start = if write_to_eof {
+                buf.len()
+            } else {
+                offset as usize
+            };
             if start + buffer.len() > buf.len() {
                 buf.resize(start + buffer.len(), 0);
             }
             buf[start..start + buffer.len()].copy_from_slice(buffer);
-            buf.len() as u64
-        };
+        }
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
             name: context.path.clone(),
             is_dir: false,
-            size: new_size,
+            size: new_size as u64,
             mtime_secs: 0,
         };
         *file_info = file_info_from(&entry, context.index());

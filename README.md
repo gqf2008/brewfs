@@ -102,6 +102,7 @@ region / access key → *Save* → *Mount*.
 | `--max-upload-bytes N` | Cap aggregate in-flight write bytes (`0` = unlimited) |
 | `--read-ahead-bytes N` | Sequential-read prefetch window, bytes (default `8388608`, `0` = off) |
 | `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |
+| `--max-dirty-bytes N` | Cap aggregate dirty whole-file write buffers (`0` = unlimited) |
 
 FUSE directory reads use `readdirplus`, so each directory entry also returns its
 attributes without extra stat round trips.
