@@ -1454,4 +1454,15 @@ async fn lookup_with_attr_returns_file_attr_in_one_call() {
             .unwrap()
             .is_none()
     );
+
+    // Directory entries resolve through the access-meta table (Dir attr).
+    let dir = store.mkdir(root, "fused_dir".to_string()).await.unwrap();
+    let (dir_ino, dir_attr) = store
+        .lookup_with_attr(root, "fused_dir")
+        .await
+        .unwrap()
+        .expect("lookup_with_attr should resolve a directory");
+    assert_eq!(dir_ino, dir);
+    assert_eq!(dir_attr.ino, dir);
+    assert_eq!(dir_attr.kind, FileType::Dir);
 }

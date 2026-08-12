@@ -1626,6 +1626,11 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         // sequential calls (lookup then stat). Backends without a fused
         // implementation fall back to the trait default (lookup+stat inside
         // the store); the client itself never issues two calls here.
+        //
+        // NOTE: this method deliberately DEGRADES on fused errors (returns the
+        // inode without attr), unlike cached_lookup_with_attr which propagates
+        // them. The asymmetry is intentional: cached_lookup historically
+        // tolerated a failing attribute read by still returning the inode.
         let result = match self.store.lookup_with_attr(parent, name).await {
             Ok(Some((ino, attr))) => {
                 self.cache_lookup_attr(parent, name, ino, attr).await;
@@ -5372,6 +5377,8 @@ struct CountingLookupStore {
     lookup_calls: std::sync::atomic::AtomicUsize,
     stat_calls: std::sync::atomic::AtomicUsize,
     lookup_with_attr_calls: std::sync::atomic::AtomicUsize,
+    lookup_with_attr_errors: std::sync::atomic::AtomicBool,
+    lookup_errors: std::sync::atomic::AtomicBool,
 }
 
 impl CountingLookupStore {
@@ -5380,6 +5387,8 @@ impl CountingLookupStore {
             lookup_calls: std::sync::atomic::AtomicUsize::new(0),
             stat_calls: std::sync::atomic::AtomicUsize::new(0),
             lookup_with_attr_calls: std::sync::atomic::AtomicUsize::new(0),
+            lookup_with_attr_errors: std::sync::atomic::AtomicBool::new(false),
+            lookup_errors: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -5420,6 +5429,9 @@ impl MetaStore for CountingLookupStore {
     async fn lookup(&self, _parent: i64, _name: &str) -> Result<Option<i64>, MetaError> {
         self.lookup_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.lookup_errors.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MetaError::Internal("injected lookup error".into()));
+        }
         Ok(Some(2))
     }
 
@@ -5430,6 +5442,12 @@ impl MetaStore for CountingLookupStore {
     ) -> Result<Option<(i64, FileAttr)>, MetaError> {
         self.lookup_with_attr_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .lookup_with_attr_errors
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MetaError::Internal("injected fused error".into()));
+        }
         Ok(Some((2, counting_fake_attr(2))))
     }
 
@@ -5546,4 +5564,69 @@ async fn cached_lookup_miss_uses_fused_single_store_call() {
         0,
         "cached_lookup must not issue a separate store.stat"
     );
+}
+
+#[tokio::test]
+async fn cached_lookup_degrades_to_lookup_only_when_fused_errors() {
+    let store = Arc::new(CountingLookupStore::new());
+    store
+        .lookup_with_attr_errors
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl {
+            inode_ttl: Duration::from_secs(60),
+            path_ttl: Duration::from_secs(60),
+        },
+    );
+
+    let ino = client.cached_lookup(1, "degrade.txt").await.unwrap();
+    assert_eq!(
+        ino,
+        Some(2),
+        "fused error must degrade to lookup-only result"
+    );
+    assert_eq!(
+        store
+            .lookup_with_attr_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        store.lookup_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        store.stat_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cached_lookup_propagates_error_when_lookup_also_fails() {
+    let store = Arc::new(CountingLookupStore::new());
+    store
+        .lookup_with_attr_errors
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    store
+        .lookup_errors
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl {
+            inode_ttl: Duration::from_secs(60),
+            path_ttl: Duration::from_secs(60),
+        },
+    );
+
+    let err = client.cached_lookup(1, "boom.txt").await.unwrap_err();
+    assert!(matches!(err, MetaError::Internal(_)));
 }
