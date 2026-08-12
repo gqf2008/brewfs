@@ -75,6 +75,10 @@ pub struct OssConfig {
     /// cache them so the following small reads are served locally (mirrors
     /// aliyun/ossfs `prefetch_chunk_size`). `None`/`Some(0)` disables it.
     pub read_ahead_bytes: Option<usize>,
+    /// Ignore FUSE fsync requests instead of flushing the whole-file write
+    /// buffer on every sync (mirrors aliyun/ossfs `ignore_fsync`). The write
+    /// is still pushed on flush/release.
+    pub ignore_fsync: bool,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -230,6 +234,8 @@ pub struct ObjectFs {
     read_cache: Mutex<ReadCache>,
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
+    /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
+    ignore_fsync: bool,
 }
 
 impl ObjectFs {
@@ -252,6 +258,7 @@ impl ObjectFs {
         let client = Client::from_conf(builder.build());
         let upload_budget_units = upload_budget_units(config.max_upload_bytes);
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
+        let ignore_fsync = config.ignore_fsync;
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -275,12 +282,18 @@ impl ObjectFs {
             read_ahead_window,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync,
         })
     }
 
     /// Read-only state of this mount.
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Whether FUSE fsync should be ignored (whole-file buffered write model).
+    pub fn ignore_fsync(&self) -> bool {
+        self.ignore_fsync
     }
 
     /// POSIX ownership / permission defaults applied by the FUSE adapters.
@@ -1237,6 +1250,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: "ossfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
@@ -1258,6 +1272,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
@@ -1290,6 +1305,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         assert!(fs.ensure_writable().is_err());
@@ -1317,6 +1333,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         let data = vec![0u8; 2 * UPLOAD_BUDGET_UNIT];
@@ -1349,6 +1366,7 @@ mod tests {
             read_ahead_window: 1024,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         fs.insert_read_cache("/a", 0, (0..1024u32).map(|v| v as u8).collect::<Vec<_>>());
@@ -1376,6 +1394,7 @@ mod tests {
             rename_dir_limit: Some(2_000_000),
             max_upload_bytes: None,
             read_ahead_bytes: None,
+            ignore_fsync: true,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -1399,6 +1418,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1440,6 +1460,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -1475,6 +1496,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1509,6 +1531,7 @@ mod tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1765,6 +1788,7 @@ mod s3_mock_tests {
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
+            ignore_fsync: true,
         }
     }
 

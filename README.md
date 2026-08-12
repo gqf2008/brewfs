@@ -101,6 +101,10 @@ region / access key → *Save* → *Mount*.
 | `--rename-dir-limit N` | Max objects copied by one directory rename (default `2000000`, `0` = unlimited) |
 | `--max-upload-bytes N` | Cap aggregate in-flight write bytes (`0` = unlimited) |
 | `--read-ahead-bytes N` | Sequential-read prefetch window, bytes (default `8388608`, `0` = off) |
+| `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |
+
+FUSE directory reads use `readdirplus`, so each directory entry also returns its
+attributes without extra stat round trips.
 
 Credentials come from the environment (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`) or the AWS shared config. The tray injects them into

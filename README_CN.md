@@ -86,6 +86,9 @@ ossmount mount --bucket my-bucket \
 | `--rename-dir-limit N` | 单次目录重命名最多拷贝的对象数（默认 `2000000`，`0` = 不限制） |
 | `--max-upload-bytes N` | 限制同时在途的写上传字节数（`0` = 不限制） |
 | `--read-ahead-bytes N` | 顺序读预取窗口字节数（默认 `8388608`，`0` = 关闭） |
+| `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
+
+FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无需额外 stat 往返。
 
 凭据来自环境变量（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`）或 AWS 共享配置；托盘会把密钥注入其拉起的 `ossmount` 进程。
 

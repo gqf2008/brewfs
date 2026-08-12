@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     AccessFlags, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use tokio::runtime::Handle;
 use tracing::{info, warn};
@@ -120,6 +120,8 @@ pub struct OssFs {
     gid: u32,
     /// Mount-level ownership / permission defaults from [`ObjectFs`].
     mount_attr: MountAttr,
+    /// Whether FUSE fsync is a no-op (whole-file buffered write model).
+    ignore_fsync: bool,
 }
 
 impl OssFs {
@@ -130,6 +132,7 @@ impl OssFs {
         let mount_attr = fs.mount_attr();
         let uid = effective_owner(mount_attr.uid, unsafe { libc::getuid() });
         let gid = effective_owner(mount_attr.gid, unsafe { libc::getgid() });
+        let ignore_fsync = fs.ignore_fsync();
         Self {
             fs,
             rt,
@@ -140,6 +143,7 @@ impl OssFs {
             uid,
             gid,
             mount_attr,
+            ignore_fsync,
         }
     }
 
@@ -840,6 +844,10 @@ impl Filesystem for OssFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        if self.ignore_fsync {
+            reply.ok();
+            return;
+        }
         let open = self.files.lock().unwrap().get(&fh.0).cloned();
         let Some(open) = open else {
             reply.error(Errno::EBADF);
@@ -912,6 +920,79 @@ impl Filesystem for OssFs {
 
         for (i, (name, ino, kind)) in items.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*ino), (i + 1) as u64, *kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let Some(path) = self.path_of(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let entries = match self.block_on(self.fs.list(&path)) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(path = %path, error = ?e, "ossfs readdirplus failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        // Keep the same bounded directory tracking as `readdir`.
+        {
+            let mut dirs = self.dirs.lock().unwrap();
+            dirs.insert(ino.0);
+            if dirs.len() > MAX_TRACKED_DIRS {
+                dirs.clear();
+                dirs.insert(ROOT_INODE);
+            }
+        }
+
+        let parent_path = if ino.0 == ROOT_INODE {
+            "/".to_string()
+        } else {
+            super::parent_path(&path)
+        };
+        let dot_attr = self.attr_of(
+            &path,
+            &DirEntry {
+                name: ".".to_string(),
+                is_dir: true,
+                size: 0,
+                mtime_secs: 0,
+            },
+        );
+        let parent_attr = self.attr_of(
+            &parent_path,
+            &DirEntry {
+                name: "..".to_string(),
+                is_dir: true,
+                size: 0,
+                mtime_secs: 0,
+            },
+        );
+
+        let mut items: Vec<(String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
+        items.push((".".to_string(), dot_attr));
+        items.push(("..".to_string(), parent_attr));
+        for entry in entries {
+            let child = join_path(&path, &entry.name);
+            let attr = self.attr_of(&child, &entry);
+            items.push((entry.name, attr));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (i, (name, attr)) in items.iter().enumerate().skip(offset as usize) {
+            if reply.add(attr.ino, (i + 1) as u64, name, &TTL, attr, Generation(0)) {
                 break;
             }
         }
