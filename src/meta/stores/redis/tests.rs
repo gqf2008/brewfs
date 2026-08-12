@@ -4304,9 +4304,17 @@ async fn test_compact_replace_creates_delayed_in_single_eval() {
     };
     let delayed = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[501]);
 
-    // The whole operation must be a single EVAL: the client may issue only
-    // the script (no top-level INCRBY/HSET/ZADD), and the delayed ledger
-    // must be written by script-internal redis.call.
+    // Pre-load the CAS+delayed script so the monitored op's EVALSHA hits the
+    // server script cache: on a cold cache redis-rs falls back to
+    // SCRIPT LOAD + a second EVALSHA, which would appear as two client
+    // script calls and trip the single-EVAL assertion.
+    let _sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg(super::CHUNK_CAS_DELAYED_LUA)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+
     let (client_cmds, lua_cmds) = monitor_top_level(async {
         store
             .replace_slices_for_compact(chunk_id, &[new_slice], &delayed)
@@ -4363,6 +4371,13 @@ async fn test_compact_replace_versioned_creates_delayed_in_single_eval() {
         length: 1024,
     };
     let delayed = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[601]);
+
+    let _sha: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg(super::CHUNK_CAS_DELAYED_LUA)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
 
     let (client_cmds, lua_cmds) = monitor_top_level(async {
         store
