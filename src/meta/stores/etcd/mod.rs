@@ -1678,6 +1678,32 @@ impl MetaStore for EtcdMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
+    async fn lookup_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+    ) -> Result<Option<(i64, FileAttr)>, MetaError> {
+        // The reverse (metadata) key is keyed by inode, which is only known
+        // after the forward lookup resolves the name, so the two reads cannot
+        // be batched into a single round trip. This explicit implementation
+        // still keeps the lookup-miss path as ONE store call for the client
+        // (no separate lookup + stat from the client side).
+        let forward_key = Self::etcd_forward_key(parent, name);
+        let Some(entry) = self.etcd_get_json::<EtcdForwardEntry>(&forward_key).await? else {
+            return Ok(None);
+        };
+        let ino = entry.inode;
+        let reverse_key = Self::etcd_reverse_key(ino);
+        let Some(entry_info) = self
+            .etcd_get_json_lenient_serde_only::<EtcdEntryInfo>(&reverse_key)
+            .await?
+        else {
+            return Err(MetaError::NotFound(ino));
+        };
+        Ok(Some((ino, entry_info.to_file_attr(ino))))
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path == "/" {

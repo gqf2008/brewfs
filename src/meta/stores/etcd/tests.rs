@@ -8,6 +8,7 @@ use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{LockName, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::EtcdMetaStore;
 use crate::vfs::chunk_id_for;
+use crate::vfs::fs::FileType;
 use chrono::Utc;
 use serial_test::serial;
 use tokio::time;
@@ -1655,5 +1656,36 @@ async fn test_process_delayed_slices_filters_by_age_before_limit_etcd() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn lookup_with_attr_returns_ino_and_attr() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "fused_lookup.txt".to_string())
+        .await
+        .unwrap();
+    store.set_file_size(ino, 1024).await.unwrap();
+
+    let got = store
+        .lookup_with_attr(root, "fused_lookup.txt")
+        .await
+        .unwrap();
+    let (got_ino, attr) = got.expect("lookup_with_attr should resolve the entry");
+    assert_eq!(got_ino, ino);
+    assert_eq!(attr.ino, ino);
+    assert_eq!(attr.kind, FileType::File);
+    assert_eq!(attr.size, 1024);
+
+    assert!(
+        store
+            .lookup_with_attr(root, "nope_lookup.txt")
+            .await
+            .unwrap()
+            .is_none()
     );
 }

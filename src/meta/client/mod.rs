@@ -1621,16 +1621,36 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         trace!("MetaClient: lookup MISS ({}, '{}')", parent, name);
         self.metrics.record_lookup_cache_miss();
 
-        let result = self.store.lookup(parent, name).await?;
+        // Fused single store call: lookup + attribute in one request, so the
+        // lookup-miss path costs one store round trip instead of two
+        // sequential calls (lookup then stat). Backends without a fused
+        // implementation fall back to the trait default (lookup+stat inside
+        // the store); the client itself never issues two calls here.
+        let result = match self.store.lookup_with_attr(parent, name).await {
+            Ok(Some((ino, attr))) => {
+                self.cache_lookup_attr(parent, name, ino, attr).await;
+                Some(ino)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                // Preserve legacy tolerance for a failing attribute read:
+                // degrade to a lookup-only result instead of failing the
+                // whole lookup (matches the old `if let Ok(Some(attr))`).
+                self.metrics.record_lookup_attr_fused_error();
+                match self.store.lookup(parent, name).await {
+                    Ok(Some(ino)) => {
+                        self.inode_cache
+                            .add_child(parent, name.to_string(), ino)
+                            .await;
+                        Some(ino)
+                    }
+                    Ok(None) => None,
+                    Err(_) => return Err(err),
+                }
+            }
+        };
 
         if let Some(ino) = result {
-            if let Ok(Some(attr)) = self.store.stat(ino).await {
-                self.cache_lookup_attr(parent, name, ino, attr).await;
-            } else {
-                self.inode_cache
-                    .add_child(parent, name.to_string(), ino)
-                    .await;
-            }
             Ok(Some(ino))
         } else if self.options.case_insensitive {
             self.resolve_case(parent, name).await
@@ -5343,4 +5363,187 @@ mod tests {
         let final_attr = client.cached_stat(file_ino).await.unwrap().unwrap();
         assert_eq!(original_attr.ino, final_attr.ino);
     }
+}
+
+/// Test double that counts which MetaStore methods the client calls on the
+/// lookup-miss path. Only `lookup_with_attr` / `lookup` / `stat` are real;
+/// every other required MetaStore method is unreachable in these tests.
+struct CountingLookupStore {
+    lookup_calls: std::sync::atomic::AtomicUsize,
+    stat_calls: std::sync::atomic::AtomicUsize,
+    lookup_with_attr_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingLookupStore {
+    fn new() -> Self {
+        Self {
+            lookup_calls: std::sync::atomic::AtomicUsize::new(0),
+            stat_calls: std::sync::atomic::AtomicUsize::new(0),
+            lookup_with_attr_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+fn counting_fake_attr(ino: i64) -> FileAttr {
+    FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        kind: FileType::File,
+        mode: 0o100644,
+        rdev: 0,
+        uid: 0,
+        gid: 0,
+        atime: 1,
+        mtime: 1,
+        ctime: 1,
+        nlink: 1,
+    }
+}
+
+#[async_trait]
+impl MetaStore for CountingLookupStore {
+    fn root_ino(&self) -> i64 {
+        1
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn stat(&self, _ino: i64) -> Result<Option<FileAttr>, MetaError> {
+        self.stat_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(counting_fake_attr(2)))
+    }
+
+    async fn lookup(&self, _parent: i64, _name: &str) -> Result<Option<i64>, MetaError> {
+        self.lookup_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(2))
+    }
+
+    async fn lookup_with_attr(
+        &self,
+        _parent: i64,
+        _name: &str,
+    ) -> Result<Option<(i64, FileAttr)>, MetaError> {
+        self.lookup_with_attr_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some((2, counting_fake_attr(2))))
+    }
+
+    async fn lookup_path(&self, _path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
+        unimplemented!()
+    }
+    async fn readdir(&self, _ino: i64) -> Result<Vec<DirEntry>, MetaError> {
+        unimplemented!()
+    }
+    async fn mkdir(&self, _parent: i64, _name: String) -> Result<i64, MetaError> {
+        unimplemented!()
+    }
+    async fn rmdir(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn create_file(&self, _parent: i64, _name: String) -> Result<i64, MetaError> {
+        unimplemented!()
+    }
+    async fn unlink(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn rename(
+        &self,
+        _old_parent: i64,
+        _old_name: &str,
+        _new_parent: i64,
+        _new_name: String,
+    ) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn rename_exchange(
+        &self,
+        _old_parent: i64,
+        _old_name: &str,
+        _new_parent: i64,
+        _new_name: &str,
+    ) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn write(
+        &self,
+        _ino: i64,
+        _chunk_id: u64,
+        _slice: crate::chunk::SliceDesc,
+        _new_size: u64,
+    ) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn set_file_size(&self, _ino: i64, _size: u64) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn get_names(&self, _ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
+        unimplemented!()
+    }
+    async fn get_paths(&self, _ino: i64) -> Result<Vec<String>, MetaError> {
+        unimplemented!()
+    }
+    async fn initialize(&self) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
+        unimplemented!()
+    }
+    async fn remove_file_metadata(&self, _ino: i64) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn get_slices(&self, _chunk_id: u64) -> Result<Vec<crate::chunk::SliceDesc>, MetaError> {
+        unimplemented!()
+    }
+    async fn append_slice(
+        &self,
+        _chunk_id: u64,
+        _slice: crate::chunk::SliceDesc,
+    ) -> Result<(), MetaError> {
+        unimplemented!()
+    }
+    async fn next_id(&self, _key: &str) -> Result<i64, MetaError> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn cached_lookup_miss_uses_fused_single_store_call() {
+    let store = Arc::new(CountingLookupStore::new());
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl {
+            inode_ttl: Duration::from_secs(60),
+            path_ttl: Duration::from_secs(60),
+        },
+    );
+
+    let ino = client.cached_lookup(1, "fused.txt").await.unwrap();
+    assert_eq!(ino, Some(2));
+
+    assert_eq!(
+        store
+            .lookup_with_attr_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cached_lookup miss must use the fused lookup_with_attr"
+    );
+    assert_eq!(
+        store.lookup_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "cached_lookup must not issue a separate store.lookup"
+    );
+    assert_eq!(
+        store.stat_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "cached_lookup must not issue a separate store.stat"
+    );
 }

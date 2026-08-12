@@ -695,3 +695,36 @@ async fn tikv_link_and_symlink_extensions() {
         vec!["/hard".to_string()]
     );
 }
+
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+#[tokio::test]
+async fn lookup_with_attr_returns_ino_and_attr() {
+    let store = TiKvMetaStore::from_config(integration_config("lookup_with_attr"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "fused_lookup.txt".to_string())
+        .await
+        .unwrap();
+    store.set_file_size(ino, 1024).await.unwrap();
+
+    let got = store
+        .lookup_with_attr(root, "fused_lookup.txt")
+        .await
+        .unwrap();
+    let (got_ino, attr) = got.expect("lookup_with_attr should resolve the entry");
+    assert_eq!(got_ino, ino);
+    assert_eq!(attr.ino, ino);
+    assert_eq!(attr.kind, FileType::File);
+    assert_eq!(attr.size, 1024);
+
+    assert!(
+        store
+            .lookup_with_attr(root, "nope_lookup.txt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
