@@ -18,6 +18,8 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0.100"
 aws-config = "1.8.8"
+aws-smithy-runtime-api = "1.11.4"
+aws-smithy-types = "1.4.4"
 aws-sdk-s3 = "1.108.0"
 dirs = "6.0.0"
 libc = "0.2.175"
@@ -32,6 +34,8 @@ winfsp = { version = "0.12.2", default-features = false }
 anyhow = { workspace = true }
 aws-config = { workspace = true, features = ["credentials-process"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
 chrono = "0.4.42"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "time", "net", "signal", "tracing"] }

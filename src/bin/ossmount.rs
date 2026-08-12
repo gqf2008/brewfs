@@ -24,11 +24,11 @@ use ossfs::{ObjectFs, OssConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ossmount --bucket BUCKET [--endpoint URL] [--region REGION]\n\
+        "usage: ossmount [mount] --bucket BUCKET [--endpoint URL] [--region REGION]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
-                 [--read-ahead-bytes N] [--no-ignore-fsync]\n\
+                 [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
@@ -70,58 +70,64 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut ignore_fsync = true;
     let mut max_dirty_bytes: Option<usize> = None;
     let mut credential_process: Option<String> = None;
+    let mut verify_crc64 = true;
     let mut mount_point: Option<PathBuf> = None;
 
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("mount") {
+        args.remove(0);
+    }
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--bucket" => bucket = args.next().unwrap_or_else(|| usage()),
-            "--endpoint" => endpoint = Some(args.next().unwrap_or_else(|| usage())),
-            "--region" => region = args.next().unwrap_or_else(|| usage()),
-            "--prefix" => prefix = args.next().unwrap_or_else(|| usage()),
+            "--bucket" => bucket = iter.next().unwrap_or_else(|| usage()),
+            "--endpoint" => endpoint = Some(iter.next().unwrap_or_else(|| usage())),
+            "--region" => region = iter.next().unwrap_or_else(|| usage()),
+            "--prefix" => prefix = iter.next().unwrap_or_else(|| usage()),
             "--force-path-style" => force_path_style = true,
             "--read-only" => read_only = true,
             "--uid" => {
-                uid = args
+                uid = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage())
             }
             "--gid" => {
-                gid = args
+                gid = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage())
             }
             "--dir-mode" => {
-                dir_mode = args
+                dir_mode = iter
                     .next()
                     .and_then(|v| parse_mode(&v))
                     .unwrap_or_else(|| usage());
             }
             "--file-mode" => {
-                file_mode = args
+                file_mode = iter
                     .next()
                     .and_then(|v| parse_mode(&v))
                     .unwrap_or_else(|| usage());
             }
             "--no-rename-dir" => allow_rename_dir = false,
             "--rename-dir-limit" => {
-                let v: u64 = args
+                let v: u64 = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
                 rename_dir_limit = if v == 0 { None } else { Some(v) };
             }
             "--max-upload-bytes" => {
-                let v: usize = args
+                let v: usize = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
                 max_upload_bytes = if v == 0 { None } else { Some(v) };
             }
             "--read-ahead-bytes" => {
-                let v: usize = args
+                let v: usize = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
@@ -129,17 +135,18 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             }
             "--no-ignore-fsync" => ignore_fsync = false,
             "--max-dirty-bytes" => {
-                let v: usize = args
+                let v: usize = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
                 max_dirty_bytes = if v == 0 { None } else { Some(v) };
             }
+            "--no-verify-crc64" => verify_crc64 = false,
             "--credential-process" => {
-                credential_process = Some(args.next().unwrap_or_else(|| usage()))
+                credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
             "--refresh-secs" => {
-                refresh_secs = args
+                refresh_secs = iter
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
@@ -172,6 +179,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             ignore_fsync,
             max_dirty_bytes,
             credential_process,
+            verify_crc64,
         },
         mount_point,
         refresh_secs,

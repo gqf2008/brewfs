@@ -26,6 +26,9 @@ use aws_config::credential_process::CredentialProcessProvider;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
+use aws_smithy_runtime_api::client::interceptors::{
+    Intercept, context::BeforeDeserializationInterceptorContextRef,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -88,6 +91,11 @@ pub struct OssConfig {
     /// command is executed on credential refresh and must emit the standard
     /// AWS credential-process JSON. Takes precedence over env/profile creds.
     pub credential_process: Option<String>,
+    /// Verify each uploaded object's integrity against the `x-oss-hash-crc64ecma`
+    /// header returned by OSS (mirrors aliyun/ossfs `enable_crc64`). The
+    /// CRC64-ECMA-182 checksum is computed locally on every object / multipart
+    /// write and compared to the value OSS reports back after the upload.
+    pub verify_crc64: bool,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -124,6 +132,65 @@ pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32) -> u16
         dir_mode as u16
     } else {
         file_mode as u16
+    }
+}
+
+/// Compute the CRC-64/ECMA-182 checksum used by Aliyun OSS
+/// (`x-oss-hash-crc64ecma`). The reflected polynomial is `0xC96C5795D7870F42`,
+/// init `0xFFFF_FFFF_FFFF_FFFF`, xorout `0xFFFF_FFFF_FFFF_FFFF`, identical to
+/// CRC-64/XZ and to aliyun/ossfs's PhotonLibOS `crc64ecma`.
+pub(crate) fn crc64ecma(data: &[u8]) -> u64 {
+    const POLY: u64 = 0xC96C_5795_D787_0F42;
+    let mut crc: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    for &b in data {
+        crc ^= b as u64;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ ((crc & 1).wrapping_neg() & POLY);
+        }
+    }
+    crc ^ 0xFFFF_FFFF_FFFF_FFFF
+}
+
+/// Captures the `x-oss-hash-crc64ecma` response header before the SDK
+/// deserializes the output, so the write path can compare it to the locally
+/// computed checksum after the call returns.
+#[derive(Debug)]
+struct Crc64ResponseCapture {
+    slot: Arc<Mutex<Option<u64>>>,
+}
+
+impl Intercept for Crc64ResponseCapture {
+    fn name(&self) -> &'static str {
+        "Crc64ResponseCapture"
+    }
+
+    fn read_before_deserialization(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+    ) -> std::result::Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        let value = context
+            .response()
+            .headers()
+            .get("x-oss-hash-crc64ecma")
+            .and_then(|v| v.parse::<u64>().ok());
+        *self.slot.lock().unwrap() = value;
+        Ok(())
+    }
+}
+
+/// Verify that `expected` matches the CRC64 value returned by OSS. The header
+/// is captured as a side effect of [`Crc64ResponseCapture`] on the operation
+/// that just completed.
+fn check_crc64_response(slot: Arc<Mutex<Option<u64>>>, expected: u64) -> Result<()> {
+    let actual = slot.lock().unwrap().take();
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => anyhow::bail!(
+            "crc64 mismatch: expected {expected}, got {actual} from x-oss-hash-crc64ecma"
+        ),
+        None => anyhow::bail!("x-oss-hash-crc64ecma header missing from upload response"),
     }
 }
 
@@ -304,7 +371,9 @@ pub struct ObjectFs {
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
     ignore_fsync: bool,
-    /// Dirty-buffer budget for the adapters; `None` when unlimited.
+    /// Verify uploaded objects via x-oss-hash-crc64ecma (see [OssConfig::verify_crc64]).
+    verify_crc64: bool,
+    /// Dirty-buffer budget for the adapters; None when unlimited.
     dirty_budget: Option<DirtyBudget>,
 }
 
@@ -357,6 +426,7 @@ impl ObjectFs {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
+            verify_crc64: config.verify_crc64,
             dirty_budget,
         })
     }
@@ -829,14 +899,26 @@ impl ObjectFs {
 
     async fn put_whole_object(&self, path: &str, data: &[u8]) -> Result<()> {
         let key = self.key_for(path);
-        self.client
+        let expected_crc = self.verify_crc64.then(|| crc64ecma(data));
+        let crc_slot = Arc::new(Mutex::new(None));
+
+        let mut put = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(ByteStream::from(data.to_vec()))
-            .send()
-            .await
-            .context("s3 put")?;
+            .customize();
+        if expected_crc.is_some() {
+            put = put.interceptor(Crc64ResponseCapture {
+                slot: Arc::clone(&crc_slot),
+            });
+        }
+        put.send().await.context("s3 put")?;
+
+        if let Some(expected) = expected_crc {
+            check_crc64_response(crc_slot, expected)?;
+        }
         Ok(())
     }
 
@@ -845,6 +927,8 @@ impl ObjectFs {
     /// no unfinished multipart upload is left behind on the bucket.
     async fn write_multipart(&self, path: &str, data: &[u8]) -> Result<()> {
         let key = self.key_for(path);
+        let expected_crc = self.verify_crc64.then(|| crc64ecma(data));
+        let crc_slot = Arc::new(Mutex::new(None));
 
         let create = self
             .client
@@ -936,7 +1020,7 @@ impl ObjectFs {
         }
 
         parts.sort_by_key(|p| p.part_number);
-        if let Err(e) = self
+        let mut complete = self
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -947,9 +1031,13 @@ impl ObjectFs {
                     .set_parts(Some(parts))
                     .build(),
             )
-            .send()
-            .await
-        {
+            .customize();
+        if expected_crc.is_some() {
+            complete = complete.interceptor(Crc64ResponseCapture {
+                slot: Arc::clone(&crc_slot),
+            });
+        }
+        if let Err(e) = complete.send().await {
             let _ = self
                 .client
                 .abort_multipart_upload()
@@ -959,6 +1047,9 @@ impl ObjectFs {
                 .send()
                 .await;
             return Err(e).context("s3 complete multipart upload");
+        }
+        if let Some(expected) = expected_crc {
+            check_crc64_response(crc_slot, expected)?;
         }
         Ok(())
     }
@@ -1331,6 +1422,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: "ossfs/".into(),
         };
@@ -1354,6 +1446,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1388,6 +1481,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1417,6 +1511,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1451,6 +1546,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1498,6 +1594,7 @@ mod tests {
             read_ahead_bytes: None,
             ignore_fsync: true,
             max_dirty_bytes: None,
+            verify_crc64: false,
             credential_process: None,
         }
         .normalize();
@@ -1523,6 +1620,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1566,6 +1664,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1603,6 +1702,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1639,6 +1739,7 @@ mod tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1699,9 +1800,14 @@ mod s3_mock_tests {
         recorded: Arc<Mutex<Vec<MockRequest>>>,
         delay: Duration,
         entries: Arc<Mutex<Vec<(String, bool)>>>,
+        crc64: Mutex<u64>,
     }
 
     impl MockS3 {
+        fn set_crc64(&self, v: u64) {
+            *self.crc64.lock().unwrap() = v;
+        }
+
         async fn start(entries: Vec<(String, bool)>, delay: Duration) -> (Arc<Self>, u16) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -1712,6 +1818,7 @@ mod s3_mock_tests {
                 recorded: Arc::new(Mutex::new(Vec::new())),
                 delay,
                 entries: Arc::new(Mutex::new(entries)),
+                crc64: Mutex::new(0),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -1814,12 +1921,20 @@ mod s3_mock_tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         } else if query.contains("uploadid") && method == "POST" {
             // CompleteMultipartUpload
-            http_response(200, "application/xml", Some(&complete_multipart_xml()))
+            let crc = *mock.crc64.lock().unwrap();
+            let body = complete_multipart_xml();
+            format!(
+                "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
         } else if method == "HEAD" {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         } else {
             // Plain PutObject / DeleteObject / ...
-            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            let crc = *mock.crc64.lock().unwrap();
+            format!(
+                "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
         };
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.shutdown().await;
@@ -1897,6 +2012,7 @@ mod s3_mock_tests {
             read_cache: Mutex::new(ReadCache::default()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
+            verify_crc64: false,
             dirty_budget: None,
         }
     }
@@ -2019,6 +2135,35 @@ mod s3_mock_tests {
     }
 
     #[tokio::test]
+    async fn write_small_object_verifies_crc64() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+
+        let data = vec![0x5Au8; 1024];
+        let expected = crc64ecma(&data);
+        mock.set_crc64(expected);
+
+        fs.write("/small-crc.bin", &data).await.expect("write");
+    }
+
+    #[tokio::test]
+    async fn write_small_object_rejects_crc64_mismatch() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+
+        let data = vec![0x5Au8; 1024];
+        mock.set_crc64(crc64ecma(&data).wrapping_add(1));
+
+        let err = fs.write("/small-bad.bin", &data).await.unwrap_err();
+        assert!(
+            err.to_string().contains("crc64 mismatch"),
+            "expected crc64 mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn write_large_object_uses_multipart_and_reassembles() {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let fs = test_fs(port, 32);
@@ -2090,6 +2235,20 @@ mod s3_mock_tests {
     }
 
     #[tokio::test]
+    async fn write_large_object_verifies_crc64() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+
+        let data: Vec<u8> = (0..20 * 1024 * 1024usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        mock.set_crc64(crc64ecma(&data));
+
+        fs.write("/large-crc.bin", &data).await.expect("write");
+    }
+
+    #[tokio::test]
     async fn stat_missing_path_is_negatively_cached() {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let fs = test_fs(port, 32);
@@ -2102,5 +2261,11 @@ mod s3_mock_tests {
         assert!(fs.stat("/nope").await.expect("stat").is_none());
         let after = mock.requests.lock().unwrap().len();
         assert_eq!(before, after, "second stat must hit the negative cache");
+    }
+
+    #[test]
+    fn crc64ecma_matches_known_vectors() {
+        assert_eq!(crc64ecma(b"123456789"), 0x995DC9BBDF1939FA);
+        assert_eq!(crc64ecma(b"a"), 0x330284772E652B05);
     }
 }

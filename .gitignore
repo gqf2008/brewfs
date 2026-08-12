@@ -30,3 +30,4 @@ desktop/installer/build/
 .agents/
 .claude/
 skills-lock.json
+TEMP/
