@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,7 +25,9 @@ use fuser::{
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
-use super::{DirEntry, MountAttr, ObjectFs, effective_mode, effective_owner};
+use super::{
+    DirEntry, DirtyBudget, DirtyPermit, MountAttr, ObjectFs, effective_mode, effective_owner,
+};
 
 /// Attribute/entry cache lifetime. Object storage has no change notifications,
 /// so a short TTL keeps the tree weakly consistent across machines.
@@ -92,6 +94,10 @@ struct OpenFile {
     /// opening a file for write never downloads the whole object.
     loaded: bool,
     dirty: bool,
+    /// High-water MiB units reserved from [`OssFs::dirty_budget`].
+    budget_units: Arc<AtomicUsize>,
+    /// RAII permits for every reservation made by this handle.
+    budget_permits: Arc<Mutex<Vec<DirtyPermit>>>,
 }
 
 /// Resize an open handle's write buffer (truncate/extend).
@@ -122,6 +128,8 @@ pub struct OssFs {
     mount_attr: MountAttr,
     /// Whether FUSE fsync is a no-op (whole-file buffered write model).
     ignore_fsync: bool,
+    /// Optional mount-wide dirty-buffer budget.
+    dirty_budget: Option<DirtyBudget>,
 }
 
 impl OssFs {
@@ -133,6 +141,7 @@ impl OssFs {
         let uid = effective_owner(mount_attr.uid, unsafe { libc::getuid() });
         let gid = effective_owner(mount_attr.gid, unsafe { libc::getgid() });
         let ignore_fsync = fs.ignore_fsync();
+        let dirty_budget = fs.dirty_budget();
         Self {
             fs,
             rt,
@@ -144,6 +153,7 @@ impl OssFs {
             gid,
             mount_attr,
             ignore_fsync,
+            dirty_budget,
         }
     }
 
@@ -157,6 +167,27 @@ impl OssFs {
         fut: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
         self.rt.block_on(fut)
+    }
+
+    /// Reserve dirty-buffer budget for `bytes`, if the mount configured one.
+    /// Tracks the handle's high-water mark so later shrink does not need to
+    /// release and reacquire permits.
+    async fn reserve_dirty(&self, open: &OpenFile, bytes: usize) -> anyhow::Result<()> {
+        let Some(budget) = &self.dirty_budget else {
+            return Ok(());
+        };
+        let new_units = bytes.div_ceil(budget.unit());
+        if new_units > budget.max_units() {
+            anyhow::bail!("dirty buffer {bytes} bytes exceeds max-dirty-bytes budget");
+        }
+        let current = open.budget_units.load(Ordering::Acquire);
+        if new_units <= current {
+            return Ok(());
+        }
+        let permit = budget.acquire_units(new_units - current).await?;
+        open.budget_permits.lock().unwrap().push(permit);
+        open.budget_units.store(new_units, Ordering::Release);
+        Ok(())
     }
 
     fn path_of(&self, ino: INodeNo) -> Option<String> {
@@ -359,6 +390,20 @@ impl Filesystem for OssFs {
                         }
                         open.loaded = true;
                     }
+                }
+                let reserve_target = {
+                    let guard = self.files.lock().unwrap();
+                    guard
+                        .get(&fh.0)
+                        .filter(|o| o.path == path && o.write_buf.is_some())
+                        .cloned()
+                };
+                if let Some(open) = reserve_target
+                    && let Err(e) = self.block_on(self.reserve_dirty(&open, new_size as usize))
+                {
+                    warn!(path = %path, error = ?e, "ossfs setattr dirty budget failed");
+                    reply.error(Errno::EIO);
+                    return;
                 }
                 let mut guard = self.files.lock().unwrap();
                 if let Some(open) = guard.get_mut(&fh.0)
@@ -602,6 +647,8 @@ impl Filesystem for OssFs {
                 write_buf,
                 loaded: false,
                 dirty: false,
+                budget_units: Arc::new(AtomicUsize::new(0)),
+                budget_permits: Arc::new(Mutex::new(Vec::new())),
             },
         );
         reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -680,6 +727,8 @@ impl Filesystem for OssFs {
                 // lazily on first write.
                 loaded: !needs_existing,
                 dirty: false,
+                budget_units: Arc::new(AtomicUsize::new(0)),
+                budget_permits: Arc::new(Mutex::new(Vec::new())),
             },
         );
         reply.created(
@@ -736,12 +785,12 @@ impl Filesystem for OssFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        // Lazily fetch the original content on the first write, without
-        // holding the files lock across the S3 round trip.
-        let (needs_load, path) = {
+        // Snapshot the handle so we can reserve dirty-buffer budget without
+        // holding the files lock across the S3 round trip or the budget wait.
+        let open_snapshot = {
             let guard = self.files.lock().unwrap();
             match guard.get(&fh.0) {
-                Some(o) => (o.write_buf.is_some() && !o.loaded, o.path.clone()),
+                Some(o) => o.clone(),
                 None => {
                     drop(guard);
                     reply.error(Errno::EBADF);
@@ -749,6 +798,8 @@ impl Filesystem for OssFs {
                 }
             }
         };
+        let path = open_snapshot.path.clone();
+        let needs_load = open_snapshot.write_buf.is_some() && !open_snapshot.loaded;
         if needs_load {
             let data = match self.block_on(self.fs.read_range(&path, 0, usize::MAX)) {
                 Ok(d) => d,
@@ -758,6 +809,11 @@ impl Filesystem for OssFs {
                     return;
                 }
             };
+            if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, data.len())) {
+                warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
+                reply.error(Errno::EIO);
+                return;
+            }
             let mut guard = self.files.lock().unwrap();
             if let Some(o) = guard.get_mut(&fh.0) {
                 // Only seed if nobody loaded meanwhile (e.g. a concurrent
@@ -769,6 +825,12 @@ impl Filesystem for OssFs {
                     o.loaded = true;
                 }
             }
+        }
+        let new_size = (offset as usize).saturating_add(data.len());
+        if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, new_size)) {
+            warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
+            reply.error(Errno::EIO);
+            return;
         }
         let mut guard = self.files.lock().unwrap();
         let Some(open) = guard.get_mut(&fh.0) else {
