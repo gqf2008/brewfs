@@ -23,6 +23,7 @@ pub mod winfsp;
 
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,17 @@ const MAX_STAT_ENTRIES: usize = 4096;
 /// during I/O storms such as `find /` recursing into the mounted network
 /// drive; without it the process can OOM-abort (0xc0000409).
 const MAX_CONCURRENT_S3_REQUESTS: usize = 32;
+/// Above this size, `write` uploads via S3 multipart (bounded-concurrency
+/// parts) instead of a single PUT. A single PUT is capped at 5 GiB by OSS/S3
+/// and is more sensitive to timeouts / retries on large objects.
+const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+/// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
+/// allows >= 100 KiB, so 8 MiB is safe for both).
+const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
+/// Concurrent in-flight part uploads within a single multipart write. Each
+/// part also takes a global request-limit permit, so global in-flight stays
+/// bounded.
+const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
 
 pub struct ObjectFs {
     client: Client,
@@ -381,14 +393,20 @@ impl ObjectFs {
         Ok(body.to_vec())
     }
 
-    /// Overwrite an object with `data` (whole-object write).
+    /// Overwrite an object with `data` (whole-object write). Large objects
+    /// are uploaded via S3 multipart so they are not limited by the single-PUT
+    /// object-size cap and can be retried per part.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
-        let _permit = self.acquire().await?;
-        self.write_impl(path, data).await
+        self.invalidate_stat(path);
+        if data.len() as u64 > MULTIPART_THRESHOLD {
+            self.write_multipart(path, data).await
+        } else {
+            let _permit = self.acquire().await?;
+            self.put_whole_object(path, data).await
+        }
     }
 
-    async fn write_impl(&self, path: &str, data: &[u8]) -> Result<()> {
-        self.invalidate_stat(path);
+    async fn put_whole_object(&self, path: &str, data: &[u8]) -> Result<()> {
         let key = self.key_for(path);
         self.client
             .put_object()
@@ -398,6 +416,129 @@ impl ObjectFs {
             .send()
             .await
             .context("s3 put")?;
+        Ok(())
+    }
+
+    /// Multipart upload: initiate -> upload parts (bounded concurrency, one
+    /// global permit per part) -> complete. Any failure aborts the upload so
+    /// no unfinished multipart upload is left behind on the bucket.
+    async fn write_multipart(&self, path: &str, data: &[u8]) -> Result<()> {
+        let key = self.key_for(path);
+
+        let create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .context("s3 create multipart upload")?;
+        let upload_id = create
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
+            .to_string();
+
+        let local = Arc::new(Semaphore::new(MULTIPART_UPLOAD_CONCURRENCY));
+        let mut handles = tokio::task::JoinSet::new();
+        let mut part_number = 1i32;
+        let mut offset = 0usize;
+
+        while offset < data.len() {
+            let end = (offset + MULTIPART_PART_SIZE as usize).min(data.len());
+            // Wait for a local slot so at most MULTIPART_UPLOAD_CONCURRENCY
+            // part chunks are materialized in memory at once.
+            let slot = local
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("multipart upload concurrency closed"))?;
+            let chunk = data[offset..end].to_vec();
+            let part_no = part_number;
+            let upload_id = upload_id.clone();
+            let key = key.clone();
+            let bucket = self.bucket.clone();
+            let client = self.client.clone();
+            let limiter = Arc::clone(&self.limiter);
+            handles.spawn(async move {
+                // Bound in-flight part uploads against the global limit too.
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
+                let resp = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_no)
+                    .body(ByteStream::from(chunk))
+                    .send()
+                    .await
+                    .context("s3 upload part")?;
+                let etag = resp.e_tag().unwrap_or_default().to_string();
+                drop(slot);
+                Ok::<(i32, String), anyhow::Error>((part_no, etag))
+            });
+            part_number += 1;
+            offset = end;
+        }
+
+        let mut parts = Vec::new();
+        let mut upload_error = None;
+        while let Some(joined) = handles.join_next().await {
+            match joined {
+                Ok(Ok((part_no, etag))) => {
+                    parts.push(
+                        CompletedPart::builder()
+                            .part_number(part_no)
+                            .e_tag(etag)
+                            .build(),
+                    );
+                }
+                Ok(Err(e)) => upload_error = Some(e),
+                Err(e) => {
+                    upload_error = Some(anyhow::anyhow!("multipart upload task panicked: {e}"))
+                }
+            }
+        }
+
+        if let Some(e) = upload_error {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(e);
+        }
+
+        parts.sort_by_key(|p| p.part_number);
+        if let Err(e) = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(e).context("s3 complete multipart upload");
+        }
         Ok(())
     }
 
@@ -838,13 +979,20 @@ mod s3_mock_tests {
     use tokio::net::{TcpListener, TcpStream};
 
     /// Minimal in-process S3 mock: counts concurrent in-flight requests,
-    /// records request targets, and serves a canned ListBucketResult so the
-    /// AWS SDK can round-trip. Used to prove the request limiter is actually
-    /// wired and that implied-directory probes use `max_keys=1`.
+    /// records request targets + bodies, and serves canned responses so the
+    /// AWS SDK can round-trip (ListBucketResult and multipart uploads).
+    #[derive(Clone, Debug)]
+    struct MockRequest {
+        method: String,
+        target: String,
+        body: Vec<u8>,
+    }
+
     struct MockS3 {
         active: Arc<AtomicUsize>,
         max_concurrent: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<String>>>,
+        recorded: Arc<Mutex<Vec<MockRequest>>>,
         delay: Duration,
         entries: Arc<Mutex<Vec<(String, bool)>>>,
     }
@@ -857,6 +1005,7 @@ mod s3_mock_tests {
                 active: Arc::new(AtomicUsize::new(0)),
                 max_concurrent: Arc::new(AtomicUsize::new(0)),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                recorded: Arc::new(Mutex::new(Vec::new())),
                 delay,
                 entries: Arc::new(Mutex::new(entries)),
             });
@@ -878,9 +1027,12 @@ mod s3_mock_tests {
     }
 
     async fn handle_conn(mut stream: TcpStream, mock: Arc<MockS3>) {
+        // Read the full HTTP request: headers first, then the Content-Length
+        // body (PUT upload-part / complete-multipart carry a payload).
         let mut buf = Vec::new();
-        let mut tmp = [0u8; 4096];
+        let mut tmp = [0u8; 8192];
         let mut header_end = None;
+        let mut content_length = 0usize;
         while header_end.is_none() {
             let n = match stream.read(&mut tmp).await {
                 Ok(0) | Err(_) => return,
@@ -892,10 +1044,30 @@ mod s3_mock_tests {
             }
         }
         let head = String::from_utf8_lossy(&buf[..header_end.unwrap()]);
+        for line in head.lines() {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
         let query = target.split('?').nth(1).unwrap_or("").to_lowercase();
+
+        // Read the remaining body bytes.
+        let total = header_end.unwrap() + content_length;
+        while buf.len() < total {
+            let n = match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body = if total <= buf.len() {
+            buf[header_end.unwrap()..total].to_vec()
+        } else {
+            Vec::new()
+        };
 
         let in_flight = mock.active.fetch_add(1, Ordering::SeqCst) + 1;
         let mut cur = mock.max_concurrent.load(Ordering::SeqCst);
@@ -911,24 +1083,63 @@ mod s3_mock_tests {
             }
         }
         mock.requests.lock().unwrap().push(target.clone());
+        mock.recorded.lock().unwrap().push(MockRequest {
+            method: method.clone(),
+            target: target.clone(),
+            body,
+        });
 
         tokio::time::sleep(mock.delay).await;
 
         let response = if query.contains("list-type=2") {
             let entries = mock.entries.lock().unwrap().clone();
             let body = list_xml(&entries);
+            http_response(200, "application/xml", Some(&format!("{body}")))
+        } else if query.contains("uploads") && !query.contains("uploadid") {
+            // InitiateMultipartUpload: POST /key?uploads
+            let body = initiate_multipart_xml();
+            http_response(200, "application/xml", Some(&body))
+        } else if query.contains("uploadid") && query.contains("partnumber") {
+            // UploadPart: PUT /key?partNumber=N&uploadId=...
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 200 OK\r\nETag: \"etag-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "mock"
             )
+        } else if query.contains("uploadid") && method == "DELETE" {
+            // AbortMultipartUpload
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        } else if query.contains("uploadid") && method == "POST" {
+            // CompleteMultipartUpload
+            http_response(200, "application/xml", Some(&complete_multipart_xml()))
         } else if method == "HEAD" {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         } else {
+            // Plain PutObject / DeleteObject / ...
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         };
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.shutdown().await;
         mock.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn http_response(status: u16, content_type: &str, body: Option<&String>) -> String {
+        let body = body.cloned().unwrap_or_default();
+        format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn initiate_multipart_xml() -> String {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>bucket</Bucket><Key>key</Key><UploadId>mock-upload-1</UploadId></InitiateMultipartUploadResult>"
+            .to_string()
+    }
+
+    fn complete_multipart_xml() -> String {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://127.0.0.1/bucket/key</Location><Bucket>bucket</Bucket><Key>key</Key><ETag>&quot;mock&quot;</ETag></CompleteMultipartUploadResult>"
+            .to_string()
     }
 
     fn list_xml(entries: &[(String, bool)]) -> String {
@@ -1047,5 +1258,93 @@ mod s3_mock_tests {
             vec![("sub".to_string(), true), ("a.txt".to_string(), false)]
         );
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_small_object_uses_single_put() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let data = vec![0x5Au8; 1024];
+        fs.write("/small.bin", &data).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "small write must be a single request");
+        assert_eq!(recorded[0].method, "PUT");
+        let q = recorded[0].target.to_lowercase();
+        assert!(!q.contains("uploads"), "must not initiate multipart");
+        assert!(!q.contains("uploadid"), "must not touch multipart");
+        assert!(!q.contains("partnumber"), "must not upload parts");
+        assert_eq!(recorded[0].body, data, "whole object must be the PUT body");
+    }
+
+    #[tokio::test]
+    async fn write_large_object_uses_multipart_and_reassembles() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        // 20 MiB > MULTIPART_THRESHOLD (16 MiB), byte pattern varies so the
+        // reassembled order can be verified.
+        let data: Vec<u8> = (0..20 * 1024 * 1024usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        fs.write("/large.bin", &data).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let lc = |t: &str| t.to_lowercase();
+
+        let creates = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploads")
+                    && !lc(&r.target).contains("uploadid")
+            })
+            .count();
+        assert_eq!(creates, 1, "exactly one initiate-multipart");
+
+        let aborts = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid"))
+            .count();
+        assert_eq!(aborts, 0, "no abort on a successful upload");
+
+        let completes = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploadid")
+                    && !lc(&r.target).contains("partnumber")
+            })
+            .count();
+        assert_eq!(completes, 1, "exactly one complete-multipart");
+
+        let mut parts: Vec<(i32, Vec<u8>)> = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && lc(&r.target).contains("partnumber"))
+            .map(|r| {
+                let query = r.target.split('?').nth(1).unwrap_or("");
+                let part_no = query
+                    .split('&')
+                    .find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        k.eq_ignore_ascii_case("partnumber")
+                            .then(|| v.parse::<i32>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                (part_no, r.body.clone())
+            })
+            .collect();
+        parts.sort_by_key(|(n, _)| *n);
+        assert!(
+            parts.len() >= 2,
+            "expected multiple multipart parts, got {}",
+            parts.len()
+        );
+
+        let reassembled: Vec<u8> = parts.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(
+            reassembled, data,
+            "multipart parts must reassemble to the original bytes in order"
+        );
     }
 }
