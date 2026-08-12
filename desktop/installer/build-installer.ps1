@@ -1,14 +1,14 @@
-# Builds the BrewFS Windows installer (WiX Burn bundle).
+# Builds the OSSFS Windows installer (WiX Burn bundle).
 #
 # Prerequisites:
-#   - Rust stable (builds brewfs-tray.exe + ossmount.exe)
+#   - Rust stable (builds ossfs-tray.exe + ossmount.exe)
 #   - WiX Toolset as a .NET tool: `dotnet tool install --global wix`
 #
 # Output:
-#   desktop\installer\build\BrewFS-Setup-<version>.exe
+#   desktop\installer\build\OSSFS-Setup-<version>.exe
 #     - installs WinFsp 2.1 silently when not already installed
-#     - installs BrewFS tray + ossmount to "%ProgramFiles%\BrewFS"
-#     - creates a "BrewFS 托盘" Start Menu shortcut
+#     - installs OSSFS tray + ossmount to "%ProgramFiles%\OSSFS"
+#     - creates a "OSSFS 托盘" Start Menu shortcut
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File desktop\installer\build-installer.ps1 [-Version 0.1.0]
@@ -24,7 +24,7 @@ $root = Resolve-Path (Join-Path $installerDir "..\..")
 $buildDir = Join-Path $installerDir "build"
 $targetDir = Join-Path $root "target\release"
 
-# brewfs workspace 的 etcd-client 构建脚本需要 protoc（prost-build）。
+# OSSFS 依赖均为纯 Rust，无需 protoc。
 if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
     throw "protoc not found; install it first (e.g. choco install protoc -y or scoop install protobuf)"
 }
@@ -34,15 +34,15 @@ New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 Write-Host "==> Building release binaries (this can take a while)..." -ForegroundColor Cyan
 Push-Location $root
 try {
-    cargo build --release -p brewfs --bin ossmount --no-default-features --features fuse-winfsp
+    cargo build --release -p ossfs --bin ossmount --no-default-features --features fuse-winfsp
     if ($LASTEXITCODE -ne 0) { throw "cargo build ossmount failed" }
-    cargo build --release -p brewfs-tray
-    if ($LASTEXITCODE -ne 0) { throw "cargo build brewfs-tray failed" }
+    cargo build --release -p ossfs-tray
+    if ($LASTEXITCODE -ne 0) { throw "cargo build ossfs-tray failed" }
 } finally {
     Pop-Location
 }
 
-$trayExe = Join-Path $targetDir "brewfs-tray.exe"
+$trayExe = Join-Path $targetDir "ossfs-tray.exe"
 $ossmountExe = Join-Path $targetDir "ossmount.exe"
 if (-not (Test-Path $trayExe)) { throw "missing $trayExe" }
 if (-not (Test-Path $ossmountExe)) { throw "missing $ossmountExe" }
@@ -59,7 +59,7 @@ wix extension add "WixToolset.Util.wixext/$wixVersion" -g
 if ($LASTEXITCODE -ne 0) { throw "wix extension add Util failed" }
 wix extension list -g
 
-$appMsi = Join-Path $buildDir "brewfs-app.msi"
+$appMsi = Join-Path $buildDir "ossfs-app.msi"
 $readme = Join-Path $installerDir "README.txt"
 $icon = Join-Path $installerDir "..\assets\brewfs.ico"
 
@@ -70,7 +70,7 @@ if (-not (Test-Path $balExt)) { throw "missing $balExt" }
 if (-not (Test-Path $utilExt)) { throw "missing $utilExt" }
 
 Write-Host "==> Building app MSI..." -ForegroundColor Cyan
-& $wix.Source build (Join-Path $installerDir "brewfs-app.wxs") -arch x64 `
+& $wix.Source build (Join-Path $installerDir "ossfs-app.wxs") -arch x64 `
     -d "Version=$Version" `
     -d "TrayPath=$trayExe" `
     -d "OssmountPath=$ossmountExe" `
@@ -78,11 +78,11 @@ Write-Host "==> Building app MSI..." -ForegroundColor Cyan
     -o $appMsi
 if ($LASTEXITCODE -ne 0) { throw "wix build app MSI failed" }
 
-$bundleExe = Join-Path $buildDir "BrewFS-Setup-$Version.exe"
+$bundleExe = Join-Path $buildDir "OSSFS-Setup-$Version.exe"
 $winfspMsi = Join-Path $installerDir "winfsp-2.1.25156.msi"
 
 Write-Host "==> Building installer bundle..." -ForegroundColor Cyan
-& $wix.Source build (Join-Path $installerDir "brewfs-bundle.wxs") `
+& $wix.Source build (Join-Path $installerDir "ossfs-bundle.wxs") `
     -ext $balExt `
     -ext $utilExt `
     -d "Version=$Version" `

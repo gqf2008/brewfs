@@ -112,7 +112,6 @@ fn auto_restart(
     state: &Rc<RefCell<model::ProfilesFile>>,
     recent: &Rc<RefCell<Vec<RecentSpawn>>>,
     ossmount: &Rc<Option<PathBuf>>,
-    brewfs: &Rc<Option<PathBuf>>,
 ) {
     let profiles = state.borrow().profiles.clone();
     let mounts = model::read_mounts(&profiles);
@@ -145,17 +144,10 @@ fn auto_restart(
             g.failed.insert(drive);
             continue;
         }
-        let spawned: Option<std::io::Result<(u32, PathBuf)>> = if p.mode == "oss" {
-            ossmount
-                .as_ref()
-                .as_deref()
-                .map(|o| model::spawn_oss_mount(o, &p))
-        } else {
-            brewfs
-                .as_ref()
-                .as_deref()
-                .map(|b| model::spawn_mount(b, &p))
-        };
+        let spawned: Option<std::io::Result<(u32, PathBuf)>> = ossmount
+            .as_ref()
+            .as_deref()
+            .map(|o| model::spawn_oss_mount(o, &p));
         match spawned {
             Some(Ok((pid, log))) => {
                 g.last_spawn.insert(drive.clone(), Instant::now());
@@ -217,7 +209,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Rc::new(RefCell::new(model::load_profiles()));
     let recent = Rc::new(RefCell::new(Vec::<RecentSpawn>::new()));
     let hold = Rc::new(StatusHold::default());
-    let brewfs = Rc::new(model::find_brewfs());
     let ossmount = Rc::new(model::find_ossmount());
 
     // Drive letters are a Windows concept; macOS/Linux use mount directories.
@@ -277,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tray.set_autostart(winutil::autostart_enabled());
 
     wire_callbacks(
-        &ui, &edit, &tray, &hold, &state, &recent, &brewfs, &ossmount, &pending,
+        &ui, &edit, &tray, &hold, &state, &recent, &ossmount, &pending,
     );
 
     // Periodic status refresh (2s) driven from the UI thread.
@@ -289,10 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let recent = recent.clone();
         let ossmount = ossmount.clone();
-        let brewfs = brewfs.clone();
         timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
             if let (Some(ui), Some(tray)) = (ui_weak.upgrade(), tray_weak.upgrade()) {
-                auto_restart(&ui, &hold, &state, &recent, &ossmount, &brewfs);
+                auto_restart(&ui, &hold, &state, &recent, &ossmount);
                 refresh(&ui, &tray, &state, &recent, &hold);
             }
         });
@@ -336,7 +326,6 @@ fn wire_callbacks(
     hold: &Rc<StatusHold>,
     state: &Rc<RefCell<model::ProfilesFile>>,
     recent: &Rc<RefCell<Vec<RecentSpawn>>>,
-    brewfs: &Rc<Option<PathBuf>>,
     ossmount: &Rc<Option<PathBuf>>,
     pending: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
 ) {
@@ -346,7 +335,6 @@ fn wire_callbacks(
     let hold = Rc::clone(hold);
     let state = Rc::clone(state);
     let recent = Rc::clone(recent);
-    let brewfs = Rc::clone(brewfs);
     let ossmount = Rc::clone(ossmount);
     let pending = Rc::clone(pending);
 
@@ -488,7 +476,6 @@ fn wire_callbacks(
         let tray_weak = tray_weak.clone();
         let state = state.clone();
         let recent = recent.clone();
-        let brewfs = brewfs.clone();
         let ossmount = ossmount.clone();
         let pending = Rc::clone(&pending);
         let hold = Rc::clone(&hold);
@@ -505,7 +492,6 @@ fn wire_callbacks(
                 // mounted -> confirm then unmount (Slint modal dialog)
                 let m = m.clone();
                 let ui_weak2 = ui_weak.clone();
-                let brewfs2 = brewfs.clone();
                 let tray_weak2 = tray_weak.clone();
                 let state2 = state.clone();
                 let recent2 = recent.clone();
@@ -520,7 +506,7 @@ fn wire_callbacks(
                         // 优雅退出期间被误判为“挂载中”而把挂载按钮一直置灰。
                         recent2.borrow_mut().retain(|r| r.pid != m.pid);
                         if let Some(ui) = ui_weak2.upgrade() {
-                            graceful_or_kill(&ui, brewfs2.as_ref(), &m);
+                            graceful_or_kill(&ui, &m);
                         }
                         if let (Some(ui), Some(tray)) = (ui_weak2.upgrade(), tray_weak2.upgrade()) {
                             refresh(&ui, &tray, &state2, &recent2, &hold2);
@@ -533,7 +519,7 @@ fn wire_callbacks(
                     ui.set_status_text(format!("挂载失败：{e}").into());
                 } else {
                     let started = mount_profile(
-                        &ui, &pending, &tray_weak, &hold, &state, &recent, &brewfs, &ossmount, &p,
+                        &ui, &pending, &tray_weak, &hold, &state, &recent, &ossmount, &p,
                     );
                     // Ask the guard to auto-restart this mount if it dies.
                     if started {
@@ -674,9 +660,8 @@ fn wire_callbacks(
     tray.on_quit_app(do_quit);
 }
 
-/// Spawn the right backend for `p` (brewfs vs ossmount), remember the profile,
-/// and report progress. Used by the per-record mount action.
-#[allow(clippy::too_many_arguments)]
+/// Spawn `ossmount` for `p`, remember the profile, and report progress.
+/// Used by the per-record mount action.
 fn mount_profile(
     ui: &MainWindow,
     pending: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
@@ -684,7 +669,6 @@ fn mount_profile(
     hold: &Rc<StatusHold>,
     state: &Rc<RefCell<model::ProfilesFile>>,
     recent: &Rc<RefCell<Vec<RecentSpawn>>>,
-    brewfs: &Rc<Option<PathBuf>>,
     ossmount: &Rc<Option<PathBuf>>,
     p: &model::Profile,
 ) -> bool {
@@ -757,24 +741,16 @@ fn mount_profile(
         return false;
     }
 
-    let spawned = if p.mode == "oss" {
-        let Some(ossmount) = ossmount.as_ref() else {
-            #[cfg(windows)]
-            ui.set_status_text("未找到 ossmount.exe（OSS 直挂需要 Windows + WinFsp）".into());
-            #[cfg(not(windows))]
-            ui.set_status_text(
-                "未找到 ossmount（OSS 直挂需要 macOS + FUSE-T 或 macFUSE，请先安装 FUSE-T：brew install --cask fuse-t）".into(),
-            );
-            return false;
-        };
-        model::spawn_oss_mount(ossmount, p)
-    } else {
-        let Some(brewfs) = brewfs.as_ref() else {
-            ui.set_status_text("未找到 brewfs.exe（可用环境变量 BREWFS_EXE 指定）".into());
-            return false;
-        };
-        model::spawn_mount(brewfs, p)
+    let Some(ossmount) = ossmount.as_ref() else {
+        #[cfg(windows)]
+        ui.set_status_text("未找到 ossmount.exe（OSS 直挂需要 Windows + WinFsp）".into());
+        #[cfg(not(windows))]
+        ui.set_status_text(
+            "未找到 ossmount（OSS 直挂需要 macOS + FUSE-T 或 macFUSE，请先安装 FUSE-T：brew install --cask fuse-t）".into(),
+        );
+        return false;
     };
+    let spawned = model::spawn_oss_mount(ossmount, p);
     match spawned {
         Ok((pid, log)) => {
             {
@@ -964,7 +940,8 @@ fn drive_from_form(edit: &EditDialog) -> String {
 
 fn profile_to_form(edit: &EditDialog, p: &model::Profile) {
     edit.set_cfg_name(p.name.clone().into());
-    edit.set_cfg_mode_index(if p.mode == "oss" { 0 } else { 1 });
+    // OSS direct mount is the only mode.
+    edit.set_cfg_mode_index(0);
     edit.set_cfg_drive(p.drive.clone().into());
     #[cfg(windows)]
     {
@@ -994,11 +971,7 @@ fn profile_to_form(edit: &EditDialog, p: &model::Profile) {
 }
 
 fn form_to_profile(edit: &EditDialog) -> model::Profile {
-    let mode = if edit.get_cfg_mode_index() == 0 {
-        "oss"
-    } else {
-        "brewfs"
-    };
+    // OSS direct mount is the only mode.
     let backend = if edit.get_cfg_backend_index() == 1 {
         "s3"
     } else {
@@ -1012,7 +985,7 @@ fn form_to_profile(edit: &EditDialog) -> model::Profile {
     };
     model::Profile {
         name: edit.get_cfg_name().to_string(),
-        mode: mode.to_string(),
+        mode: "oss".to_string(),
         drive: drive_from_form(edit),
         backend: backend.to_string(),
         data_dir: edit.get_cfg_data_dir().to_string(),
@@ -1043,44 +1016,19 @@ fn ask_confirm(
     *pending.borrow_mut() = Some(Box::new(on_yes));
 }
 
-/// Prefer a graceful control-plane unmount (`brewfs unmount <drive>`); only
-/// fall back to force-killing the process when brewfs is missing or does not
-/// accept the request (e.g. an older binary without the `unmount` subcommand).
-fn graceful_or_kill(ui: &MainWindow, brewfs: &Option<PathBuf>, m: &model::MountStatus) {
-    // Metadata-less ossmount instances have no control plane to shut down
-    // gracefully; data is flushed on close, so terminating is safe.
-    if m.is_oss {
-        match winutil::terminate_process(m.pid) {
-            Ok(()) => {
-                guard().desired.remove(&m.drive);
-                // Drop the stale drive icon from "This PC" right away.
-                winutil::notify_drive_removed(&m.drive);
-                // Remove the runtime record so the row can't linger as a
-                // stale "not mounted" entry (idempotent: missing file is fine).
-                let _ =
-                    std::fs::remove_file(model::oss_records_dir().join(format!("{}.json", m.pid)));
-                ui.set_status_text(format!("已卸载 {}", m.drive).into());
-            }
-            Err(e) => ui.set_status_text(format!("卸载 {} 失败：{e}", m.drive).into()),
-        }
-        return;
-    }
-    if let Some(brewfs) = brewfs {
-        match model::graceful_unmount(brewfs, &m.drive) {
-            Ok(true) => {
-                ui.set_status_text(format!("已请求优雅卸载 {}", m.drive).into());
-                return;
-            }
-            Ok(false) => {
-                ui.set_status_text(format!("{} 未接受优雅卸载请求，改用强制结束", m.drive).into());
-            }
-            Err(e) => {
-                ui.set_status_text(format!("优雅卸载 {} 失败：{e}，改用强制结束", m.drive).into());
-            }
-        }
-    }
+/// Unmount an OSS mount. `ossmount` instances have no control plane to shut
+/// down gracefully; data is flushed on close, so terminating is safe.
+fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
     match winutil::terminate_process(m.pid) {
-        Ok(()) => ui.set_status_text(format!("已强制结束 {}", m.drive).into()),
+        Ok(()) => {
+            guard().desired.remove(&m.drive);
+            // Drop the stale drive icon from "This PC" right away.
+            winutil::notify_drive_removed(&m.drive);
+            // Remove the runtime record so the row can't linger as a stale
+            // "not mounted" entry (idempotent: missing file is fine).
+            let _ = std::fs::remove_file(model::oss_records_dir().join(format!("{}.json", m.pid)));
+            ui.set_status_text(format!("已卸载 {}", m.drive).into());
+        }
         Err(e) => ui.set_status_text(format!("卸载 {} 失败：{e}", m.drive).into()),
     }
 }

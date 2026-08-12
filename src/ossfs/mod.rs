@@ -39,7 +39,7 @@ pub struct OssConfig {
     /// Force path-style addressing (MinIO, Aliyun access points usually need
     /// virtual-hosted style, so default false).
     pub force_path_style: bool,
-    /// Optional namespace prefix under the bucket (e.g. `brewfs/`). All keys
+    /// Optional namespace prefix under the bucket (e.g. `ossfs/`). All keys
     /// are stored under it. Must be empty or end with `/`.
     pub prefix: String,
     /// Optional in-flight S3 request cap. `None` (or `Some(0)`) uses the
@@ -675,11 +675,11 @@ mod tests {
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            prefix: "brewfs/".into(),
+            prefix: "ossfs/".into(),
         };
-        assert_eq!(fs.key_for("/docs/a.txt"), "brewfs/docs/a.txt");
-        assert_eq!(fs.key_for("/docs/"), "brewfs/docs/");
-        assert_eq!(fs.key_for("/"), "brewfs");
+        assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
+        assert_eq!(fs.key_for("/docs/"), "ossfs/docs/");
+        assert_eq!(fs.key_for("/"), "ossfs");
 
         let fs2 = ObjectFs {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
@@ -700,11 +700,11 @@ mod tests {
             region: "cn-shanghai".into(),
             endpoint: None,
             force_path_style: false,
-            prefix: "brewfs".into(),
+            prefix: "ossfs".into(),
             max_concurrent_requests: None,
         }
         .normalize();
-        assert_eq!(cfg.prefix, "brewfs/");
+        assert_eq!(cfg.prefix, "ossfs/");
         let _ = request_timeout();
     }
 

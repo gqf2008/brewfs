@@ -949,16 +949,16 @@ impl Filesystem for OssFs {
 }
 
 /// Runtime record the desktop tray app uses to list and stop `ossmount`
-/// instances. Kept in `$TMPDIR/brewfs-oss` so it never mixes with the BrewFS
-/// control-plane registry (`$TMPDIR/brewfs`), matching the Windows adapter.
+/// instances. Kept in `$TMPDIR/ossfs-oss` so it never mixes with the OSSFS
+/// control-plane registry (`$TMPDIR/ossfs`), matching the Windows adapter.
 fn runtime_record_path(pid: u32) -> PathBuf {
     std::env::temp_dir()
-        .join("brewfs-oss")
+        .join("ossfs-oss")
         .join(format!("{pid}.json"))
 }
 
 fn write_runtime_record(mount_point: &Path) {
-    let dir = std::env::temp_dir().join("brewfs-oss");
+    let dir = std::env::temp_dir().join("ossfs-oss");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(error = ?e, "ossfs failed to create runtime record dir");
         return;
@@ -1004,7 +1004,7 @@ fn macos_fuse_backend() -> Option<&'static str> {
 
 fn build_config() -> Config {
     let mut cfg = Config::default();
-    cfg.mount_options = vec![MountOption::FSName("BrewFS-OSS".to_string())];
+    cfg.mount_options = vec![MountOption::FSName("OSSFS-OSS".to_string())];
     #[cfg(target_os = "macos")]
     {
         let subtype = match macos_fuse_backend() {
@@ -1104,7 +1104,7 @@ pub async fn mount_oss_fuse(
     #[cfg(unix)]
     let _mount_lock = {
         use std::os::unix::io::AsRawFd;
-        let lock_dir = std::env::temp_dir().join("brewfs-oss").join(".locks");
+        let lock_dir = std::env::temp_dir().join("ossfs-oss").join(".locks");
         std::fs::create_dir_all(&lock_dir).ok();
         let safe: String = mount_point
             .display()
@@ -1184,7 +1184,7 @@ pub async fn mount_oss_fuse(
         }
     }
 
-    info!(mount_point = %mount_point.display(), "brewfs-oss mounted via FUSE");
+    info!(mount_point = %mount_point.display(), "ossfs-oss mounted via FUSE");
     println!("mounted at {}", mount_point.display());
     write_runtime_record(mount_point);
 

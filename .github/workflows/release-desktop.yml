@@ -2,7 +2,7 @@ name: Build & Release (Desktop)
 
 # 与 ../abb 相同的发布方式：打 v* tag 时自动构建 macOS DMG 与 Windows 安装包，
 # 签名/公证后发 GitHub Release；也可手动触发（只出产物，不发 Release）。
-# 目标仓库：gqf2008/brewfs（本仓库即 fork 后的发布源）。
+# 目标仓库：gqf2008/ossfs（OSSFS 独立项目，已与原 brewfs 分叉）。
 #
 # 密钥说明（运行时判断，缺失时优雅降级）：
 #   APPLE_CERT_P12 / APPLE_CERT_PASSWORD / APPLE_TEAM_ID / APPLE_ID / APPLE_APP_PASSWORD
@@ -44,7 +44,7 @@ jobs:
           brew install protobuf
           brew install --cask fuse-t
           # 准备 ossmount 链接用的 FUSE-T prefix（布局与 scripts/package_macos.sh 一致）
-          FUSE_T_PREFIX="$HOME/brewfs-deps/fuse-t"
+          FUSE_T_PREFIX="$HOME/ossfs-deps/fuse-t"
           mkdir -p "$FUSE_T_PREFIX/lib/pkgconfig" "$FUSE_T_PREFIX/include"
           if [ -d /usr/local/include/fuse ]; then
             cp -R /usr/local/include/fuse "$FUSE_T_PREFIX/include/fuse"
@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           if [ -n "$APPLE_CERT_P12" ]; then
             echo "==> Importing Developer ID certificate"
-            echo "$APPLE_CERT_P12" | base64 --decode > /tmp/brewfs-cert.p12
+            echo "$APPLE_CERT_P12" | base64 --decode > /tmp/ossfs-cert.p12
             security create-keychain -p temp /tmp/brewfs-signing.keychain
             # 关键：关闭临时钥匙串自动锁（默认 5 分钟），否则 build 完成后
             # codesign 会弹密码框并永久挂起（上一次 macos 卡了 5h44m）。
@@ -93,7 +93,7 @@ jobs:
             security default-keychain -s /tmp/brewfs-signing.keychain
             security list-keychains -d user -s /tmp/brewfs-signing.keychain login.keychain
             security unlock-keychain -p temp /tmp/brewfs-signing.keychain
-            security import /tmp/brewfs-cert.p12 -k /tmp/brewfs-signing.keychain \
+            security import /tmp/ossfs-cert.p12 -k /tmp/brewfs-signing.keychain \
               -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple:,codesign: \
               -s -k temp /tmp/brewfs-signing.keychain
@@ -114,7 +114,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dist
-          path: dist/macos/BrewFS-*.dmg
+          path: dist/macos/OSSFS-*.dmg
           if-no-files-found: error
 
   # ─────────────────────────── Windows（x64 + WiX Burn）───────────────────────────
@@ -148,12 +148,6 @@ jobs:
           # runner 镜像可能预置 7.x 扩展缓存，v4 工具会解析到它并报 WIX0144；清掉让脚本装 4.0.6
           Remove-Item -Recurse -Force "$env:USERPROFILE\.wix\extensions" -ErrorAction SilentlyContinue
 
-      - name: Install protoc (etcd-client build dependency)
-        shell: pwsh
-        run: |
-          choco install protoc -y --no-progress
-          protoc --version
-
       - name: Build installer
         shell: pwsh
         env:
@@ -181,8 +175,8 @@ jobs:
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
             | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $signtool) { throw "signtool not found" }
-          $pfx = [IO.File]::WriteAllBytes("$env:TEMP\brewfs-cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
-          $exe = Get-ChildItem desktop\installer\build\BrewFS-Setup-*.exe | Select-Object -First 1
+          $pfx = [IO.File]::WriteAllBytes("$env:TEMP\ossfs-cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
+          $exe = Get-ChildItem desktop\installer\build\OSSFS-Setup-*.exe | Select-Object -First 1
           & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 `
             /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
           if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
@@ -190,7 +184,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-dist
-          path: desktop/installer/build/BrewFS-Setup-*.exe
+          path: desktop/installer/build/OSSFS-Setup-*.exe
           if-no-files-found: error
 
   # ─────────────────────────── 汇总发 Release ───────────────────────────

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package BrewFS for macOS: build release binaries, assemble a signed .app,
+# Package OSSFS for macOS: build release binaries, assemble a signed .app,
 # create a Developer ID-signed DMG, and notarize + staple it.
 #
 # Requirements:
@@ -7,11 +7,11 @@
 #   - Developer ID Application identity in the login keychain
 #   - A FUSE provider for linking ossmount (pkg-config "fuse"):
 #       * FUSE-T (recommended, kext-free) — local prefix pointed to by
-#         FUSE_T_PREFIX (default: ~/brewfs-deps/fuse-t). See the comment near
+#         FUSE_T_PREFIX (default: ~/ossfs-deps/fuse-t). See the comment near
 #         the FUSE_T_PREFIX config below for how to prepare it after
 #         `brew install --cask fuse-t`.
 #       * macFUSE — local extracted copy pointed to by
-#         MACFUSE_PREFIX (default: ~/brewfs-deps/macfuse-5.3.3)
+#         MACFUSE_PREFIX (default: ~/ossfs-deps/macfuse-5.3.3)
 #     Set FUSE_BACKEND=fuse-t|macfuse to force one; default is auto (fuse-t
 #     wins when its prefix is present).
 #   - Notarization credentials: set APPLE_ID, APPLE_TEAM_ID, APPLE_PASSWORD or
@@ -25,18 +25,18 @@ cd "$(git rev-parse --show-toplevel)"
 
 # ---- config ----
 IDENTITY="${IDENTITY:-Developer ID Application: qingfeng gao (XFXU84HVK3)}"
-BUNDLE_ID="${BUNDLE_ID:-ai.brewfs.tray}"
+BUNDLE_ID="${BUNDLE_ID:-ai.ossfs.tray}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-APP_NAME="BrewFS"
-MACFUSE_PREFIX="${MACFUSE_PREFIX:-$HOME/brewfs-deps/macfuse-5.3.3}"
+APP_NAME="OSSFS"
+MACFUSE_PREFIX="${MACFUSE_PREFIX:-$HOME/ossfs-deps/macfuse-5.3.3}"
 # FUSE-T prefix layout: $FUSE_T_PREFIX/{include/fuse,lib,lib/pkgconfig}.
 # Prepare it after `brew install --cask fuse-t` (installs to /usr/local) with:
-#   mkdir -p ~/brewfs-deps/fuse-t/lib/pkgconfig ~/brewfs-deps/fuse-t/include
-#   cp -R /usr/local/include/fuse ~/brewfs-deps/fuse-t/include/fuse
-#   cp /usr/local/lib/libfuse-t-*.dylib ~/brewfs-deps/fuse-t/lib/
-#   ln -s libfuse-t-*.dylib ~/brewfs-deps/fuse-t/lib/libfuse-t.dylib
-#   cat > ~/brewfs-deps/fuse-t/lib/pkgconfig/fuse.pc <<'EOF'
-#   prefix=$HOME/brewfs-deps/fuse-t
+#   mkdir -p ~/ossfs-deps/fuse-t/lib/pkgconfig ~/ossfs-deps/fuse-t/include
+#   cp -R /usr/local/include/fuse ~/ossfs-deps/fuse-t/include/fuse
+#   cp /usr/local/lib/libfuse-t-*.dylib ~/ossfs-deps/fuse-t/lib/
+#   ln -s libfuse-t-*.dylib ~/ossfs-deps/fuse-t/lib/libfuse-t.dylib
+#   cat > ~/ossfs-deps/fuse-t/lib/pkgconfig/fuse.pc <<'EOF'
+#   prefix=$HOME/ossfs-deps/fuse-t
 #   exec_prefix=${prefix}
 #   libdir=${prefix}/lib
 #   includedir=${prefix}/include/fuse
@@ -46,7 +46,7 @@ MACFUSE_PREFIX="${MACFUSE_PREFIX:-$HOME/brewfs-deps/macfuse-5.3.3}"
 #   Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
 #   Cflags: -I${includedir}
 #   EOF
-FUSE_T_PREFIX="${FUSE_T_PREFIX:-$HOME/brewfs-deps/fuse-t}"
+FUSE_T_PREFIX="${FUSE_T_PREFIX:-$HOME/ossfs-deps/fuse-t}"
 FUSE_BACKEND="${FUSE_BACKEND:-auto}"
 if [[ "$FUSE_BACKEND" == "auto" && -f "$FUSE_T_PREFIX/lib/pkgconfig/fuse.pc" ]]; then
   FUSE_BACKEND=fuse-t
@@ -87,7 +87,7 @@ done
 ARCH="$(uname -m)"
 STAGE="dist/macos/staging"
 APP="$STAGE/$APP_NAME.app"
-DMG="dist/macos/BrewFS-${VERSION}-macos-${ARCH}.dmg"
+DMG="dist/macos/OSSFS-${VERSION}-macos-${ARCH}.dmg"
 ENTITLEMENTS="dist/macos/entitlements.plist"
 
 # ---- 0. ensure plist templates ----
@@ -101,15 +101,15 @@ cat > dist/macos/Info.plist <<'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>brewfs-tray</string>
+    <string>ossfs-tray</string>
     <key>CFBundleIdentifier</key>
-    <string>ai.brewfs.tray</string>
+    <string>ai.ossfs.tray</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>BrewFS</string>
+    <string>OSSFS</string>
     <key>CFBundleDisplayName</key>
-    <string>BrewFS</string>
+    <string>OSSFS</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -117,7 +117,7 @@ cat > dist/macos/Info.plist <<'PLIST'
     <key>CFBundleVersion</key>
     <string>0.1.2</string>
     <key>CFBundleIconFile</key>
-    <string>brewfs</string>
+    <string>ossfs</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSApplicationCategoryType</key>
@@ -144,12 +144,12 @@ PLIST
 fi
 
 # ---- 1. build ----
-echo "==> Building brewfs / ossmount (fuse-tokio-runtime, release)"
+echo "==> Building ossfs / ossmount (fuse-tokio-runtime, release)"
 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
   cargo build --release --no-default-features --features fuse-tokio-runtime \
-  --bin brewfs --bin ossmount
-echo "==> Building brewfs-tray"
-CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo build --release -p brewfs-tray
+  --bin ossfs --bin ossmount
+echo "==> Building ossfs-tray"
+CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo build --release -p ossfs-tray
 
 # ---- 2. assemble .app ----
 echo "==> Assembling $APP"
@@ -158,8 +158,8 @@ cp dist/macos/Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist" 2>/dev/null || true
-cp target/release/brewfs-tray "$APP/Contents/MacOS/"
-cp target/release/brewfs "$APP/Contents/MacOS/"
+cp target/release/ossfs-tray "$APP/Contents/MacOS/"
+cp target/release/ossfs "$APP/Contents/MacOS/"
 cp target/release/ossmount "$APP/Contents/MacOS/"
 if [[ "$FUSE_BACKEND" == "fuse-t" ]]; then
   # The build links libfuse-t via the build prefix's rpath; the distributed
@@ -167,25 +167,25 @@ if [[ "$FUSE_BACKEND" == "fuse-t" ]]; then
   install_name_tool -change @rpath/libfuse-t.dylib /usr/local/lib/libfuse-t.dylib \
     "$APP/Contents/MacOS/ossmount" 2>/dev/null || true
 fi
-# Prefer the repo's brewfs.icns (same source as the Windows .ico) so the
+# Prefer the repo's ossfs.icns (same source as the Windows .ico) so the
 # macOS app icon always matches the Windows version; fall back to generating
-# one from brewfs.png if it is missing.
-if [[ -f desktop/assets/brewfs.icns ]]; then
-  echo "==> Using desktop/assets/brewfs.icns"
-  cp desktop/assets/brewfs.icns "$APP/Contents/Resources/brewfs.icns"
-elif [[ ! -f "$APP/Contents/Resources/brewfs.icns" ]]; then
+# one from ossfs.png if it is missing.
+if [[ -f desktop/assets/ossfs.icns ]]; then
+  echo "==> Using desktop/assets/ossfs.icns"
+  cp desktop/assets/ossfs.icns "$APP/Contents/Resources/ossfs.icns"
+elif [[ ! -f "$APP/Contents/Resources/ossfs.icns" ]]; then
   echo "==> Generating icns"
   ICONSET="dist/macos/iconset.iconset"
   rm -rf "$ICONSET"
   mkdir -p "$ICONSET"
   for s in 16 32 64 128 256 512; do
-    sips -z "$s" "$s" desktop/assets/brewfs.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    sips -z "$s" "$s" desktop/assets/ossfs.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
   done
   for s in 32 64 128 256 512 1024; do
     h=$((s / 2))
-    sips -z "$s" "$s" desktop/assets/brewfs.png --out "$ICONSET/icon_${h}x${h}@2x.png" >/dev/null
+    sips -z "$s" "$s" desktop/assets/ossfs.png --out "$ICONSET/icon_${h}x${h}@2x.png" >/dev/null
   done
-  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/brewfs.icns"
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/ossfs.icns"
 fi
 chmod +x "$APP/Contents/MacOS/"*
 
@@ -204,13 +204,13 @@ else
   fi
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-    "$APP/Contents/MacOS/brewfs"
+    "$APP/Contents/MacOS/ossfs"
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
     "$APP/Contents/MacOS/ossmount"
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" \
-    "$APP/Contents/MacOS/brewfs-tray"
+    "$APP/Contents/MacOS/ossfs-tray"
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
@@ -236,7 +236,7 @@ if [[ "$SKIP_NOTARIZE" == "0" ]]; then
 fi
 
 # ---- 5. create DMG ----
-# Bundle macFUSE installer + license alongside BrewFS.app when present
+# Bundle macFUSE installer + license alongside OSSFS.app when present
 # (non-commercial redistribution is allowed under macFUSE's BSD-style
 # license; see dist/macos/macfuse/License.rtf, condition 4).
 DMG_ROOT="dist/macos/dmg-root"

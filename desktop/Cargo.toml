@@ -1,8 +1,8 @@
 [package]
-name = "brewfs-tray"
+name = "ossfs-tray"
 version = "0.1.0"
 edition = "2024"
-description = "Windows system-tray manager for BrewFS (Slint 1.17 UI)"
+description = "Windows system-tray manager for OSSFS (Slint 1.17 UI)"
 license = "MIT"
 publish = false
 

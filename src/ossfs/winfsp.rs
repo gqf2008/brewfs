@@ -471,7 +471,7 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
         return Err(anyhow::anyhow!("failed to start WinFsp dispatcher: {e}"));
     }
 
-    info!(mount_point = %mount_point.display(), "brewfs-oss mounted via WinFsp");
+    info!(mount_point = %mount_point.display(), "ossfs-oss mounted via WinFsp");
     println!("mounted at {}", mount_point.display());
     write_runtime_record(mount_point);
 
@@ -493,7 +493,7 @@ fn build_volume_params() -> VolumeParams {
     vp.sector_size(512)
         .sectors_per_allocation_unit(8)
         .max_component_length(255)
-        .filesystem_name("BrewFS-OSS")
+        .filesystem_name("OSSFS-OSS")
         .case_sensitive_search(true)
         .case_preserved_names(true)
         .unicode_on_disk(true)
@@ -845,7 +845,7 @@ impl FileSystemContext for OssMountContext {
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         out_volume_info.total_size = 1 << 50;
         out_volume_info.free_size = 1 << 50;
-        out_volume_info.set_volume_label("BrewFS-OSS");
+        out_volume_info.set_volume_label("OSSFS-OSS");
         Ok(())
     }
 }
@@ -1058,16 +1058,16 @@ fn log_path(path: &str) -> &str {
 }
 
 /// Runtime record the desktop tray app uses to list and stop `ossmount`
-/// instances. Kept in `%TEMP%\brewfs-oss` so it never mixes with the BrewFS
-/// control-plane registry (`%TEMP%\brewfs`).
+/// instances. Kept in `%TEMP%\ossfs-oss` so it never mixes with the OSSFS
+/// control-plane registry (`%TEMP%\ossfs`).
 fn runtime_record_path(pid: u32) -> PathBuf {
     std::env::temp_dir()
-        .join("brewfs-oss")
+        .join("ossfs-oss")
         .join(format!("{pid}.json"))
 }
 
 fn write_runtime_record(mount_point: &Path) {
-    let dir = std::env::temp_dir().join("brewfs-oss");
+    let dir = std::env::temp_dir().join("ossfs-oss");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(error = ?e, "ossfs failed to create runtime record dir");
         return;

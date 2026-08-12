@@ -6,8 +6,6 @@ target/
 **/target/
 **/.DS_Store
 *.log
-docker/compose-xfstests/artifacts/
-docker/compose-xfstests/results/
 docker/compose-xfstests/logs/
 !target/
 target/*

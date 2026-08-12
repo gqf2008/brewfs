@@ -7,20 +7,20 @@
 //! drive", not a multi-writer POSIX filesystem.
 //!
 //! Credentials come from the environment (`AWS_ACCESS_KEY_ID`,
-//! `AWS_SECRET_ACCESS_KEY`), matching how the BrewFS tray app spawns mounts.
+//! `AWS_SECRET_ACCESS_KEY`), matching how the OSSFS tray app spawns mounts.
 //!
 //! Platform mount adapters:
 //! - Windows: WinFsp 2.x (`mount_oss_winfsp`)
 //! - macOS: FUSE via macFUSE (`mount_oss_fuse`); Linux: FUSE via libfuse
 //!
 //! The `MOUNT_POINT` is a drive letter (`Z:`) on Windows and a directory
-//! (e.g. `/Volumes/brewfs`) on macOS/Linux.
+//! (e.g. `/Volumes/ossfs`) on macOS/Linux.
 
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use brewfs::ossfs::{ObjectFs, OssConfig};
+use ossfs::{ObjectFs, OssConfig};
 
 fn usage() -> ! {
     eprintln!(
@@ -87,11 +87,11 @@ async fn main() -> anyhow::Result<()> {
     {
         // WinFsp uses a fixed 10s notify interval (see REFRESH_INTERVAL_MS).
         let _ = refresh_secs;
-        brewfs::ossfs::winfsp::mount_oss_winfsp(fs, &mount_point).await
+        ossfs::winfsp::mount_oss_winfsp(fs, &mount_point).await
     }
     #[cfg(not(windows))]
     {
-        brewfs::ossfs::fuse::mount_oss_fuse(fs, &mount_point, refresh_secs).await
+        ossfs::fuse::mount_oss_fuse(fs, &mount_point, refresh_secs).await
     }
 }
 

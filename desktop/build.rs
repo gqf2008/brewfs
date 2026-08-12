@@ -1,8 +1,8 @@
 fn main() {
-    slint_build::compile("ui/brewfs_tray.slint").expect("failed to compile Slint UI");
+    slint_build::compile("ui/ossfs_tray.slint").expect("failed to compile Slint UI");
 
     // Windows: embed the application icon into the .exe so Explorer, the
-    // taskbar and Alt-Tab all show the BrewFS icon. macOS uses the .icns in
+    // taskbar and Alt-Tab all show the OSSFS icon. macOS uses the .icns in
     // the app bundle (and the runtime window icon set by Slint).
     #[cfg(windows)]
     {

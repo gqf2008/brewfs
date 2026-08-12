@@ -1,4 +1,0 @@
-# Relative pjdfstest test path regexes excluded from BrewFS' required POSIX set.
-#
-# There are currently no default exclusions. Add one only with a reproducible
-# artifact and a comment explaining why the behavior cannot be implemented.
