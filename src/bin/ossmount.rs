@@ -93,3 +93,39 @@ async fn main() -> anyhow::Result<()> {
         brewfs::ossfs::fuse::mount_oss_fuse(fs, &mount_point, refresh_secs).await
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod stack_tests {
+    /// The WinFsp host threads that run ossmount's synchronous callbacks
+    /// (`get_file_info` / `open` / `get_security_by_name` / ...) are created
+    /// with the process default stack size (`SizeOfStackReserve` from the PE
+    /// header, `CreateThread` with `dwStackSize = 0`). Those callbacks drive
+    /// AWS SDK futures via `Handle::block_on`; the hyper/rustls async stack
+    /// can exhaust the linker default 1 MiB reserve under heavy concurrent
+    /// I/O and abort the process with 0xc0000409 (FAST_FAIL_FATAL_APP_EXIT).
+    /// `build.rs` widens the reserve; this test pins that property so a
+    /// future linker change cannot silently shrink it again.
+    #[test]
+    fn pe_stack_reserve_is_widened() {
+        const MIN_RESERVE: u64 = 8 * 1024 * 1024;
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let bytes = std::fs::read(&exe).expect("read executable");
+        assert!(bytes.starts_with(b"MZ"), "not a PE image");
+
+        let e_lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+        let pe = e_lfanew + 4;
+        assert_eq!(&bytes[e_lfanew..pe], b"PE\0\0", "missing PE signature");
+
+        let magic = u16::from_le_bytes(bytes[pe + 20..pe + 22].try_into().unwrap());
+        assert_eq!(magic, 0x20B, "expected PE32+ (x64) image");
+
+        // PE32+ optional header: SizeOfStackReserve is a u64 at offset 0x48.
+        let reserve_off = pe + 20 + 0x48;
+        let reserve = u64::from_le_bytes(bytes[reserve_off..reserve_off + 8].try_into().unwrap());
+        assert!(
+            reserve >= MIN_RESERVE,
+            "SizeOfStackReserve {reserve:#x} < {MIN_RESERVE:#x}; build.rs stack widening missing?"
+        );
+    }
+}
