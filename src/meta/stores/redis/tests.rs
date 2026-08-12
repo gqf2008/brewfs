@@ -12,6 +12,7 @@ use crate::vfs::fs::VFS;
 use crate::{chunk::layout::ChunkLayout, chunk::store::InMemoryBlockStore};
 use redis::AsyncCommands;
 use serial_test::serial;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -159,6 +160,97 @@ async fn redis_command_calls(store: &RedisMetaStore, command: &str) -> u64 {
 
 async fn redis_script_calls(store: &RedisMetaStore) -> u64 {
     redis_command_calls(store, "eval").await + redis_command_calls(store, "evalsha").await
+}
+
+/// Run `op` while Redis MONITOR is active and return (client_commands,
+/// lua_commands) observed during a short grace window after it returns.
+/// MONITOR tags commands executed inside Lua scripts with a `[<db> lua]`
+/// source, so client-issued top-level commands are distinguishable from
+/// script-internal `redis.call` invocations.
+async fn monitor_top_level<F, T>(op: F) -> (Vec<String>, Vec<String>)
+where
+    F: Future<Output = T>,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stream = tokio::net::TcpStream::connect("127.0.0.1:6379")
+        .await
+        .unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    writer.write_all(b"MONITOR\r\n").await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut handshake = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_millis(500), reader.read(&mut handshake))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&handshake[..n]).contains("+OK"),
+        "MONITOR handshake failed"
+    );
+
+    op.await;
+
+    let mut client_cmds = Vec::new();
+    let mut lua_cmds = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        let n = match tokio::time::timeout(Duration::from_millis(50), reader.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).to_string();
+            if line.to_lowercase().contains(" lua]") {
+                lua_cmds.push(line);
+            } else {
+                client_cmds.push(line);
+            }
+        }
+    }
+    (client_cmds, lua_cmds)
+}
+
+/// Assert the delayed GC ledger was written *inside* the CAS EVAL: the
+/// client must issue exactly the script (EVAL/EVALSHA) with no top-level
+/// INCRBY/HSET/ZADD/MULTI/EXEC, while the script-internal (lua) calls must
+/// include INCRBY/HSET/ZADD.
+fn assert_delayed_written_inside_single_eval(client_cmds: &[String], lua_cmds: &[String]) {
+    let client_joined = client_cmds.join("\n").to_lowercase();
+    assert!(
+        client_joined.contains("eval") || client_joined.contains("evalsha"),
+        "CAS must run as a single script; client cmds: {client_cmds:?}"
+    );
+    // Only the delayed-GC ledger commands must stay inside the EVAL; the
+    // versioned variant legitimately issues MULTI/DEL/ZREM afterwards for
+    // best-effort uncommitted-record cleanup (idempotent, GC-covered).
+    for banned in ["\"incrby\"", "\"hset\"", "\"zadd\""] {
+        assert!(
+            !client_joined.contains(banned),
+            "top-level {banned} must not be issued by the client (delayed ledger must be written inside the EVAL); client cmds: {client_cmds:?}"
+        );
+    }
+    let lua_joined = lua_cmds.join("\n").to_lowercase();
+    assert!(
+        lua_joined.contains("\"incrby\""),
+        "delayed counter must be incremented inside the EVAL; lua cmds: {lua_cmds:?}"
+    );
+    assert!(
+        lua_joined.contains("\"hset\""),
+        "delayed hashes must be written inside the EVAL"
+    );
+    assert!(
+        lua_joined.contains("\"zadd\""),
+        "delayed index must be written inside the EVAL"
+    );
 }
 
 /// Create a new test store with pre-configured session ID
@@ -4174,5 +4266,258 @@ async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
         result.is_ok(),
         "set_plock on tombstoned inode after unlock should succeed, got: {:?}",
         result
+    );
+}
+
+// #1: CAS + delayed GC ledger must land in a single EVAL so a crash between
+// the list swap and the delayed-record write cannot leak unreferenced slices.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_compact_replace_creates_delayed_in_single_eval() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_eval.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 501,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, old_slice).await.unwrap();
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 502,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    let delayed = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[501]);
+
+    // The whole operation must be a single EVAL: the client may issue only
+    // the script (no top-level INCRBY/HSET/ZADD), and the delayed ledger
+    // must be written by script-internal redis.call.
+    let (client_cmds, lua_cmds) = monitor_top_level(async {
+        store
+            .replace_slices_for_compact(chunk_id, &[new_slice], &delayed)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_delayed_written_inside_single_eval(&client_cmds, &lua_cmds);
+
+    // And the ledger must actually exist, atomically with the new list.
+    let slices = store.get_slices(chunk_id).await.unwrap();
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].slice_id, 502);
+    let counter: i64 = redis::cmd("GET")
+        .arg(super::DELAYED_COUNTER_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        counter, 1,
+        "delayed counter must be 1 after one delayed slice"
+    );
+    let idx_len: i64 = redis::cmd("ZCARD")
+        .arg(super::DELAYED_INDEX_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(idx_len, 1, "delayed index must contain the new record");
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_compact_replace_versioned_creates_delayed_in_single_eval() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_eval_v.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 601,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, old_slice).await.unwrap();
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 602,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    let delayed = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[601]);
+
+    let (client_cmds, lua_cmds) = monitor_top_level(async {
+        store
+            .replace_slices_for_compact_with_version(chunk_id, &[new_slice], &delayed, &[old_slice])
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_delayed_written_inside_single_eval(&client_cmds, &lua_cmds);
+
+    let slices = store.get_slices(chunk_id).await.unwrap();
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].slice_id, 602);
+    let counter: i64 = redis::cmd("GET")
+        .arg(super::DELAYED_COUNTER_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(counter, 1);
+}
+
+// Conflict: a stale expected version must abort with zero side effects — the
+// list stays, and no delayed ledger (counter / hashes / index) is created.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_compact_cas_conflict_writes_nothing() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_conflict.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let slice = crate::chunk::SliceDesc {
+        slice_id: 701,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, slice).await.unwrap();
+
+    // Fabricate a stale reader: the version key is bumped out from under us,
+    // so the CAS (expected=0) must fail.
+    let version_key = store.chunk_version_key(chunk_id);
+    redis::cmd("SET")
+        .arg(&version_key)
+        .arg(99)
+        .query_async::<()>(&mut store.conn.clone())
+        .await
+        .unwrap();
+
+    let chunk_key = store.chunk_key(chunk_id);
+    let before: Vec<Vec<u8>> = redis::cmd("LRANGE")
+        .arg(&chunk_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+
+    let delayed = crate::chunk::SliceDesc::encode_delayed_data(&[slice], &[701]);
+    let delayed_slices = crate::chunk::SliceDesc::decode_delayed_data(&delayed).unwrap();
+    let mut delayed_args: Vec<Vec<u8>> = Vec::with_capacity(delayed_slices.len() * 3);
+    for (sid, off, sz) in &delayed_slices {
+        delayed_args.push(sid.to_string().into_bytes());
+        delayed_args.push(off.to_string().into_bytes());
+        delayed_args.push(u64::from(*sz).to_string().into_bytes());
+    }
+    let script = redis::Script::new(super::CHUNK_CAS_DELAYED_LUA);
+    let ok: i32 = script
+        .key(&chunk_key)
+        .key(&version_key)
+        .key(super::DELAYED_COUNTER_KEY)
+        .key(super::DELAYED_INDEX_KEY)
+        .arg(0) // expected version: stale
+        .arg(1)
+        .arg(chunk_id.to_string())
+        .arg("1700000000")
+        .arg(delayed_slices.len() as i64)
+        .arg(&delayed_args)
+        .invoke_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(ok, 0, "stale expected version must fail the CAS");
+
+    let after: Vec<Vec<u8>> = redis::cmd("LRANGE")
+        .arg(&chunk_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(after.len(), before.len(), "chunk list must be unchanged");
+    let counter: Option<i64> = redis::cmd("GET")
+        .arg(super::DELAYED_COUNTER_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        counter, None,
+        "no delayed counter may be created on conflict"
+    );
+    let idx_len: i64 = redis::cmd("ZCARD")
+        .arg(super::DELAYED_INDEX_KEY)
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        idx_len, 0,
+        "no delayed index entries may be created on conflict"
+    );
+}
+
+// #2: stat_fs must enumerate with SCAN, never with the blocking KEYS command.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_stat_fs_uses_scan_not_keys() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    for i in 0..3 {
+        let ino = store
+            .create_file(root, format!("scan_{i}.txt"))
+            .await
+            .unwrap();
+        store.set_file_size(ino, 1024 + i).await.unwrap();
+    }
+    store.mkdir(root, "scan_dir".to_string()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let snap = store.stat_fs().await.unwrap();
+    assert!(snap.used_inodes >= 5, "root + 3 files + 1 dir");
+
+    let keys_calls = redis_command_calls(&store, "keys").await;
+    let scan_calls = redis_command_calls(&store, "scan").await;
+    assert_eq!(keys_calls, 0, "stat_fs must not use blocking KEYS");
+    assert!(
+        scan_calls >= 1,
+        "stat_fs should walk the node space with SCAN"
+    );
+}
+
+// #2: repeated stat_fs within the TTL must be served from the cache.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_stat_fs_result_cached_within_ttl() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    store
+        .create_file(root, "cache_ttl.txt".to_string())
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let _ = store.stat_fs().await.unwrap();
+    let _ = store.stat_fs().await.unwrap();
+    let scan_calls = redis_command_calls(&store, "scan").await;
+    assert_eq!(
+        scan_calls, 1,
+        "second stat_fs within TTL must hit the cache"
     );
 }
