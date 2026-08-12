@@ -47,6 +47,53 @@ pub struct OssConfig {
     /// default [`MAX_CONCURRENT_S3_REQUESTS`]; explicit values let high-RTT
     /// or low-memory mounts tune the bound (0/None = default, never disable).
     pub max_concurrent_requests: Option<usize>,
+    /// Mount the filesystem read-only: reject write / mkdir / delete / rename.
+    pub read_only: bool,
+    /// POSIX ownership / permission defaults applied to every object by the
+    /// FUSE adapters. Objects are metadata-less, so these are mount-level
+    /// defaults (like aliyun/ossfs `uid` / `gid` / `dir_mode` / `file_mode`).
+    /// `uid`/`gid` of 0 mean "use the mounting user".
+    pub uid: u32,
+    pub gid: u32,
+    pub dir_mode: u32,
+    pub file_mode: u32,
+}
+
+/// POSIX ownership / permission defaults applied to every object by the FUSE
+/// adapters. See [`OssConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountAttr {
+    pub uid: u32,
+    pub gid: u32,
+    pub dir_mode: u32,
+    pub file_mode: u32,
+}
+
+impl Default for MountAttr {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+        }
+    }
+}
+
+/// Resolve a configured owner id: `0` means "use the mounting user".
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn effective_owner(configured: u32, current: u32) -> u32 {
+    if configured == 0 { current } else { configured }
+}
+
+/// Resolve the FUSE permission bits for an object: directory vs file.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32) -> u16 {
+    if is_dir {
+        dir_mode as u16
+    } else {
+        file_mode as u16
+    }
 }
 
 impl OssConfig {
@@ -110,6 +157,10 @@ pub struct ObjectFs {
     negative: Mutex<HashMap<String, Instant>>,
     /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
     limiter: Arc<Semaphore>,
+    /// Read-only mount: reject all mutations.
+    read_only: bool,
+    /// POSIX ownership / permission defaults for the FUSE adapters.
+    mount_attr: MountAttr,
 }
 
 impl ObjectFs {
@@ -139,7 +190,32 @@ impl ObjectFs {
             limiter: Arc::new(Semaphore::new(effective_max_concurrent_requests(
                 config.max_concurrent_requests,
             ))),
+            read_only: config.read_only,
+            mount_attr: MountAttr {
+                uid: config.uid,
+                gid: config.gid,
+                dir_mode: config.dir_mode,
+                file_mode: config.file_mode,
+            },
         })
+    }
+
+    /// Read-only state of this mount.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// POSIX ownership / permission defaults applied by the FUSE adapters.
+    pub fn mount_attr(&self) -> MountAttr {
+        self.mount_attr
+    }
+
+    /// Reject mutations when mounted read-only.
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!("filesystem is mounted read-only");
+        }
+        Ok(())
     }
 
     /// Acquire a permit bounding in-flight S3 operations. Every public
@@ -432,6 +508,7 @@ impl ObjectFs {
     /// are uploaded via S3 multipart so they are not limited by the single-PUT
     /// object-size cap and can be retried per part.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         self.invalidate_stat(path);
         if data.len() as u64 > MULTIPART_THRESHOLD {
             self.write_multipart(path, data).await
@@ -590,6 +667,7 @@ impl ObjectFs {
 
     /// Delete a single object.
     pub async fn delete(&self, path: &str) -> Result<()> {
+        self.ensure_writable()?;
         let _permit = self.acquire().await?;
         self.delete_impl(path).await
     }
@@ -609,6 +687,7 @@ impl ObjectFs {
 
     /// Recursively delete a directory tree (objects under the dir prefix).
     pub async fn delete_dir_recursive(&self, dir: &str) -> Result<()> {
+        self.ensure_writable()?;
         let _permit = self.acquire().await?;
         self.delete_dir_recursive_impl(dir).await
     }
@@ -667,6 +746,7 @@ impl ObjectFs {
     /// Rename a file or directory. Directories are copied recursively; the
     /// operation is intentionally non-atomic (object storage semantics).
     pub async fn rename(&self, old: &str, new: &str) -> Result<()> {
+        self.ensure_writable()?;
         let _permit = self.acquire().await?;
         self.rename_impl(old, new).await
     }
@@ -852,6 +932,8 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: "ossfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
@@ -864,11 +946,41 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
         assert_eq!(fs2.list_prefix("/docs"), "docs/");
         assert_eq!(fs2.list_prefix("/"), "");
+    }
+
+    #[test]
+    fn effective_owner_and_mode_resolve_defaults() {
+        assert_eq!(effective_owner(0, 1000), 1000);
+        assert_eq!(effective_owner(42, 1000), 42);
+        assert_eq!(effective_mode(true, 0o755, 0o644), 0o755);
+        assert_eq!(effective_mode(false, 0o755, 0o644), 0o644);
+    }
+
+    #[tokio::test]
+    async fn read_only_rejects_all_mutations() {
+        let fs = ObjectFs {
+            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
+            bucket: "b".into(),
+            stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: true,
+            mount_attr: MountAttr::default(),
+            prefix: String::new(),
+        };
+        assert!(fs.ensure_writable().is_err());
+        assert!(fs.write("/a", b"x").await.is_err());
+        assert!(fs.mkdir("/d").await.is_err());
+        assert!(fs.delete("/a").await.is_err());
+        assert!(fs.delete_dir_recursive("/d").await.is_err());
+        assert!(fs.rename("/a", "/b").await.is_err());
     }
 
     #[test]
@@ -880,6 +992,11 @@ mod tests {
             force_path_style: false,
             prefix: "ossfs".into(),
             max_concurrent_requests: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -894,6 +1011,8 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -926,6 +1045,8 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -952,6 +1073,8 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -977,6 +1100,8 @@ mod tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1224,6 +1349,8 @@ mod s3_mock_tests {
             stats: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(limit)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
         }
     }
 

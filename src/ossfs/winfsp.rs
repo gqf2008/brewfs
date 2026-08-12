@@ -454,13 +454,14 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
     }
 
     let rt = Handle::current();
+    let read_only = fs.read_only();
     let context = OssMountContext {
         fs,
         rt,
         mount_point: mount_point.to_path_buf(),
         refresh: Mutex::new(RefreshState::new()),
     };
-    let params = FileSystemParams::default_params(build_volume_params());
+    let params = FileSystemParams::default_params(build_volume_params(read_only));
     let mut host = FileSystemHost::new_with_timer_async::<(), REFRESH_INTERVAL_MS>(params, context)
         .map_err(|e| anyhow::anyhow!("failed to create WinFsp filesystem host: {e}"))?;
 
@@ -488,8 +489,9 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
     Ok(())
 }
 
-fn build_volume_params() -> VolumeParams {
+fn build_volume_params(read_only: bool) -> VolumeParams {
     let mut vp = VolumeParams::new();
+    vp.read_only_volume(read_only);
     vp.sector_size(512)
         .sectors_per_allocation_unit(8)
         .max_component_length(255)
@@ -529,6 +531,11 @@ impl FileSystemContext for OssMountContext {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
                 FILE_ATTRIBUTE_ARCHIVE
+                    | if self.fs.read_only() {
+                        FILE_ATTRIBUTE_READONLY
+                    } else {
+                        0
+                    }
             },
         })
     }
@@ -555,6 +562,9 @@ impl FileSystemContext for OssMountContext {
         }
 
         let write = granted_access & 0x2 != 0 || granted_access & 0x4000_0000 != 0;
+        if write && self.fs.read_only() {
+            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+        }
         let write_buf = if is_dir {
             None
         } else if write {
@@ -591,6 +601,9 @@ impl FileSystemContext for OssMountContext {
     ) -> winfsp::Result<Self::FileContext> {
         let posix = win_path_to_posix(file_name);
         let is_dir = create_options & FILE_DIRECTORY_FILE != 0;
+        if self.fs.read_only() {
+            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+        }
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;

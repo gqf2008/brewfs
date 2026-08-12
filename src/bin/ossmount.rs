@@ -25,12 +25,27 @@ use ossfs::{ObjectFs, OssConfig};
 fn usage() -> ! {
     eprintln!(
         "usage: ossmount --bucket BUCKET [--endpoint URL] [--region REGION]\n\
-                 [--prefix PREFIX] [--force-path-style] [--refresh-secs N] MOUNT_POINT\n\
+                 [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
+                 [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
+                 MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
          env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY"
     );
     std::process::exit(2);
+}
+
+/// Parse a POSIX permission mode: accepts octal (`755` / `0o755`) or
+/// decimal. Octal is the expected input for `--dir-mode` / `--file-mode`.
+fn parse_mode(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        return u32::from_str_radix(oct, 8).ok();
+    }
+    if !s.is_empty() && s.chars().all(|c| ('0'..='7').contains(&c)) {
+        return u32::from_str_radix(s, 8).ok();
+    }
+    s.parse().ok()
 }
 
 fn parse_args() -> (OssConfig, PathBuf, u64) {
@@ -40,6 +55,11 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut prefix = String::new();
     let mut force_path_style = false;
     let mut refresh_secs: u64 = 10;
+    let mut read_only = false;
+    let mut uid: u32 = 0;
+    let mut gid: u32 = 0;
+    let mut dir_mode: u32 = 0o755;
+    let mut file_mode: u32 = 0o644;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
@@ -50,6 +70,31 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             "--region" => region = args.next().unwrap_or_else(|| usage()),
             "--prefix" => prefix = args.next().unwrap_or_else(|| usage()),
             "--force-path-style" => force_path_style = true,
+            "--read-only" => read_only = true,
+            "--uid" => {
+                uid = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
+            "--gid" => {
+                gid = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
+            "--dir-mode" => {
+                dir_mode = args
+                    .next()
+                    .and_then(|v| parse_mode(&v))
+                    .unwrap_or_else(|| usage());
+            }
+            "--file-mode" => {
+                file_mode = args
+                    .next()
+                    .and_then(|v| parse_mode(&v))
+                    .unwrap_or_else(|| usage());
+            }
             "--refresh-secs" => {
                 refresh_secs = args
                     .next()
@@ -72,6 +117,11 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             force_path_style,
             prefix,
             max_concurrent_requests: None,
+            read_only,
+            uid,
+            gid,
+            dir_mode,
+            file_mode,
         },
         mount_point,
         refresh_secs,
@@ -92,6 +142,23 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(windows))]
     {
         ossfs::fuse::mount_oss_fuse(fs, &mount_point, refresh_secs).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mode;
+
+    #[test]
+    fn parses_octal_and_decimal_modes() {
+        assert_eq!(parse_mode("755"), Some(0o755));
+        assert_eq!(parse_mode("0o755"), Some(0o755));
+        assert_eq!(parse_mode("0O644"), Some(0o644));
+        assert_eq!(parse_mode("0644"), Some(0o644));
+        assert_eq!(parse_mode("644"), Some(0o644));
+        assert_eq!(parse_mode("493"), Some(493)); // '9' forces decimal
+        assert_eq!(parse_mode(""), None);
+        assert_eq!(parse_mode("abc"), None);
     }
 }
 

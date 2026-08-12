@@ -92,6 +92,11 @@ region / access key → *Save* → *Mount*.
 | `--prefix` | Optional object-key namespace (e.g. `myns/`); keep consistent across machines |
 | `--force-path-style` | Use path-style addressing (MinIO / self-hosted S3) |
 | `--refresh-secs N` | Periodic directory refresh interval (FUSE; 0 disables; WinFsp fixed at 10s) |
+| `--read-only` | Reject all write/mkdir/delete/rename at mount level |
+| `--uid N` | Owner uid shown on every object (0 = mounting user) |
+| `--gid N` | Owner gid shown on every object (0 = mounting user) |
+| `--dir-mode M` | Directory permission bits, octal (default `755`) |
+| `--file-mode M` | File permission bits, octal (default `644`) |
 
 Credentials come from the environment (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`) or the AWS shared config. The tray injects them into

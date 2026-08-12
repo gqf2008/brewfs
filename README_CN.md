@@ -77,6 +77,11 @@ ossmount mount --bucket my-bucket \
 | `--prefix` | 可选对象键命名空间（如 `myns/`）；多机需一致 |
 | `--force-path-style` | path-style 寻址（MinIO/自建 S3 需要） |
 | `--refresh-secs N` | 目录定时刷新间隔（FUSE；0 关闭；WinFsp 固定 10s） |
+| `--read-only` | 挂载级只读，拒绝写入/建目录/删除/重命名 |
+| `--uid N` | 所有对象显示的属主 uid（0 = 当前挂载用户） |
+| `--gid N` | 所有对象显示的属组 gid（0 = 当前挂载用户） |
+| `--dir-mode M` | 目录权限位，八进制（默认 `755`） |
+| `--file-mode M` | 文件权限位，八进制（默认 `644`） |
 
 凭据来自环境变量（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`）或 AWS 共享配置；托盘会把密钥注入其拉起的 `ossmount` 进程。
 

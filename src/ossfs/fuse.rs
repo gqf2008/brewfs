@@ -25,7 +25,7 @@ use fuser::{
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
-use super::{DirEntry, ObjectFs};
+use super::{DirEntry, MountAttr, ObjectFs, effective_mode, effective_owner};
 
 /// Attribute/entry cache lifetime. Object storage has no change notifications,
 /// so a short TTL keeps the tree weakly consistent across machines.
@@ -118,6 +118,8 @@ pub struct OssFs {
     /// uid/gid shown in attributes (the mounting user).
     uid: u32,
     gid: u32,
+    /// Mount-level ownership / permission defaults from [`ObjectFs`].
+    mount_attr: MountAttr,
 }
 
 impl OssFs {
@@ -125,6 +127,9 @@ impl OssFs {
         let mut inodes = HashMap::new();
         inodes.insert(ROOT_INODE, "/".to_string());
         dirs.lock().unwrap().insert(ROOT_INODE);
+        let mount_attr = fs.mount_attr();
+        let uid = effective_owner(mount_attr.uid, unsafe { libc::getuid() });
+        let gid = effective_owner(mount_attr.gid, unsafe { libc::getgid() });
         Self {
             fs,
             rt,
@@ -132,8 +137,9 @@ impl OssFs {
             dirs,
             files: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid,
+            gid,
+            mount_attr,
         }
     }
 
@@ -164,9 +170,17 @@ impl OssFs {
 
     fn attr_of(&self, path: &str, entry: &DirEntry) -> FileAttr {
         let (kind, perm, nlink) = if entry.is_dir {
-            (FileType::Directory, 0o755u16, 2u32)
+            (
+                FileType::Directory,
+                effective_mode(true, self.mount_attr.dir_mode, self.mount_attr.file_mode),
+                2u32,
+            )
         } else {
-            (FileType::RegularFile, 0o644u16, 1u32)
+            (
+                FileType::RegularFile,
+                effective_mode(false, self.mount_attr.dir_mode, self.mount_attr.file_mode),
+                1u32,
+            )
         };
         let size = entry.size;
         FileAttr {
