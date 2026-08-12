@@ -70,6 +70,11 @@ pub struct OssConfig {
     /// Rounded up to 1 MiB units internally. Mirrors aliyun/ossfs
     /// `total_mem_limit` (the write-upload portion).
     pub max_upload_bytes: Option<usize>,
+    /// Sequential-read prefetch window in bytes. When set, consecutive
+    /// reads (next offset == previous end) fetch this many bytes ahead and
+    /// cache them so the following small reads are served locally (mirrors
+    /// aliyun/ossfs `prefetch_chunk_size`). `None`/`Some(0)` disables it.
+    pub read_ahead_bytes: Option<usize>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -163,6 +168,14 @@ const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
 /// whole MiB units, so the bound is accurate to within one MiB while keeping
 /// permit counts small.
 const UPLOAD_BUDGET_UNIT: usize = 1 << 20;
+/// Upper bound on bytes held by the read-ahead cache. Keeps prefetch from
+/// turning a sequential scan into an OOM (the same failure class the global
+/// request limiter already guards against).
+const READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Upper bound on read-ahead cache entries.
+const READ_CACHE_MAX_ENTRIES: usize = 256;
+/// Upper bound on tracked sequential-read hints; cleared when exceeded.
+const MAX_READ_SEQ_ENTRIES: usize = 4096;
 
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
@@ -174,6 +187,19 @@ fn upload_budget_units(max_bytes: Option<usize>) -> Option<usize> {
     }
     let units = bytes.div_ceil(UPLOAD_BUDGET_UNIT).min(u32::MAX as usize);
     Some(units.max(1))
+}
+
+/// One cached read-ahead window for a path.
+struct ReadCacheEntry {
+    start: u64,
+    data: Vec<u8>,
+}
+
+/// Bounded read-ahead cache shared by all paths in one mount.
+#[derive(Default)]
+struct ReadCache {
+    entries: HashMap<String, ReadCacheEntry>,
+    bytes: usize,
 }
 
 pub struct ObjectFs {
@@ -198,6 +224,12 @@ pub struct ObjectFs {
     upload_budget: Option<Arc<Semaphore>>,
     /// Total MiB units available when [`Self::upload_budget`] is set.
     upload_budget_units: usize,
+    /// Sequential-read prefetch window; 0 disables read-ahead.
+    read_ahead_window: usize,
+    /// Bounded read-ahead cache.
+    read_cache: Mutex<ReadCache>,
+    /// path -> end offset of its previous read (sequential-read hint).
+    read_seq: Mutex<HashMap<String, u64>>,
 }
 
 impl ObjectFs {
@@ -219,6 +251,7 @@ impl ObjectFs {
         }
         let client = Client::from_conf(builder.build());
         let upload_budget_units = upload_budget_units(config.max_upload_bytes);
+        let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -239,6 +272,9 @@ impl ObjectFs {
             rename_dir_limit: config.rename_dir_limit,
             upload_budget: upload_budget_units.map(|units| Arc::new(Semaphore::new(units))),
             upload_budget_units: upload_budget_units.unwrap_or(0),
+            read_ahead_window,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
         })
     }
 
@@ -544,12 +580,56 @@ impl ObjectFs {
 
     /// Read `len` bytes starting at `offset`. Returns fewer bytes near EOF,
     /// empty when `offset` is at/behind EOF.
+    ///
+    /// When [`Self::read_ahead_window`] is enabled and the read continues the
+    /// previous read (`offset == last_end`), the object is fetched in
+    /// window-sized chunks and cached so subsequent sequential small reads do
+    /// not pay an S3 round trip each.
     pub async fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let _permit = self.acquire().await?;
+        let window = self.read_ahead_window;
         let key = self.key_for(path);
+
+        if window > 0
+            && let Some(data) = self.read_cache_hit(path, offset, len)
+        {
+            self.note_read_end(path, offset.saturating_add(data.len() as u64));
+            return Ok(data);
+        }
+
+        let sequential = if window > 0 {
+            let seq = self.read_seq.lock().unwrap();
+            seq.get(path) == Some(&offset)
+        } else {
+            false
+        };
+
+        // Warm the sequential hint so the next contiguous read can trigger
+        // prefetch even if this one is served directly.
+        if window > 0 {
+            self.note_read_end(path, offset.saturating_add(len as u64));
+        }
+
+        let fetch_len = read_fetch_len(len, window, sequential);
+
+        let _permit = self.acquire().await?;
+        let data = self.read_range_uncached(&key, offset, fetch_len).await?;
+
+        if window > 0 && fetch_len > len {
+            self.insert_read_cache(path, offset, data.clone());
+        }
+        if window > 0 {
+            self.note_read_end(path, offset.saturating_add(data.len() as u64));
+        }
+
+        Ok(data[..len.min(data.len())].to_vec())
+    }
+
+    /// Actual S3 GET for `len` bytes at `offset`. Caller holds a limiter
+    /// permit.
+    async fn read_range_uncached(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         let end = offset.saturating_add(len as u64);
         let range = if offset == 0 && len == usize::MAX {
             "bytes=0-".to_string()
@@ -560,7 +640,7 @@ impl ObjectFs {
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(&key)
+            .key(key)
             .range(&range)
             .send()
             .await
@@ -573,12 +653,78 @@ impl ObjectFs {
         Ok(body.to_vec())
     }
 
+    /// Return a fully-cached window slice when `[offset, offset+len)` is
+    /// entirely inside it.
+    fn read_cache_hit(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let cache = self.read_cache.lock().unwrap();
+        let entry = cache.entries.get(path)?;
+        let end = entry.start.checked_add(entry.data.len() as u64)?;
+        if offset < entry.start || offset.saturating_add(len as u64) > end {
+            return None;
+        }
+        let start = (offset - entry.start) as usize;
+        Some(entry.data[start..start + len].to_vec())
+    }
+
+    /// Insert a read-ahead window into the bounded cache, evicting arbitrary
+    /// entries when the byte/entry budgets are exceeded.
+    fn insert_read_cache(&self, path: &str, start: u64, data: Vec<u8>) {
+        if data.is_empty() || data.len() > READ_CACHE_MAX_BYTES {
+            return;
+        }
+        let mut cache = self.read_cache.lock().unwrap();
+        if let Some(old) = cache.entries.remove(path) {
+            cache.bytes = cache.bytes.saturating_sub(old.data.len());
+        }
+        while cache.bytes + data.len() > READ_CACHE_MAX_BYTES
+            || cache.entries.len() >= READ_CACHE_MAX_ENTRIES
+        {
+            let key = cache.entries.keys().next().cloned();
+            let Some(key) = key else { break };
+            if let Some(evicted) = cache.entries.remove(&key) {
+                cache.bytes = cache.bytes.saturating_sub(evicted.data.len());
+            }
+        }
+        cache.bytes += data.len();
+        cache
+            .entries
+            .insert(path.to_string(), ReadCacheEntry { start, data });
+    }
+
+    /// Track the end of the most recent read for sequential-prefetch
+    /// detection. The hint map is bounded like the stat/negative caches.
+    fn note_read_end(&self, path: &str, end: u64) {
+        let mut seq = self.read_seq.lock().unwrap();
+        if seq.len() >= MAX_READ_SEQ_ENTRIES {
+            seq.clear();
+        }
+        seq.insert(path.to_string(), end);
+    }
+
+    /// Drop cached read-ahead data for one path after a local mutation.
+    fn invalidate_read_cache(&self, path: &str) {
+        let mut cache = self.read_cache.lock().unwrap();
+        if let Some(old) = cache.entries.remove(path) {
+            cache.bytes = cache.bytes.saturating_sub(old.data.len());
+        }
+        self.read_seq.lock().unwrap().remove(path);
+    }
+
+    /// Drop all cached read-ahead data (used by recursive delete/rename).
+    fn clear_read_cache(&self) {
+        let mut cache = self.read_cache.lock().unwrap();
+        cache.entries.clear();
+        cache.bytes = 0;
+        self.read_seq.lock().unwrap().clear();
+    }
+
     /// Overwrite an object with `data` (whole-object write). Large objects
     /// are uploaded via S3 multipart so they are not limited by the single-PUT
     /// object-size cap and can be retried per part.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.invalidate_stat(path);
+        self.invalidate_read_cache(path);
         let _budget = self.acquire_upload_budget(data.len()).await?;
         if data.len() as u64 > MULTIPART_THRESHOLD {
             self.write_multipart(path, data).await
@@ -744,6 +890,7 @@ impl ObjectFs {
 
     async fn delete_impl(&self, path: &str) -> Result<()> {
         self.invalidate_stat(path);
+        self.invalidate_read_cache(path);
         let key = self.key_for(path);
         self.client
             .delete_object()
@@ -764,6 +911,7 @@ impl ObjectFs {
 
     async fn delete_dir_recursive_impl(&self, dir: &str) -> Result<()> {
         self.invalidate_stat(dir);
+        self.clear_read_cache();
         let prefix = self.list_prefix(dir);
         let mut token: Option<String> = None;
         loop {
@@ -824,6 +972,7 @@ impl ObjectFs {
     async fn rename_impl(&self, old: &str, new: &str) -> Result<()> {
         self.invalidate_stat(old);
         self.invalidate_stat(new);
+        self.clear_read_cache();
         let old_key = self.key_for(old);
         let new_key = self.key_for(new);
         let source = format!("{}/{}", self.bucket, old_key);
@@ -986,6 +1135,17 @@ fn is_s3_invalid_range(
     }
 }
 
+/// Size of the S3 GET for one read, factoring in the read-ahead window and
+/// whether this read continues the previous one. Extracted so the prefetch
+/// decision is unit-testable.
+fn read_fetch_len(len: usize, window: usize, sequential: bool) -> usize {
+    if window > 0 && (len as u64) < window as u64 && sequential {
+        window
+    } else {
+        len
+    }
+}
+
 /// Normalize an object key so its directory prefix is `<base>/`, never
 /// `<base>//`. Used by directory rename copy/count paths.
 fn dir_object_prefix(key: &str) -> String {
@@ -1074,6 +1234,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: "ossfs/".into(),
         };
         assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
@@ -1092,6 +1255,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
@@ -1121,6 +1287,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         assert!(fs.ensure_writable().is_err());
@@ -1145,11 +1314,48 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: Some(Arc::new(Semaphore::new(1))),
             upload_budget_units: 1,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         let data = vec![0u8; 2 * UPLOAD_BUDGET_UNIT];
         let err = fs.write("/large.bin", &data).await.unwrap_err();
         assert!(err.to_string().contains("max-upload-bytes budget"));
+    }
+
+    #[test]
+    fn read_fetch_len_prefetches_only_on_sequential_reads() {
+        assert_eq!(read_fetch_len(4096, 8 * 1024, false), 4096);
+        assert_eq!(read_fetch_len(4096, 8 * 1024, true), 8 * 1024);
+        assert_eq!(read_fetch_len(8 * 1024, 8 * 1024, true), 8 * 1024);
+        assert_eq!(read_fetch_len(4096, 0, true), 4096);
+    }
+
+    #[test]
+    fn read_cache_hit_and_invalidation() {
+        let fs = ObjectFs {
+            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
+            bucket: "b".into(),
+            stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            read_only: false,
+            mount_attr: MountAttr::default(),
+            allow_rename_dir: true,
+            rename_dir_limit: None,
+            upload_budget: None,
+            upload_budget_units: 0,
+            read_ahead_window: 1024,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
+            prefix: String::new(),
+        };
+        fs.insert_read_cache("/a", 0, (0..1024u32).map(|v| v as u8).collect::<Vec<_>>());
+        assert_eq!(fs.read_cache_hit("/a", 10, 4), Some(vec![10, 11, 12, 13]));
+        assert_eq!(fs.read_cache_hit("/a", 2048, 4), None);
+        fs.invalidate_read_cache("/a");
+        assert_eq!(fs.read_cache_hit("/a", 10, 4), None);
     }
 
     #[test]
@@ -1169,6 +1375,7 @@ mod tests {
             allow_rename_dir: true,
             rename_dir_limit: Some(2_000_000),
             max_upload_bytes: None,
+            read_ahead_bytes: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -1189,6 +1396,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1227,6 +1437,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         let old = DirEntry {
@@ -1259,6 +1472,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1290,6 +1506,9 @@ mod tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
             prefix: String::new(),
         };
         let entry = DirEntry {
@@ -1543,6 +1762,9 @@ mod s3_mock_tests {
             rename_dir_limit: None,
             upload_budget: None,
             upload_budget_units: 0,
+            read_ahead_window: 0,
+            read_cache: Mutex::new(ReadCache::default()),
+            read_seq: Mutex::new(HashMap::new()),
         }
     }
 

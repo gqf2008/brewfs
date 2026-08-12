@@ -100,6 +100,7 @@ region / access key → *Save* → *Mount*.
 | `--no-rename-dir` | Disable recursive directory rename |
 | `--rename-dir-limit N` | Max objects copied by one directory rename (default `2000000`, `0` = unlimited) |
 | `--max-upload-bytes N` | Cap aggregate in-flight write bytes (`0` = unlimited) |
+| `--read-ahead-bytes N` | Sequential-read prefetch window, bytes (default `8388608`, `0` = off) |
 
 Credentials come from the environment (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`) or the AWS shared config. The tray injects them into
