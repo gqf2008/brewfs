@@ -76,6 +76,13 @@ pub struct DirEntry {
 const STAT_TTL: Duration = Duration::from_secs(3);
 /// Upper bound on cached stat entries; the cache is cleared when exceeded.
 const MAX_STAT_ENTRIES: usize = 4096;
+/// TTL for the negative-stat cache (paths known to not exist). Avoids
+/// repeated remote HEAD/probe round trips when callers repeatedly stat
+/// missing paths.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Upper bound on negative-cache entries; cleared when exceeded so memory
+/// stays bounded (mirrors [`MAX_STAT_ENTRIES`]).
+const MAX_NEGATIVE_ENTRIES: usize = 4096;
 /// Upper bound on in-flight S3 requests issued by one mount. Bounds peak
 /// memory (every list/head materializes full results) and remote pressure
 /// during I/O storms such as `find /` recursing into the mounted network
@@ -99,6 +106,8 @@ pub struct ObjectFs {
     prefix: String,
     /// Short-TTL attribute cache: path -> (cached_at, entry).
     stats: Mutex<HashMap<String, (Instant, DirEntry)>>,
+    /// Negative stat cache: path -> cached_at (path known missing).
+    negative: Mutex<HashMap<String, Instant>>,
     /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
     limiter: Arc<Semaphore>,
 }
@@ -126,6 +135,7 @@ impl ObjectFs {
             bucket: config.bucket,
             prefix: config.prefix,
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(effective_max_concurrent_requests(
                 config.max_concurrent_requests,
             ))),
@@ -248,12 +258,35 @@ impl ObjectFs {
                 }
             }
         }
+        if self.negative_hit(path) {
+            return Ok(None);
+        }
         let _permit = self.acquire().await?;
         let result = self.stat_uncached_impl(path).await?;
         if let Some(entry) = &result {
             self.cache_insert(path, entry.clone());
+        } else {
+            self.negative_insert(path);
         }
         Ok(result)
+    }
+
+    /// Whether `path` is currently recorded as missing (and still fresh).
+    fn negative_hit(&self, path: &str) -> bool {
+        matches!(
+            self.negative.lock().unwrap().get(path),
+            Some(at) if at.elapsed() < NEGATIVE_CACHE_TTL
+        )
+    }
+
+    /// Record `path` as missing (bounded, same clear-on-overflow policy as the
+    /// positive cache).
+    fn negative_insert(&self, path: &str) {
+        let mut cache = self.negative.lock().unwrap();
+        if cache.len() >= MAX_NEGATIVE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(path.to_string(), Instant::now());
     }
 
     /// Insert a stat result into the cache, clearing the whole cache when
@@ -267,9 +300,11 @@ impl ObjectFs {
         cache.insert(path.to_string(), (Instant::now(), entry));
     }
 
-    /// Drop any cached attribute for `path` (called after local mutations).
+    /// Drop any cached attribute (positive or negative) for `path`, called
+    /// after local mutations.
     fn invalidate_stat(&self, path: &str) {
         self.stats.lock().unwrap().remove(path);
+        self.negative.lock().unwrap().remove(path);
     }
 
     /// The actual S3 lookup behind [`Self::stat`] (HEAD, then directory-marker
@@ -815,6 +850,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: "ossfs/".into(),
         };
@@ -826,6 +862,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
@@ -855,6 +892,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
@@ -886,6 +924,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
@@ -911,6 +950,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
@@ -935,6 +975,7 @@ mod tests {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             prefix: String::new(),
         };
@@ -1181,6 +1222,7 @@ mod s3_mock_tests {
             bucket: "b".into(),
             prefix: String::new(),
             stats: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(limit)),
         }
     }
@@ -1346,5 +1388,20 @@ mod s3_mock_tests {
             reassembled, data,
             "multipart parts must reassemble to the original bytes in order"
         );
+    }
+
+    #[tokio::test]
+    async fn stat_missing_path_is_negatively_cached() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        assert!(fs.stat("/nope").await.expect("stat").is_none());
+        let before = mock.requests.lock().unwrap().len();
+
+        // Within NEGATIVE_CACHE_TTL, a second stat of the same missing path
+        // must not issue any remote HEAD/probe requests.
+        assert!(fs.stat("/nope").await.expect("stat").is_none());
+        let after = mock.requests.lock().unwrap().len();
+        assert_eq!(before, after, "second stat must hit the negative cache");
     }
 }
