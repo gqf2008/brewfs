@@ -22,6 +22,7 @@ pub mod fuse;
 pub mod winfsp;
 
 use anyhow::{Context as _, Result};
+use aws_config::credential_process::CredentialProcessProvider;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
@@ -83,6 +84,10 @@ pub struct OssConfig {
     /// mount adapters. `None`/`Some(0)` disables the cap. Rounded up to 1 MiB
     /// units. Mirrors aliyun/ossfs `total_mem_limit` (the dirty-buffer part).
     pub max_dirty_bytes: Option<usize>,
+    /// External `credential_process` command (mirrors aliyun/ossfs). The
+    /// command is executed on credential refresh and must emit the standard
+    /// AWS credential-process JSON. Takes precedence over env/profile creds.
+    pub credential_process: Option<String>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -319,6 +324,9 @@ impl ObjectFs {
         }
         if config.force_path_style {
             builder = builder.force_path_style(true);
+        }
+        if let Some(command) = &config.credential_process {
+            builder = builder.credentials_provider(CredentialProcessProvider::new(command.clone()));
         }
         let client = Client::from_conf(builder.build());
         let upload_budget_units = upload_budget_units(config.max_upload_bytes);
@@ -1490,6 +1498,7 @@ mod tests {
             read_ahead_bytes: None,
             ignore_fsync: true,
             max_dirty_bytes: None,
+            credential_process: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");

@@ -29,7 +29,7 @@ fn usage() -> ! {
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync]\n\
-                 [--max-dirty-bytes N]\n\
+                 [--max-dirty-bytes N] [--credential-process CMD]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -69,6 +69,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut read_ahead_bytes: Option<usize> = Some(8 * 1024 * 1024);
     let mut ignore_fsync = true;
     let mut max_dirty_bytes: Option<usize> = None;
+    let mut credential_process: Option<String> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
@@ -134,6 +135,9 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
                     .unwrap_or_else(|| usage());
                 max_dirty_bytes = if v == 0 { None } else { Some(v) };
             }
+            "--credential-process" => {
+                credential_process = Some(args.next().unwrap_or_else(|| usage()))
+            }
             "--refresh-secs" => {
                 refresh_secs = args
                     .next()
@@ -167,6 +171,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             read_ahead_bytes,
             ignore_fsync,
             max_dirty_bytes,
+            credential_process,
         },
         mount_point,
         refresh_secs,
