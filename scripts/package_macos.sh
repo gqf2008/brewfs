@@ -144,10 +144,9 @@ PLIST
 fi
 
 # ---- 1. build ----
-echo "==> Building ossfs / ossmount (fuse-tokio-runtime, release)"
+echo "==> Building ossmount (release)"
 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
-  cargo build --release --no-default-features --features fuse-tokio-runtime \
-  --bin ossfs --bin ossmount
+  cargo build --release --bin ossmount
 echo "==> Building ossfs-tray"
 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo build --release -p ossfs-tray
 
@@ -159,7 +158,6 @@ cp dist/macos/Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist" 2>/dev/null || true
 cp target/release/ossfs-tray "$APP/Contents/MacOS/"
-cp target/release/ossfs "$APP/Contents/MacOS/"
 cp target/release/ossmount "$APP/Contents/MacOS/"
 if [[ "$FUSE_BACKEND" == "fuse-t" ]]; then
   # The build links libfuse-t via the build prefix's rpath; the distributed

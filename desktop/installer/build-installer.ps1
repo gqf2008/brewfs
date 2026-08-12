@@ -25,9 +25,6 @@ $buildDir = Join-Path $installerDir "build"
 $targetDir = Join-Path $root "target\release"
 
 # OSSFS 依赖均为纯 Rust，无需 protoc。
-if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
-    throw "protoc not found; install it first (e.g. choco install protoc -y or scoop install protobuf)"
-}
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
