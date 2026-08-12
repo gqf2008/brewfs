@@ -1425,3 +1425,44 @@ async fn test_chown_directory() {
     assert_eq!(stat.uid, 500);
     assert_eq!(stat.gid, 500);
 }
+
+#[tokio::test]
+async fn lookup_with_attr_returns_file_attr_in_one_call() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "fused_lookup.txt".to_string())
+        .await
+        .unwrap();
+    store.set_file_size(ino, 1024).await.unwrap();
+
+    let got = store
+        .lookup_with_attr(root, "fused_lookup.txt")
+        .await
+        .unwrap();
+    let (got_ino, attr) = got.expect("lookup_with_attr should resolve the entry");
+    assert_eq!(got_ino, ino);
+    assert_eq!(attr.ino, ino);
+    assert_eq!(attr.kind, FileType::File);
+    assert_eq!(attr.size, 1024);
+
+    // Missing name resolves to None.
+    assert!(
+        store
+            .lookup_with_attr(root, "nope_lookup.txt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Directory entries resolve through the access-meta table (Dir attr).
+    let dir = store.mkdir(root, "fused_dir".to_string()).await.unwrap();
+    let (dir_ino, dir_attr) = store
+        .lookup_with_attr(root, "fused_dir")
+        .await
+        .unwrap()
+        .expect("lookup_with_attr should resolve a directory");
+    assert_eq!(dir_ino, dir);
+    assert_eq!(dir_attr.ino, dir);
+    assert_eq!(dir_attr.kind, FileType::Dir);
+}

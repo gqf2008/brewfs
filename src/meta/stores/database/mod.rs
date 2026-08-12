@@ -1382,6 +1382,40 @@ impl MetaStore for DatabaseMetaStore {
         Ok(entry.map(|e| e.inode))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
+    async fn lookup_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+    ) -> Result<Option<(i64, FileAttr)>, MetaError> {
+        let entry = ContentMeta::find()
+            .filter(content_meta::Column::ParentInode.eq(parent))
+            .filter(content_meta::Column::EntryName.eq(name))
+            .one(&self.db)
+            .await
+            .map_err(MetaError::Database)?;
+
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let ino = entry.inode;
+
+        // Fused lookup: fetch both metadata tables in parallel instead of
+        // serializing file-meta and access-meta reads after the content
+        // lookup, so the client's lookup-miss path pays one store call.
+        let file_query = FileMeta::find_by_id(ino).one(&self.db);
+        let access_query = AccessMeta::find_by_id(ino).one(&self.db);
+        let (file_meta, access_meta) =
+            tokio::try_join!(file_query, access_query).map_err(MetaError::Database)?;
+
+        let attr = match (file_meta, access_meta) {
+            (Some(file_meta), _) => Self::file_meta_to_attr(&file_meta),
+            (None, Some(access_meta)) => Self::access_meta_to_attr(&access_meta),
+            (None, None) => return Err(MetaError::NotFound(ino)),
+        };
+        Ok(Some((ino, attr)))
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path == "/" {

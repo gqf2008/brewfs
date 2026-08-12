@@ -1398,6 +1398,36 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn lookup_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+    ) -> Result<Option<(i64, FileAttr)>, MetaError> {
+        // Fused single-round-trip lookup: resolve the dentry and the node
+        // metadata inside ONE read transaction instead of two (lookup then
+        // stat), so the client lookup-miss path pays a single store call.
+        let operation = "lookup_with_attr";
+        let name = name.to_string();
+        self.read_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                let Some(dentry) = store
+                    .txn_get_dentry(txn, parent, &name, false, operation)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let ino = dentry.ino;
+                let attr = match store.txn_get_node(txn, ino, false, operation).await? {
+                    Some(node) => node.to_attr(),
+                    None => return Err(MetaError::NotFound(ino)),
+                };
+                Ok(Some((ino, attr)))
+            })
+        })
+        .await
+    }
+
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path.is_empty() {
             return Ok(None);
