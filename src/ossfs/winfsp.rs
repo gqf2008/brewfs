@@ -423,10 +423,12 @@ impl OssMountContext {
             notify_change(notifier, &path, FILE_ACTION_REMOVED, filter);
             snap.remove(&name);
         }
-        *snap = current
-            .into_iter()
-            .map(|e| (e.name, (e.is_dir, e.size, e.mtime_secs)))
-            .collect();
+        // Persist the new baseline through the same budget-enforcing path as
+        // seeding: a directory that grows past the budget mid-session is not
+        // kept (re-seeded next pass) and the total-entry budget is never
+        // exceeded even after diffs. (`snap`'s borrow ends after the removed
+        // loop above; NLL releases it before this new mutable borrow.)
+        state.store_snapshot(dir, &current);
     }
 }
 
@@ -993,31 +995,37 @@ impl AsyncFileSystemContext for OssMountContext {
             None => 0,
         };
 
-        let lock = context
-            .dir_buffer
-            .acquire(marker.is_none(), Some(buffer.len() as u32))?;
-
         let matches = |name: &str| pat.as_deref().is_none_or(|p| wildcard_match(p, name));
 
-        if !is_root {
+        // Fetch "." / ".." attributes BEFORE acquiring the DirBuffer lock:
+        // these stat calls wait on the S3 limiter and do network I/O, which
+        // must not happen while holding the kernel-side directory buffer
+        // lock. Only the first page (start == 0) emits them, matching the
+        // original listing where the dots preceded every real entry.
+        let mut dots: Vec<(String, DirEntry)> = Vec::new();
+        if !is_root && start == 0 {
             if matches(".")
                 && let Ok(Some(dot)) = self.fs.stat(&context.path).await
             {
-                let mut di = DirInfo::<255>::new();
-                if di.set_name(".").is_ok() {
-                    *di.file_info_mut() = file_info_from(&dot, file_index("."));
-                    lock.write(&mut di)?;
-                }
+                dots.push((".".to_string(), dot));
             }
             let parent = parent_posix(&context.path);
             if matches("..")
                 && let Ok(Some(dotdot)) = self.fs.stat(&parent).await
             {
-                let mut di = DirInfo::<255>::new();
-                if di.set_name("..").is_ok() {
-                    *di.file_info_mut() = file_info_from(&dotdot, file_index(".."));
-                    lock.write(&mut di)?;
-                }
+                dots.push(("..".to_string(), dotdot));
+            }
+        }
+
+        let lock = context
+            .dir_buffer
+            .acquire(marker.is_none(), Some(buffer.len() as u32))?;
+
+        for (name, dot) in dots {
+            let mut di = DirInfo::<255>::new();
+            if di.set_name(&name).is_ok() {
+                *di.file_info_mut() = file_info_from(&dot, file_index(&name));
+                lock.write(&mut di)?;
             }
         }
 
@@ -1147,6 +1155,44 @@ mod tests {
         state.store_snapshot("/huge", &huge);
         assert!(!state.snapshots.contains_key("/huge"));
         assert!(!state.seeded.contains("/huge"));
+    }
+
+    #[test]
+    fn refresh_growth_evicts_largest_when_total_exceeds_budget() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 100;
+        let a60: Vec<DirEntry> = (0..60).map(|i| entry(&format!("a{i}"))).collect();
+        let b40: Vec<DirEntry> = (0..40).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/a", &a60);
+        state.store_snapshot("/b", &b40);
+        assert_eq!(state.snapshot_entries(), 100);
+        // /b grows to 50 -> total 110 > 100 -> largest non-root (/a, 60)
+        // is evicted, mirroring the refresh_dir diff path (which now goes
+        // through store_snapshot).
+        let b50: Vec<DirEntry> = (0..50).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/b", &b50);
+        assert!(
+            state.snapshot_entries() <= 100,
+            "budget exceeded after growth"
+        );
+        assert!(!state.snapshots.contains_key("/a"));
+        assert!(state.snapshots.contains_key("/b"));
+    }
+
+    #[test]
+    fn refresh_growth_past_single_dir_cap_drops_snapshot() {
+        let mut state = RefreshState::new();
+        state.snapshot_budget = 20;
+        let small: Vec<DirEntry> = (0..5).map(|i| entry(&format!("a{i}"))).collect();
+        state.store_snapshot("/d", &small);
+        assert!(state.snapshots.contains_key("/d"));
+        // The directory grows past the whole budget mid-session: the
+        // baseline must be dropped (re-seed next pass), not persisted.
+        let big: Vec<DirEntry> = (0..30).map(|i| entry(&format!("b{i}"))).collect();
+        state.store_snapshot("/d", &big);
+        assert!(!state.snapshots.contains_key("/d"));
+        assert!(!state.seeded.contains("/d"));
+        assert!(state.snapshot_entries() <= 20);
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub struct OssConfig {
     /// Optional namespace prefix under the bucket (e.g. `brewfs/`). All keys
     /// are stored under it. Must be empty or end with `/`.
     pub prefix: String,
+    /// Optional in-flight S3 request cap. `None` (or `Some(0)`) uses the
+    /// default [`MAX_CONCURRENT_S3_REQUESTS`]; explicit values let high-RTT
+    /// or low-memory mounts tune the bound (0/None = default, never disable).
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl OssConfig {
@@ -110,14 +114,18 @@ impl ObjectFs {
             bucket: config.bucket,
             prefix: config.prefix,
             stats: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
+            limiter: Arc::new(Semaphore::new(effective_max_concurrent_requests(
+                config.max_concurrent_requests,
+            ))),
         })
     }
 
     /// Acquire a permit bounding in-flight S3 operations. Every public
-    /// S3-facing method takes exactly one permit for its whole body;
-    /// internal `*_impl` helpers never acquire, so cross-calls cannot
-    /// deadlock even when the pool is saturated.
+    /// S3-facing method takes exactly one permit for its whole body (mkdir
+    /// takes one indirectly via write); internal `*_impl` helpers never
+    /// acquire, so cross-calls cannot deadlock even when the pool is
+    /// saturated. Keep this invariant: public methods acquire, `*_impl`
+    /// helpers never do.
     async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
         self.limiter
             .clone()
@@ -628,6 +636,15 @@ pub fn request_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// Effective in-flight S3 request cap: explicit config wins, `None`/`0`
+/// fall back to the default bound (0 never means "unlimited", which would
+/// reintroduce the unbounded-concurrency OOM this limiter prevents).
+fn effective_max_concurrent_requests(configured: Option<usize>) -> usize {
+    configured
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_CONCURRENT_S3_REQUESTS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +701,7 @@ mod tests {
             endpoint: None,
             force_path_style: false,
             prefix: "brewfs".into(),
+            max_concurrent_requests: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "brewfs/");
@@ -796,6 +814,19 @@ mod tests {
         let cache = fs.stats.lock().unwrap();
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key("/overflow"));
+    }
+
+    #[test]
+    fn max_concurrent_requests_default_and_override() {
+        assert_eq!(
+            effective_max_concurrent_requests(None),
+            MAX_CONCURRENT_S3_REQUESTS
+        );
+        assert_eq!(
+            effective_max_concurrent_requests(Some(0)),
+            MAX_CONCURRENT_S3_REQUESTS
+        );
+        assert_eq!(effective_max_concurrent_requests(Some(4)), 4);
     }
 }
 

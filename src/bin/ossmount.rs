@@ -71,6 +71,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             endpoint,
             force_path_style,
             prefix,
+            max_concurrent_requests: None,
         },
         mount_point,
         refresh_secs,
