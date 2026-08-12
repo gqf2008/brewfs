@@ -86,23 +86,23 @@ jobs:
           if [ -n "$APPLE_CERT_P12" ]; then
             echo "==> Importing Developer ID certificate"
             echo "$APPLE_CERT_P12" | base64 --decode > /tmp/ossfs-cert.p12
-            security create-keychain -p temp /tmp/brewfs-signing.keychain
+            security create-keychain -p temp /tmp/ossfs-signing.keychain
             # 关键：关闭临时钥匙串自动锁（默认 5 分钟），否则 build 完成后
             # codesign 会弹密码框并永久挂起（上一次 macos 卡了 5h44m）。
-            security set-keychain-settings -lut 21600 /tmp/brewfs-signing.keychain
-            security default-keychain -s /tmp/brewfs-signing.keychain
-            security list-keychains -d user -s /tmp/brewfs-signing.keychain login.keychain
-            security unlock-keychain -p temp /tmp/brewfs-signing.keychain
-            security import /tmp/ossfs-cert.p12 -k /tmp/brewfs-signing.keychain \
+            security set-keychain-settings -lut 21600 /tmp/ossfs-signing.keychain
+            security default-keychain -s /tmp/ossfs-signing.keychain
+            security list-keychains -d user -s /tmp/ossfs-signing.keychain login.keychain
+            security unlock-keychain -p temp /tmp/ossfs-signing.keychain
+            security import /tmp/ossfs-cert.p12 -k /tmp/ossfs-signing.keychain \
               -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple:,codesign: \
-              -s -k temp /tmp/brewfs-signing.keychain
+              -s -k temp /tmp/ossfs-signing.keychain
             IDENTITY="$(security find-identity -v -p codesigning \
               | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
             echo "IDENTITY=$IDENTITY"
             export IDENTITY
             # package_macos.sh 在 build 之后才签名，需在签名前再 unlock 一次
-            export CODESIGN_KEYCHAIN=/tmp/brewfs-signing.keychain
+            export CODESIGN_KEYCHAIN=/tmp/ossfs-signing.keychain
             export CODESIGN_KEYCHAIN_PASSWORD=temp
             CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 bash scripts/package_macos.sh
           else

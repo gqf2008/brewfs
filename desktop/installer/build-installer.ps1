@@ -61,7 +61,7 @@ wix extension list -g
 
 $appMsi = Join-Path $buildDir "ossfs-app.msi"
 $readme = Join-Path $installerDir "README.txt"
-$icon = Join-Path $installerDir "..\assets\brewfs.ico"
+$icon = Join-Path $installerDir "..\assets\ossfs.ico"
 
 # 显式指定 4.0.6 扩展 DLL，避免 wix build 解析到预置的 7.x 扩展目录（WIX0144）
 $balExt = Join-Path $HOME ".wix\extensions\WixToolset.Bal.wixext\$wixVersion\wixext4\WixToolset.Bal.wixext.dll"

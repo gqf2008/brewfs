@@ -15,12 +15,10 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Profile {
     pub name: String,
-    /// "brewfs" = metadata-backed BrewFS mount; "oss" = metadata-less OSS
-    /// direct mount (multi-machine cloud drive, weak consistency).
+    /// "oss" = metadata-less OSS direct mount (multi-machine cloud drive,
+    /// weak consistency). The only supported mode.
     pub mode: String,
     pub drive: String,
-    pub backend: String, // "local-fs" | "s3" (brewfs mode only)
-    pub data_dir: String,
     pub s3_bucket: String,
     pub s3_endpoint: String,
     pub s3_region: String,
@@ -30,8 +28,6 @@ pub struct Profile {
     pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
-    pub meta_backend: String, // "sqlx" | "redis" | "etcd" | "tikv"
-    pub meta_url: String,
 }
 
 /// Default mount point for a fresh config. Windows uses drive letters and the
@@ -44,7 +40,7 @@ pub fn default_drive() -> String {
 /// Default mount point for a fresh config (see `default_drive`).
 #[cfg(not(windows))]
 pub fn default_drive() -> String {
-    "/Volumes/brewfs".to_string()
+    "/Volumes/ossfs".to_string()
 }
 
 impl Default for Profile {
@@ -53,8 +49,6 @@ impl Default for Profile {
             name: "新建配置".to_string(),
             mode: "oss".to_string(),
             drive: default_drive(),
-            backend: "local-fs".to_string(),
-            data_dir: String::from("E:\\ossfs-data"),
             s3_bucket: String::new(),
             s3_endpoint: String::new(),
             s3_region: String::new(),
@@ -63,8 +57,6 @@ impl Default for Profile {
             prefix: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
-            meta_backend: "sqlx".to_string(),
-            meta_url: String::new(),
         }
     }
 }
@@ -76,16 +68,16 @@ impl Profile {
         }
         let drive = self.drive.trim();
         if drive.is_empty() {
-            return Err("请填写挂载点（例如 Z: 或 /Volumes/brewfs）".into());
+            return Err("请填写挂载点（例如 Z: 或 /Volumes/ossfs）".into());
         }
         // Windows uses drive letters (`Z:`); macOS/Linux use a directory path
-        // (e.g. `/Volumes/brewfs`).
+        // (e.g. `/Volumes/ossfs`).
         if !drive.starts_with('/') {
             let bytes = drive.as_bytes();
             let ok = bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
             if !ok {
                 return Err(format!(
-                    "挂载点格式不正确：{drive}（Windows 用盘符如 Z:，macOS/Linux 用目录如 /Volumes/brewfs）"
+                    "挂载点格式不正确：{drive}（Windows 用盘符如 Z:，macOS/Linux 用目录如 /Volumes/ossfs）"
                 ));
             }
         }
@@ -112,7 +104,7 @@ pub struct ProfilesFile {
 pub fn profiles_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("brewfs-tray")
+        .join("ossfs-tray")
         .join("profiles.json")
 }
 
@@ -149,7 +141,7 @@ pub struct InstanceRecord {
 
 /// Directory where `ossmount` records its instances.
 pub fn oss_records_dir() -> PathBuf {
-    std::env::temp_dir().join("brewfs-oss")
+    std::env::temp_dir().join("ossfs-oss")
 }
 
 fn read_records_raw(dir: &Path) -> Vec<InstanceRecord> {
@@ -179,8 +171,8 @@ pub struct MountStatus {
     pub detail: String,
     pub pid: u32,
     pub alive: bool,
-    /// True when this is a metadata-less `ossmount` instance (not a BrewFS
-    /// control-plane mount); unmount = terminate the process.
+    /// True when this is a metadata-less `ossmount` instance; unmount = terminate
+    /// the process.
     pub is_oss: bool,
 }
 
@@ -294,7 +286,7 @@ pub fn find_ossmount() -> Option<PathBuf> {
 pub fn spawn_oss_mount(ossmount: &Path, profile: &Profile) -> std::io::Result<(u32, PathBuf)> {
     let app_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("brewfs-tray");
+        .join("ossfs-tray");
     let log_dir = app_dir.join("logs");
     fs::create_dir_all(&log_dir)?;
 
@@ -435,7 +427,7 @@ mod tests {
 
     #[test]
     fn read_records_skips_non_json_and_bad_files() {
-        let dir = std::env::temp_dir().join(format!("brewfs-tray-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ossfs-tray-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -492,7 +484,6 @@ mod tests {
             mode: "oss".into(),
             prefix: "myns/".into(),
             drive: "F:".into(),
-            backend: "s3".into(),
             s3_bucket: "b".into(),
             s3_endpoint: "https://s3.example.com".into(),
             access_key: "ak".into(),

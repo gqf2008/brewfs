@@ -1,4 +1,4 @@
-// BrewFS desktop tray UI (Slint 1.17).
+// OSSFS desktop tray UI (Slint 1.17).
 
 import {
     Button,
@@ -94,8 +94,8 @@ component IconButton inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    title: "BrewFS";
-    icon: @image-url("../assets/brewfs.png");
+    title: "OSSFS";
+    icon: @image-url("../assets/ossfs.png");
     preferred-width: 320px;
     preferred-height: 540px;
     min-width: 320px;
@@ -164,7 +164,7 @@ export component MainWindow inherits Window {
                         horizontal-stretch: 1.0;
                         spacing: 1px;
                         Text {
-                            text: "BrewFS";
+                            text: "OSSFS";
                             font-size: 15px;
                             font-weight: 700;
                             color: #151a21;
@@ -425,7 +425,7 @@ export component MainWindow inherits Window {
 
 export component EditDialog inherits Window {
     title: "编辑配置";
-    icon: @image-url("../assets/brewfs.png");
+    icon: @image-url("../assets/ossfs.png");
     // Fill the window immediately so it never shows as a transparent hole
     // while the first frame is being prepared.
     background: #f4f6f9;
@@ -444,13 +444,10 @@ export component EditDialog inherits Window {
 
     // 表单
     in-out property <string> cfg-name;
-    in-out property <int> cfg-mode-index;
     in-out property <int> cfg-drive-index;
     in-out property <string> cfg-drive;
     in-out property <bool> show-free-drives;
     in property <[string]> drive-options;
-    in-out property <int> cfg-backend-index;
-    in-out property <string> cfg-data-dir;
     in-out property <string> cfg-s3-bucket;
     in-out property <string> cfg-s3-endpoint;
     in-out property <string> cfg-s3-region;
@@ -458,12 +455,6 @@ export component EditDialog inherits Window {
     in-out property <string> cfg-s3-secret-key;
     in-out property <bool> cfg-s3-force-path-style;
     in-out property <string> cfg-prefix;
-    in-out property <int> cfg-meta-index;
-    in-out property <string> cfg-meta-url;
-
-    property <string> cfg-mode: cfg-mode-index == 0 ? "oss" : "brewfs";
-    property <string> cfg-backend: cfg-backend-index == 1 ? "s3" : "local-fs";
-    property <string> cfg-meta-backend: cfg-meta-index == 1 ? "redis" : (cfg-meta-index == 2 ? "etcd" : (cfg-meta-index == 3 ? "tikv" : "sqlx"));
 
     callback save-form();
     callback cancel-edit();
@@ -525,90 +516,13 @@ export component EditDialog inherits Window {
                         }
                         if !root.show-free-drives: LineEdit {
                             text <=> root.cfg-drive;
-                            placeholder-text: "macOS/Linux 挂载目录，例如 /Volumes/brewfs";
+                            placeholder-text: "macOS/Linux 挂载目录，例如 /Volumes/ossfs";
                             input-type: text;
                             horizontal-stretch: 1.0;
                         }
                     }
 
                     Row {
-                        Text {
-                            text: "挂载模式";
-                            width: 88px;
-                            vertical-alignment: center;
-                        }
-
-                        ComboBox {
-                            model: ["OSS 直挂（多机，推荐）", "BrewFS（元数据）"];
-                            current-index: root.cfg-mode-index;
-                            horizontal-stretch: 1.0;
-                            selected(v) => {
-                                root.cfg-mode-index = v == "BrewFS（元数据）" ? 1 : 0;
-                            }
-                        }
-                    }
-
-                    if root.cfg-mode == "brewfs": Rectangle {
-                        background: #fff4e0;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #e0a030;
-                        HorizontalBox {
-                            padding: 8px;
-                            Text {
-                                text: "⚠️ 元数据模式需要自建/共享元数据库（Redis/TiKV/etcd）；多机必须连同一个元数据库否则数据不一致；数据库故障则盘不可用。普通网盘推荐 OSS 直挂。";
-                                color: #7a4d00;
-                                wrap: word-wrap;
-                                font-size: 12px;
-                            }
-                        }
-                    }
-                    if root.cfg-mode == "brewfs": Row {
-                        Text {
-                            text: "数据后端";
-                            width: 88px;
-                            vertical-alignment: center;
-                        }
-
-                        ComboBox {
-                            model: ["local-fs", "s3"];
-                            current-index: root.cfg-backend-index;
-                            horizontal-stretch: 1.0;
-                            selected(v) => {
-                                root.cfg-backend-index = v == "s3" ? 1 : 0;
-                            }
-                        }
-                    }
-                    if root.cfg-mode == "brewfs": Row {
-                        Text {
-                            text: "元数据后端";
-                            width: 88px;
-                            vertical-alignment: center;
-                        }
-
-                        ComboBox {
-                            model: ["sqlx", "redis", "etcd", "tikv"];
-                            current-index: root.cfg-meta-index;
-                            horizontal-stretch: 1.0;
-                            selected(v) => {
-                                root.cfg-meta-index = v == "redis" ? 1 : (v == "etcd" ? 2 : (v == "tikv" ? 3 : 0));
-                            }
-                        }
-                    }
-                    if root.cfg-mode == "brewfs" && root.cfg-backend == "local-fs": Row {
-                        Text {
-                            text: "数据目录";
-                            width: 88px;
-                            vertical-alignment: center;
-                        }
-
-                        LineEdit {
-                            text <=> root.cfg-data-dir;
-                            placeholder-text: "本地对象存储目录，例如 E:\\brewfs-data";
-                            horizontal-stretch: 1.0;
-                        }
-                    }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
                         Text {
                             text: "Bucket";
                             width: 88px;
@@ -621,7 +535,7 @@ export component EditDialog inherits Window {
                             horizontal-stretch: 1.0;
                         }
                     }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
+                    Row {
                         Text {
                             text: "Region";
                             width: 88px;
@@ -634,7 +548,7 @@ export component EditDialog inherits Window {
                             horizontal-stretch: 1.0;
                         }
                     }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
+                    Row {
                         Text {
                             text: "Endpoint";
                             width: 88px;
@@ -647,7 +561,7 @@ export component EditDialog inherits Window {
                             horizontal-stretch: 1.0;
                         }
                     }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
+                    Row {
                         Text {
                             text: "AccessKey";
                             width: 88px;
@@ -660,7 +574,7 @@ export component EditDialog inherits Window {
                             horizontal-stretch: 1.0;
                         }
                     }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
+                    Row {
                         Text {
                             text: "SecretKey";
                             width: 88px;
@@ -674,7 +588,7 @@ export component EditDialog inherits Window {
                             horizontal-stretch: 1.0;
                         }
                     }
-                    if root.cfg-mode == "oss" || (root.cfg-mode == "brewfs" && root.cfg-backend == "s3"): Row {
+                    Row {
                         Rectangle {
                             width: 88px;
                         }
@@ -684,7 +598,7 @@ export component EditDialog inherits Window {
                             checked <=> root.cfg-s3-force-path-style;
                         }
                     }
-                    if root.cfg-mode == "oss": Row {
+                    Row {
                         Text {
                             text: "Prefix";
                             width: 88px;
@@ -694,19 +608,6 @@ export component EditDialog inherits Window {
                         LineEdit {
                             text <=> root.cfg-prefix;
                             placeholder-text: "对象 key 命名空间（可选），例如 myns/；多机共享时保持一致";
-                            horizontal-stretch: 1.0;
-                        }
-                    }
-                    if root.cfg-mode == "brewfs": Row {
-                        Text {
-                            text: "元数据 URL";
-                            width: 88px;
-                            vertical-alignment: center;
-                        }
-
-                        LineEdit {
-                            text <=> root.cfg-meta-url;
-                            placeholder-text: "sqlite://./data/brewfs-meta.db?mode=rwc 或 redis://... 或 etcd/tikv 地址（逗号分隔）";
                             horizontal-stretch: 1.0;
                         }
                     }
@@ -739,7 +640,7 @@ export component EditDialog inherits Window {
 }
 
 export component Tray inherits SystemTrayIcon {
-    icon: @image-url("../assets/brewfs.png");
+    icon: @image-url("../assets/ossfs.png");
     tooltip: root.tray-tooltip;
     in property <string> tray-tooltip;
     in property <[MountInfo]> mounts;
@@ -784,7 +685,7 @@ export component Tray inherits SystemTrayIcon {
         MenuSeparator { }
 
         MenuItem {
-            title: "退出 BrewFS";
+            title: "退出 OSSFS";
             activated => { root.quit-app(); }
         }
     }

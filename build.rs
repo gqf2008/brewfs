@@ -2,7 +2,7 @@ use std::env;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn brewfs_git_env() {
+fn ossfs_git_env() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
 
     emit_git_rerun_hints(&manifest_dir);
@@ -26,11 +26,11 @@ fn brewfs_git_env() {
         .unwrap_or("unknown");
     let build_timestamp = build_timestamp(&manifest_dir);
 
-    println!("cargo:rustc-env=BREWFS_GIT_COMMIT={commit}");
-    println!("cargo:rustc-env=BREWFS_GIT_COMMIT_SHORT={short_commit}");
-    println!("cargo:rustc-env=BREWFS_GIT_BRANCH={branch}");
-    println!("cargo:rustc-env=BREWFS_GIT_DIRTY={dirty}");
-    println!("cargo:rustc-env=BREWFS_BUILD_TIMESTAMP={build_timestamp}");
+    println!("cargo:rustc-env=OSSFS_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=OSSFS_GIT_COMMIT_SHORT={short_commit}");
+    println!("cargo:rustc-env=OSSFS_GIT_BRANCH={branch}");
+    println!("cargo:rustc-env=OSSFS_GIT_DIRTY={dirty}");
+    println!("cargo:rustc-env=OSSFS_BUILD_TIMESTAMP={build_timestamp}");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
 
@@ -125,7 +125,7 @@ fn widen_thread_stack() {
 }
 
 fn main() {
-    brewfs_git_env();
+    ossfs_git_env();
     #[cfg(windows)]
     winfsp_delayload();
     #[cfg(windows)]

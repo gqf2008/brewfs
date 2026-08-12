@@ -6,7 +6,7 @@ fn main() {
     // the app bundle (and the runtime window icon set by Slint).
     #[cfg(windows)]
     {
-        println!("cargo:rerun-if-changed=assets/brewfs.ico");
+        println!("cargo:rerun-if-changed=assets/ossfs.ico");
         embed_resource::compile("app.rc", embed_resource::NONE);
     }
 }

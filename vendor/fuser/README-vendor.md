@@ -5,7 +5,7 @@ This directory is a vendored copy of [`fuser` 0.17.0](https://github.com/cberner
 [FUSE-T](https://www.fuse-t.org/) — the kext-less FUSE implementation that backs
 FUSE with a local NFS server.
 
-BrewFS wires it in via `[patch.crates-io]` in the workspace `Cargo.toml`:
+OSSFS wires it in via `[patch.crates-io]` in the workspace `Cargo.toml`:
 
 ```toml
 [patch.crates-io]

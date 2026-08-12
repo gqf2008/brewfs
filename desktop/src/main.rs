@@ -1,14 +1,14 @@
-//! BrewFS desktop tray manager (Slint 1.17), Windows + macOS.
+//! OSSFS desktop tray manager (Slint 1.17), Windows + macOS.
 //!
-//! A system-tray app that keeps a list of saved BrewFS mount
+//! A system-tray app that keeps a list of saved OSSFS mount
 //! profiles (config records), shows their live mount state, and lets the user
 //! open / mount|unmount / delete each record from one list, edit the selected
 //! profile in the form, and add new configs.
 //!
-//! Requires a brewfs build with the `fuse-winfsp` feature on Windows
+//! Requires a ossfs build with the `fuse-winfsp` feature on Windows
 //! (`ossmount` for the metadata-less OSS direct-mount mode; macOS uses
 //! the FUSE-based `ossmount` with FUSE-T/macFUSE). Binaries are located next
-//! to this executable, via `BREWFS_EXE` / `OSSMOUNT_EXE`, or on PATH.
+//! to this executable, via `OSSMOUNT_EXE`, or on PATH.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -25,7 +25,7 @@ use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 slint::include_modules!();
 
-/// A `brewfs mount` process we started that has not yet produced a runtime
+/// A `ossfs mount` process we started that has not yet produced a runtime
 /// registry record (control plane still initializing) or failed to do so.
 struct RecentSpawn {
     drive: String,
@@ -194,7 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Single-instance protection via a Windows named mutex (kernel object):
     // a second launch is shown a message box and exits immediately.
-    let _single_instance = match winutil::single_instance_guard("BrewFS-Tray") {
+    let _single_instance = match winutil::single_instance_guard("OSSFS-Tray") {
         Some(guard) => guard,
         None => {
             winutil::alert_single_instance();
@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Drop stale runtime records from earlier crashed/force-killed mounts so
-    // both the tray status and `brewfs info` stay accurate.
+    // both the tray status and `ossfs info` stay accurate.
     model::prune_stale_records();
 
     refresh(&ui, &tray, &state, &recent, &hold);
@@ -311,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    ui.set_status_text(SharedString::from("BrewFS 托盘已就绪"));
+    ui.set_status_text(SharedString::from("OSSFS 托盘已就绪"));
     refresh(&ui, &tray, &state, &recent, &hold);
 
     slint::run_event_loop()?;
@@ -703,7 +703,7 @@ fn mount_profile(
         return false;
     }
     #[cfg(target_os = "macos")]
-    if p.mode == "oss" && !macos_fuse_backend_ready() {
+    if !macos_fuse_backend_ready() {
         let ui_weak = ui.as_weak();
         let hold = Rc::clone(hold);
         ask_confirm(
@@ -836,12 +836,8 @@ fn refresh(
         .map(|p| {
             let drive = model::normalize_mount_point(&p.drive);
             let m = mounts.iter().find(|m| m.drive == drive);
-            let detail = if p.mode == "oss" || p.backend == "s3" {
-                // 行内只展示“盘名”（对象存储即 bucket），其余参数在编辑表单里看。
-                p.s3_bucket.clone()
-            } else {
-                p.data_dir.clone()
-            };
+            // 行内只展示“盘名”（对象存储即 bucket），其余参数在编辑表单里看。
+            let detail = p.s3_bucket.clone();
             ProfileRecord {
                 name: p.name.clone().into(),
                 drive: drive.clone().into(),
@@ -882,10 +878,10 @@ fn refresh(
         if Instant::now() < until {
             ui.set_status_text(hold.msg.borrow().clone().into());
             let tooltip = if live.is_empty() {
-                "BrewFS（无挂载）".to_string()
+                "OSSFS（无挂载）".to_string()
             } else {
                 let drives: Vec<&str> = live.iter().map(|m| m.drive.as_str()).collect();
-                format!("BrewFS：已挂载 {}", drives.join(", "))
+                format!("OSSFS：已挂载 {}", drives.join(", "))
             };
             tray.set_tray_tooltip(tooltip.into());
             return;
@@ -894,10 +890,10 @@ fn refresh(
     ui.set_status_text(status.into());
 
     let tooltip = if live.is_empty() {
-        "BrewFS（无挂载）".to_string()
+        "OSSFS（无挂载）".to_string()
     } else {
         let drives: Vec<&str> = live.iter().map(|m| m.drive.as_str()).collect();
-        format!("BrewFS：已挂载 {}", drives.join(", "))
+        format!("OSSFS：已挂载 {}", drives.join(", "))
     };
     tray.set_tray_tooltip(tooltip.into());
 }
@@ -940,8 +936,6 @@ fn drive_from_form(edit: &EditDialog) -> String {
 
 fn profile_to_form(edit: &EditDialog, p: &model::Profile) {
     edit.set_cfg_name(p.name.clone().into());
-    // OSS direct mount is the only mode.
-    edit.set_cfg_mode_index(0);
     edit.set_cfg_drive(p.drive.clone().into());
     #[cfg(windows)]
     {
@@ -952,8 +946,6 @@ fn profile_to_form(edit: &EditDialog, p: &model::Profile) {
             .unwrap_or(0);
         edit.set_cfg_drive_index(idx as i32);
     }
-    edit.set_cfg_backend_index(if p.backend == "s3" { 1 } else { 0 });
-    edit.set_cfg_data_dir(p.data_dir.clone().into());
     edit.set_cfg_s3_bucket(p.s3_bucket.clone().into());
     edit.set_cfg_s3_endpoint(p.s3_endpoint.clone().into());
     edit.set_cfg_s3_region(p.s3_region.clone().into());
@@ -961,34 +953,13 @@ fn profile_to_form(edit: &EditDialog, p: &model::Profile) {
     edit.set_cfg_s3_secret_key(p.secret_key.clone().into());
     edit.set_cfg_s3_force_path_style(p.s3_force_path_style);
     edit.set_cfg_prefix(p.prefix.clone().into());
-    edit.set_cfg_meta_index(match p.meta_backend.as_str() {
-        "redis" => 1,
-        "etcd" => 2,
-        "tikv" => 3,
-        _ => 0,
-    });
-    edit.set_cfg_meta_url(p.meta_url.clone().into());
 }
 
 fn form_to_profile(edit: &EditDialog) -> model::Profile {
-    // OSS direct mount is the only mode.
-    let backend = if edit.get_cfg_backend_index() == 1 {
-        "s3"
-    } else {
-        "local-fs"
-    };
-    let meta_backend = match edit.get_cfg_meta_index() {
-        1 => "redis",
-        2 => "etcd",
-        3 => "tikv",
-        _ => "sqlx",
-    };
     model::Profile {
         name: edit.get_cfg_name().to_string(),
         mode: "oss".to_string(),
         drive: drive_from_form(edit),
-        backend: backend.to_string(),
-        data_dir: edit.get_cfg_data_dir().to_string(),
         s3_bucket: edit.get_cfg_s3_bucket().to_string(),
         s3_endpoint: edit.get_cfg_s3_endpoint().to_string(),
         s3_region: edit.get_cfg_s3_region().to_string(),
@@ -997,8 +968,6 @@ fn form_to_profile(edit: &EditDialog) -> model::Profile {
         prefix: edit.get_cfg_prefix().to_string(),
         access_key: edit.get_cfg_s3_access_key().to_string(),
         secret_key: edit.get_cfg_s3_secret_key().to_string(),
-        meta_backend: meta_backend.to_string(),
-        meta_url: edit.get_cfg_meta_url().to_string(),
     }
 }
 
@@ -1242,7 +1211,7 @@ fn raise_window_to_front() {
 
     // The tray's "show window" action targets the main window only. The edit
     // dialog is a separate hidden window and must never be raised by it, so we
-    // match the main window by its title ("BrewFS") instead of picking the
+    // match the main window by its title ("OSSFS") instead of picking the
     // largest top-level window (the edit dialog is larger than the main one).
     thread_local! {
         static MAIN_HWND: Cell<HWND> = const { Cell::new(null_mut()) };
@@ -1257,7 +1226,7 @@ fn raise_window_to_front() {
                 let len = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
                 if len > 0 {
                     let t = String::from_utf16_lossy(&title[..len as usize]);
-                    if t == "BrewFS" {
+                    if t == "OSSFS" {
                         MAIN_HWND.with(|c| c.set(hwnd));
                     }
                 }
@@ -1516,7 +1485,7 @@ mod mac_dock_reopen {
         let mtm = MainThreadMarker::new().expect("Dock reopen hook must run on the main thread");
         let app = NSApplication::sharedApplication(mtm);
         let Some(delegate) = app.delegate() else {
-            eprintln!("BrewFS: no NSApplication delegate yet; Dock reopen hook not installed");
+            eprintln!("OSSFS: no NSApplication delegate yet; Dock reopen hook not installed");
             return;
         };
         let class_ptr = unsafe {
@@ -1549,7 +1518,7 @@ mod mac_dock_reopen {
             )
         };
         if !added.as_bool() {
-            eprintln!("BrewFS: class_addMethod failed; Dock reopen may not show the window");
+            eprintln!("OSSFS: class_addMethod failed; Dock reopen may not show the window");
         }
     }
 }

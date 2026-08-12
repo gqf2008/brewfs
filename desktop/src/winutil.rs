@@ -1,4 +1,4 @@
-//! Platform helpers for the BrewFS tray app.
+//! Platform helpers for the OSSFS tray app.
 //!
 //! Windows uses the Win32 API directly (via `windows-sys`) for drive-letter
 //! enumeration and process liveness checks. Unix builds provide minimal
@@ -40,7 +40,7 @@ pub fn free_drives() -> Vec<String> {
 }
 
 /// True when the process at `pid` is actually one of our mount binaries
-/// (ossmount / brewfs). Guards against stale runtime records whose pid was
+/// (ossmount). Guards against stale runtime records whose pid was
 /// reused by an unrelated process, which would otherwise show phantom
 /// mounted drives in the tray.
 #[cfg(windows)]
@@ -68,7 +68,7 @@ pub fn pid_is_mount_process(pid: u32) -> bool {
         }
         let name = String::from_utf16_lossy(&buf[..len as usize]).replace('\\', "/");
         let base = name.rsplit('/').next().unwrap_or("");
-        base.starts_with("ossmount") || base.starts_with("brewfs")
+        base.starts_with("ossmount")
     }
 }
 
@@ -84,11 +84,11 @@ pub fn pid_is_mount_process(pid: u32) -> bool {
     match out {
         Ok(o) if o.status.success() => {
             // macOS `ps -o comm=` prints the full executable path (e.g.
-            // /Applications/BrewFS.app/Contents/MacOS/ossmount), while Linux
+            // /Applications/OSSFS.app/Contents/MacOS/ossmount), while Linux
             // prints the basename; match on the basename on both.
             let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let base = name.rsplit('/').next().unwrap_or("");
-            base.starts_with("ossmount") || base.starts_with("brewfs")
+            base.starts_with("ossmount")
         }
         _ => false,
     }
@@ -189,7 +189,7 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Reap an exited child process (the tray spawns ossmount/brewfs and never
+/// Reap an exited child process (the tray spawns ossmount and never
 /// keeps the `Child` handle, so exited children would linger as zombies).
 /// `waitpid(WNOHANG)` on a non-child is a harmless no-op (ECHILD).
 #[cfg(not(windows))]
@@ -228,7 +228,7 @@ pub fn set_dock_visible(visible: bool) {
 #[cfg(not(target_os = "macos"))]
 pub fn set_dock_visible(_visible: bool) {}
 
-/// Terminate a process tree. On Windows uses `taskkill /T /F`; the brewfs
+/// Terminate a process tree. On Windows uses `taskkill /T /F`; the ossmount
 /// WinFsp volume is torn down by the kernel when the owning process exits.
 /// On other platforms falls back to `kill`.
 pub fn terminate_process(pid: u32) -> std::io::Result<()> {
@@ -327,11 +327,11 @@ pub fn alert_single_instance() {
             flags: u32,
         ) -> i32;
     }
-    let text: Vec<u16> = "BrewFS 已经在运行，请勿重复启动。"
+    let text: Vec<u16> = "OSSFS 已经在运行，请勿重复启动。"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let caption: Vec<u16> = "BrewFS".encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = "OSSFS".encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: MessageBoxW is passed valid NUL-terminated wide strings.
     unsafe {
         MessageBoxW(
@@ -405,7 +405,7 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
         0,
     ]; // "Software\Microsoft\Windows\CurrentVersion\Run"
     let exe = std::env::current_exe()?;
-    let val: Vec<u16> = "BrewFS-Tray"
+    let val: Vec<u16> = "OSSFS-Tray"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -465,7 +465,7 @@ pub fn autostart_enabled() -> bool {
         0x72, 0x65, 0x6e, 0x74, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x5c, 0x52, 0x75, 0x6e,
         0,
     ];
-    let val: Vec<u16> = "BrewFS-Tray"
+    let val: Vec<u16> = "OSSFS-Tray"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -513,7 +513,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn single_instance_mutex_blocks_second_acquirer() {
-        let name = format!("BrewFS-Tray-Test-{}", std::process::id());
+        let name = format!("OSSFS-Tray-Test-{}", std::process::id());
         let first = super::single_instance_guard(&name);
         assert!(first.is_some(), "first acquire must succeed");
         let second = super::single_instance_guard(&name);

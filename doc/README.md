@@ -12,10 +12,12 @@ metadata database (s3fs-style layout).
 - `src/bin/ossmount.rs` — the `ossmount` CLI
 - `desktop/` — `ossfs-tray` system-tray manager
 
-## Operational notes
+## Design notes
 
-- **No local metadata database**: every directory enumeration / stat is a
-  remote S3 request. Avoid full-disk scans over the mounted drive.
+- **Metadata-less**: every directory enumeration / stat is a remote S3 request.
+  Layout is s3fs-style: `/docs/report.txt` → object key `docs/report.txt`;
+  directories are implicit via prefix, with a zero-byte marker object so empty
+  directories survive listing.
 - **Concurrency & memory bounds**: `ObjectFs` caps in-flight S3 requests
   (`MAX_CONCURRENT_S3_REQUESTS`, default 32, configurable via
   `OssConfig::max_concurrent_requests`), probes implied directories with
@@ -24,11 +26,21 @@ metadata database (s3fs-style layout).
   aborting the process (0xc0000409).
 - **WinFsp thread stacks**: the PE image reserves a 16 MiB thread stack so the
   deep AWS-SDK async stack cannot overflow WinFsp callback threads.
-- Runtime records: `ossmount` writes per-instance JSON under `%TEMP%\brewfs-oss`.
+- **Writes**: whole-file buffered; pushed to the object store on close/flush.
 
-## Known limitations
+## Operational notes
 
-- Weak consistency (no locks / no atomic rename); suitable for single-writer or
-  multi-machine "cloud drive" usage.
+- Avoid full-disk scans over the mounted drive — every operation is a remote
+  round trip.
+- Runtime records: `ossmount` writes per-instance JSON under
+  `%TEMP%\ossfs-oss` (used by the tray to list/stop mounts).
+
+## Known POSIX / FUSE limitations
+
 - `generic/075` (xfstests) and LTP `iogen01` remain excluded from default test
-  profiles due to buffered-FUSE page-cache races.
+  profiles: buffered FUSE mmap after truncate/extend can expose stale
+  page-cache data, and the tiny-overlap direct-I/O profile has a
+  split-write/page-cache coherency race. Full direct I/O is not a substitute
+  (mmap returns `ENODEV`).
+- FIFO, socket, char/block device inodes and `rdev` are persisted as object
+  markers; the adapters map them back on readdir/stat.
