@@ -452,6 +452,9 @@ impl DiskCache {
             order: Mutex::new(VecDeque::new()),
         };
         cache.load_order();
+        if cache.order.lock().unwrap().is_empty() {
+            cache.rebuild_order_from_mtime();
+        }
         cache.rescan_used();
         Ok(cache)
     }
@@ -655,6 +658,50 @@ impl DiskCache {
         }
         self.used.store(used, Ordering::Relaxed);
     }
+    fn rebuild_order_from_mtime(&self) {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("blk") {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let stem = name.strip_suffix(".blk").unwrap_or(name);
+                let Some(block) = stem
+                    .rsplit_once('-')
+                    .and_then(|(_, h)| u64::from_str_radix(h, 16).ok())
+                else {
+                    continue;
+                };
+                let Ok(raw) = std::fs::read(&path) else {
+                    continue;
+                };
+                if raw.len() < 4 {
+                    continue;
+                }
+                let klen = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+                if raw.len() < 4 + klen {
+                    continue;
+                }
+                let key = String::from_utf8_lossy(&raw[4..4 + klen]).to_string();
+                let mtime = e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                files.push((mtime, key, block));
+            }
+        }
+        files.sort_by_key(|(mtime, _, _)| *mtime);
+        let mut order = self.order.lock().unwrap();
+        for (_, key, block) in files {
+            order.push_back((key, block));
+        }
+    }
+
     fn rescan_used(&self) {
         let mut used = 0u64;
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
