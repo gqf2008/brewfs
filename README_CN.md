@@ -100,6 +100,10 @@ ossmount mount --bucket my-bucket \
 | `--total-mem-limit N` | 总读写缓冲预算，自动派生上传/脏/读缓存上限 |
 | `--total-mem-read-ratio R` | `--total-mem-limit` 中读缓存占比 `(0,1)`（默认 `0.5`） |
 | `--read-cache-max-bytes N` | 内存预读缓存上限（默认 `67108864`） |
+| `--stat-cache-ttl N` | 正向 stat 缓存 TTL（秒，默认 `3`） |
+| `--stat-cache-max-entries N` | 正向 stat 缓存最大条目（默认 `4096`） |
+| `--negative-cache-ttl N` | 负缓存 TTL（秒，默认 `5`） |
+| `--negative-cache-max-entries N` | 负缓存最大条目（默认 `4096`） |
 | `--metrics-listen ADDR` | 在 `ADDR` 提供 Prometheus `/metrics` |
 | `--metrics-log-interval N` | 每 N 秒输出一次指标快照日志（`0` = 关闭） |
 | `--log-dir PATH` | 写入按天滚动的 `ossmount.log` |

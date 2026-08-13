@@ -115,6 +115,10 @@ region / access key → *Save* → *Mount*.
 | `--total-mem-limit N` | Total read/write buffer budget; derives upload/dirty/read-cache limits |
 | `--total-mem-read-ratio R` | Fraction of `--total-mem-limit` reserved for read cache, `(0,1)` (default `0.5`) |
 | `--read-cache-max-bytes N` | In-memory read-ahead cache cap, bytes (default `67108864`) |
+| `--stat-cache-ttl N` | Positive stat cache TTL in seconds (default `3`) |
+| `--stat-cache-max-entries N` | Max positive stat cache entries (default `4096`) |
+| `--negative-cache-ttl N` | Negative stat cache TTL in seconds (default `5`) |
+| `--negative-cache-max-entries N` | Max negative stat cache entries (default `4096`) |
 | `--metrics-listen ADDR` | Serve Prometheus `/metrics` on `ADDR` |
 | `--metrics-log-interval N` | Emit a metrics snapshot to the log every N seconds (`0` = off) |
 | `--log-dir PATH` | Write daily-rotating `ossmount.log` to PATH |
