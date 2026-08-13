@@ -93,6 +93,60 @@ impl Profile {
         }
         Ok(())
     }
+
+    /// Serialize this profile into the same JSON shape `ossmount --config`
+    /// accepts. Only the shared mount options are emitted; tray-only fields
+    /// (`name` / `drive` / `mode` / payload-checksum toggle) are omitted.
+    // TODO: wire into the tray import/export UI once a native file dialog is
+    // available; the round-trip is already covered by tests.
+    #[allow(dead_code)]
+    pub fn to_ossmount_config(&self) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "bucket": self.s3_bucket,
+            "endpoint": self.s3_endpoint,
+            "region": self.s3_region,
+            "force-path-style": self.s3_force_path_style,
+            "prefix": self.prefix,
+            "access_key_id": self.access_key,
+            "secret_access_key": self.secret_key,
+        }))
+        .unwrap_or_default()
+    }
+
+    /// Build a tray profile from an `ossmount --config` JSON document.
+    /// Tray-only fields are filled with sensible defaults.
+    // TODO: wire into the tray import/export UI once a native file dialog is
+    // available; the round-trip is already covered by tests.
+    #[allow(dead_code)]
+    pub fn from_ossmount_config(json: &str) -> Result<Profile, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+        let Some(obj) = value.as_object() else {
+            return Err("config must be a JSON object".into());
+        };
+        let get_str = |k: &str| {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        Ok(Profile {
+            name: "导入配置".into(),
+            mode: "oss".into(),
+            drive: default_drive(),
+            s3_bucket: get_str("bucket"),
+            s3_endpoint: get_str("endpoint"),
+            s3_region: get_str("region"),
+            s3_force_path_style: obj
+                .get("force-path-style")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            s3_disable_payload_checksum: true,
+            prefix: get_str("prefix"),
+            access_key: get_str("access_key_id"),
+            secret_key: get_str("secret_access_key"),
+        })
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -476,6 +530,27 @@ mod tests {
         // prefix is optional in OSS mode
         p.prefix = "myns/".into();
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn profile_roundtrips_through_ossmount_config() {
+        let p = oss_profile();
+        let json = p.to_ossmount_config();
+        let back = Profile::from_ossmount_config(&json).expect("import");
+        assert_eq!(back.s3_bucket, p.s3_bucket);
+        assert_eq!(back.s3_endpoint, p.s3_endpoint);
+        assert_eq!(back.s3_region, p.s3_region);
+        assert_eq!(back.s3_force_path_style, p.s3_force_path_style);
+        assert_eq!(back.prefix, p.prefix);
+        assert_eq!(back.access_key, p.access_key);
+        assert_eq!(back.secret_key, p.secret_key);
+        assert_eq!(back.mode, "oss");
+        assert_eq!(back.name, "导入配置");
+    }
+
+    #[test]
+    fn profile_import_rejects_non_object_config() {
+        assert!(Profile::from_ossmount_config("[1,2]").is_err());
     }
 
     #[test]
