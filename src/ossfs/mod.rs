@@ -1221,7 +1221,7 @@ impl ObjectFs {
         )
     }
 
-    /// Record `path` as missing (bounded, same clear-on-overflow policy as the
+    /// Record `path` as missing (bounded; evicts the oldest entry when full).
     /// positive cache).
     fn negative_insert(&self, path: &str) {
         let mut cache = self.negative.lock().unwrap();
