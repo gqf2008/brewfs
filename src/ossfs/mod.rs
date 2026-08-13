@@ -1223,8 +1223,14 @@ impl ObjectFs {
 
     fn cache_insert(&self, path: &str, entry: DirEntry) {
         let mut cache = self.stats.lock().unwrap();
-        if cache.len() >= self.stat_max_entries {
-            cache.clear();
+        if cache.len() >= self.stat_max_entries && !cache.contains_key(path) {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            }
         }
         cache.insert(path.to_string(), (Instant::now(), entry));
     }
@@ -2804,7 +2810,8 @@ mod tests {
         // keep only the new entry), exactly what stat() would do.
         fs.cache_insert("/overflow", entry.clone());
         let cache = fs.stats.lock().unwrap();
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.len(), MAX_STAT_ENTRIES);
+        assert!(!cache.contains_key("/f0"));
         assert!(cache.contains_key("/overflow"));
     }
 
