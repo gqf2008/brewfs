@@ -659,6 +659,9 @@ impl DiskCache {
         let mut used = 0u64;
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) != Some("blk") {
+                    continue;
+                }
                 if let Ok(meta) = e.metadata() {
                     used += meta.len();
                 }
@@ -674,6 +677,9 @@ impl DiskCache {
         let prefix = format!("{}-", fnv1a64(key));
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) != Some("blk") {
+                    continue;
+                }
                 let path = e.path();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.starts_with(&prefix) {
@@ -698,6 +704,9 @@ impl DiskCache {
         }
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) != Some("blk") {
+                    continue;
+                }
                 let _ = std::fs::remove_file(e.path());
             }
         }
