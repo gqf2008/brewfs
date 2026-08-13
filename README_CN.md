@@ -92,6 +92,10 @@ ossmount mount --bucket my-bucket \
 | `--max-dirty-bytes N` | 限制聚合的整文件写缓冲脏字节数（`0` = 不限制） |
 | `--credential-process CMD` | 外部凭据进程（标准 AWS credential_process JSON） |
 | `--no-verify-crc64` | 关闭写路径 CRC64-ECMA 完整性校验（默认开启） |
+| `--content-md5` | 上传时设置 Content-MD5（跨 S3 兼容的完整性兜底） |
+| `--storage-class SC` | 新写对象的存储类型（如 `Standard`/`IA`/`Archive` 或 `STANDARD`/`GLACIER`） |
+| `--multipart-size N` | 分片上传每片大小（默认 `8388608`，最小钳制 `5242880`） |
+| `--multipart-concurrency N` | 单次分片上传的并发片数（默认 `4`） |
 | `--disk-cache-dir PATH` | 对象区间本地磁盘缓存目录 |
 | `--disk-cache-max-bytes N` | 磁盘缓存字节上限；超出后 LRU 逐出 |
 | `--disk-cache-block-size N` | 磁盘缓存块大小（默认 `4194304`，`0` = 默认） |
@@ -99,6 +103,8 @@ ossmount mount --bucket my-bucket \
 | `--disk-cache-prefetch-concurrency N` | 磁盘缓存预取任务最大并发（默认 `4`） |
 | `--disk-cache-verify-etag` | 服务磁盘缓存块前用 HEAD 校验对象 ETag |
 | `--disk-cache-etag-ttl N` | ETag 复检 TTL（秒，默认 `10`） |
+| `--disk-cache-reserve-diskfree N` | 磁盘缓存所在盘至少保留的空闲字节数 |
+| `--disk-cache-free-space-ratio R` | 磁盘缓存所在盘至少保留的空闲比例 `(0,1)` |
 | `--total-mem-limit N` | 总读写缓冲预算，自动派生上传/脏/读缓存上限 |
 | `--total-mem-read-ratio R` | `--total-mem-limit` 中读缓存占比 `(0,1)`（默认 `0.5`） |
 | `--read-cache-max-bytes N` | 内存预读缓存上限（默认 `67108864`） |

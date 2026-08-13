@@ -107,6 +107,10 @@ region / access key → *Save* → *Mount*.
 | `--max-dirty-bytes N` | Cap aggregate dirty whole-file write buffers (`0` = unlimited) |
 | `--credential-process CMD` | External credential process (standard AWS credential_process JSON) |
 | `--no-verify-crc64` | Disable write-path CRC64-ECMA integrity verification (default on) |
+| `--content-md5` | Set Content-MD5 on uploads (cross-S3-compatible integrity fallback) |
+| `--storage-class SC` | Storage class for newly written objects (e.g. `Standard`/`IA`/`Archive` or `STANDARD`/`GLACIER`) |
+| `--multipart-size N` | Multipart part size, bytes (default `8388608`, clamped to `5242880` minimum) |
+| `--multipart-concurrency N` | Concurrent part uploads per multipart write (default `4`) |
 | `--disk-cache-dir PATH` | Local disk cache directory for object-range blocks |
 | `--disk-cache-max-bytes N` | Disk cache byte budget; evicts LRU blocks when exceeded |
 | `--disk-cache-block-size N` | Disk-cache block size, bytes (default `4194304`, `0` = default) |
@@ -114,6 +118,8 @@ region / access key → *Save* → *Mount*.
 | `--disk-cache-prefetch-concurrency N` | Max concurrent disk-cache prefetch tasks (default `4`) |
 | `--disk-cache-verify-etag` | Verify object ETag with a HEAD before serving disk-cache blocks |
 | `--disk-cache-etag-ttl N` | ETag re-check TTL in seconds (default `10`) |
+| `--disk-cache-reserve-diskfree N` | Keep at least this many bytes free on the cache filesystem |
+| `--disk-cache-free-space-ratio R` | Keep at least this fraction `(0,1)` of the cache filesystem free |
 | `--total-mem-limit N` | Total read/write buffer budget; derives upload/dirty/read-cache limits |
 | `--total-mem-read-ratio R` | Fraction of `--total-mem-limit` reserved for read cache, `(0,1)` (default `0.5`) |
 | `--read-cache-max-bytes N` | In-memory read-ahead cache cap, bytes (default `67108864`) |
