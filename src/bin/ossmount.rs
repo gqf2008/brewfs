@@ -32,6 +32,7 @@ fn usage() -> ! {
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
+                 [--max-concurrent-requests N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
@@ -85,6 +86,7 @@ fn parse_args() -> (
     let mut file_mode: u32 = 0o644;
     let mut allow_rename_dir = true;
     let mut rename_dir_limit: Option<u64> = Some(2_000_000);
+    let mut max_concurrent_requests: Option<usize> = None;
     let mut max_upload_bytes: Option<usize> = None;
     let mut read_ahead_bytes: Option<usize> = Some(8 * 1024 * 1024);
     let mut ignore_fsync = true;
@@ -164,6 +166,13 @@ fn parse_args() -> (
                     .unwrap_or_else(|| usage());
             }
             "--no-rename-dir" => allow_rename_dir = false,
+            "--max-concurrent-requests" => {
+                let v: usize = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                max_concurrent_requests = if v == 0 { None } else { Some(v) };
+            }
             "--rename-dir-limit" => {
                 let v: u64 = iter
                     .next()
@@ -361,7 +370,7 @@ fn parse_args() -> (
             endpoint,
             force_path_style,
             prefix,
-            max_concurrent_requests: None,
+            max_concurrent_requests,
             read_only,
             uid,
             gid,

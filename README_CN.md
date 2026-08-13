@@ -86,6 +86,7 @@ ossmount mount --bucket my-bucket \
 | `--file-mode M` | 文件权限位，八进制（默认 `644`） |
 | `--no-rename-dir` | 禁用目录递归重命名 |
 | `--rename-dir-limit N` | 单次目录重命名最多拷贝的对象数（默认 `2000000`，`0` = 不限制） |
+| `--max-concurrent-requests N` | 同时在途的 S3 请求上限（默认 `32`，`0` = 默认） |
 | `--max-upload-bytes N` | 限制同时在途的写上传字节数（`0` = 不限制） |
 | `--read-ahead-bytes N` | 顺序读预取窗口字节数（默认 `8388608`，`0` = 关闭） |
 | `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
