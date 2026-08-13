@@ -752,6 +752,8 @@ pub struct Metrics {
     s3_heads: AtomicU64,
     s3_stat_heads: AtomicU64,
     stat_cache_hits: AtomicU64,
+    stat_positive_cache_hits: AtomicU64,
+    stat_negative_cache_hits: AtomicU64,
     s3_etag_heads: AtomicU64,
     s3_lists: AtomicU64,
     s3_puts: AtomicU64,
@@ -782,6 +784,8 @@ pub struct MetricsSnapshot {
     pub s3_heads: u64,
     pub s3_stat_heads: u64,
     pub stat_cache_hits: u64,
+    pub stat_positive_cache_hits: u64,
+    pub stat_negative_cache_hits: u64,
     pub s3_etag_heads: u64,
     pub s3_lists: u64,
     pub s3_puts: u64,
@@ -813,6 +817,8 @@ impl Metrics {
             s3_heads: self.s3_heads.load(Ordering::Relaxed),
             s3_stat_heads: self.s3_stat_heads.load(Ordering::Relaxed),
             stat_cache_hits: self.stat_cache_hits.load(Ordering::Relaxed),
+            stat_positive_cache_hits: self.stat_positive_cache_hits.load(Ordering::Relaxed),
+            stat_negative_cache_hits: self.stat_negative_cache_hits.load(Ordering::Relaxed),
             s3_etag_heads: self.s3_etag_heads.load(Ordering::Relaxed),
             s3_lists: self.s3_lists.load(Ordering::Relaxed),
             s3_puts: self.s3_puts.load(Ordering::Relaxed),
@@ -1156,14 +1162,20 @@ impl ObjectFs {
         {
             let cache = self.stats.lock().unwrap();
             if let Some((at, entry)) = cache.get(path) {
-                self.metrics.stat_cache_hits.fetch_add(1, Ordering::Relaxed);
                 if at.elapsed() < STAT_TTL {
+                    self.metrics.stat_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .stat_positive_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(entry.clone()));
                 }
             }
         }
-        self.metrics.stat_cache_hits.fetch_add(1, Ordering::Relaxed);
         if self.negative_hit(path) {
+            self.metrics.stat_cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .stat_negative_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         let _permit = self.acquire().await?;
@@ -1176,7 +1188,6 @@ impl ObjectFs {
         Ok(result)
     }
 
-    /// Whether `path` is currently recorded as missing (and still fresh).
     fn negative_hit(&self, path: &str) -> bool {
         matches!(
             self.negative.lock().unwrap().get(path),

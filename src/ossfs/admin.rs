@@ -57,6 +57,14 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         ("ossfs_s3_heads_total", s.s3_heads),
         ("ossfs_s3_stat_heads_total", s.s3_stat_heads),
         ("ossfs_stat_cache_hits_total", s.stat_cache_hits),
+        (
+            "ossfs_stat_positive_cache_hits_total",
+            s.stat_positive_cache_hits,
+        ),
+        (
+            "ossfs_stat_negative_cache_hits_total",
+            s.stat_negative_cache_hits,
+        ),
         ("ossfs_s3_etag_heads_total", s.s3_etag_heads),
         ("ossfs_s3_lists_total", s.s3_lists),
         ("ossfs_s3_puts_total", s.s3_puts),
@@ -130,6 +138,8 @@ mod tests {
             s3_heads: 4,
             s3_stat_heads: 5,
             stat_cache_hits: 7,
+            stat_positive_cache_hits: 8,
+            stat_negative_cache_hits: 9,
             s3_etag_heads: 6,
             s3_lists: 4,
             s3_puts: 5,
