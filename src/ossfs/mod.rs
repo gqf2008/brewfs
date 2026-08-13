@@ -26,7 +26,7 @@ pub mod winfsp;
 use anyhow::{Context as _, Result};
 use aws_config::credential_process::CredentialProcessProvider;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
 use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
@@ -100,6 +100,11 @@ pub struct OssConfig {
     /// CRC64-ECMA-182 checksum is computed locally on every object / multipart
     /// write and compared to the value OSS reports back after the upload.
     pub verify_crc64: bool,
+    /// Storage class applied to newly written objects (mirrors aliyun/ossfs
+    /// `storage_class`). Common values: `Standard`, `IA`, `Archive` (OSS) or
+    /// `STANDARD` / `STANDARD_IA` / `GLACIER` (S3). `None` keeps the bucket
+    /// default.
+    pub storage_class: Option<String>,
     /// Local disk cache directory for object-range blocks. When set, read
     /// ranges that are not served from the in-memory read-ahead cache are
     /// written here and reused on later reads (even across remounts).
@@ -962,6 +967,8 @@ pub struct ObjectFs {
     ignore_fsync: bool,
     /// Verify uploaded objects via x-oss-hash-crc64ecma (see [OssConfig::verify_crc64]).
     verify_crc64: bool,
+    /// Storage class for newly written objects (see [OssConfig::storage_class]).
+    storage_class: Option<StorageClass>,
     /// Monotonic operation counters.
     metrics: Arc<Metrics>,
     /// Dirty-buffer budget for the adapters; None when unlimited.
@@ -1049,6 +1056,7 @@ impl ObjectFs {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
+            storage_class: config.storage_class.map(|s| StorageClass::from(s.as_str())),
             metrics: Arc::new(Metrics::default()),
             dirty_budget,
         })
@@ -1772,8 +1780,11 @@ impl ObjectFs {
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(ByteStream::from(data.to_vec()))
-            .customize();
+            .body(ByteStream::from(data.to_vec()));
+        if let Some(sc) = &self.storage_class {
+            put = put.storage_class(sc.clone());
+        }
+        let mut put = put.customize();
         if expected_crc.is_some() {
             put = put.interceptor(Crc64ResponseCapture {
                 slot: Arc::clone(&crc_slot),
@@ -1799,11 +1810,15 @@ impl ObjectFs {
         let expected_crc = self.verify_crc64.then(|| crc64ecma(data));
         let crc_slot = Arc::new(Mutex::new(None));
 
-        let create = self
+        let mut create = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(&key)
+            .key(&key);
+        if let Some(sc) = &self.storage_class {
+            create = create.storage_class(sc.clone());
+        }
+        let create = create
             .send()
             .await
             .inspect_err(|_| {
@@ -2320,6 +2335,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: "ossfs/".into(),
@@ -2357,6 +2373,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2405,6 +2422,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2448,6 +2466,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2496,6 +2515,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2654,6 +2674,7 @@ mod tests {
             ignore_fsync: true,
             max_dirty_bytes: None,
             verify_crc64: false,
+            storage_class: None,
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
             disk_cache_block_size: None,
@@ -2706,6 +2727,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2763,6 +2785,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2814,6 +2837,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2864,6 +2888,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2917,6 +2942,7 @@ mod s3_mock_tests {
         method: String,
         target: String,
         body: Vec<u8>,
+        storage_class: Option<String>,
     }
 
     struct MockS3 {
@@ -2998,12 +3024,17 @@ mod s3_mock_tests {
         }
         let head = String::from_utf8_lossy(&buf[..header_end.unwrap()]);
         let mut range_header: Option<String> = None;
+        let mut storage_class_header: Option<String> = None;
         for line in head.lines() {
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
+            let lower = line.to_ascii_lowercase();
+            if let Some(v) = lower.strip_prefix("range:") {
                 range_header = Some(v.trim().to_string());
             }
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            if let Some(v) = lower.strip_prefix("content-length:") {
                 content_length = v.trim().parse().unwrap_or(0);
+            }
+            if lower.strip_prefix("x-amz-storage-class:").is_some() {
+                storage_class_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
             }
         }
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
@@ -3044,6 +3075,7 @@ mod s3_mock_tests {
             method: method.clone(),
             target: target.clone(),
             body,
+            storage_class: storage_class_header.clone(),
         });
 
         tokio::time::sleep(mock.delay).await;
@@ -3232,6 +3264,7 @@ mod s3_mock_tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            storage_class: None,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
         }
@@ -3352,6 +3385,26 @@ mod s3_mock_tests {
         assert!(!q.contains("uploadid"), "must not touch multipart");
         assert!(!q.contains("partnumber"), "must not upload parts");
         assert_eq!(recorded[0].body, data, "whole object must be the PUT body");
+    }
+
+    #[tokio::test]
+    async fn write_small_object_sets_storage_class() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.storage_class = Some(StorageClass::from("Standard"));
+
+        fs.write("/small-sc.bin", &[1u8, 2, 3])
+            .await
+            .expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "PUT");
+        assert_eq!(
+            recorded[0].storage_class.as_deref(),
+            Some("Standard"),
+            "PUT must carry the requested x-amz-storage-class header"
+        );
     }
 
     #[tokio::test]

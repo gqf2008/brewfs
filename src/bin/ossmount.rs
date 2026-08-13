@@ -33,6 +33,7 @@ fn usage() -> ! {
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
+                 [--storage-class SC]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N] [--negative-cache-ttl N] [--negative-cache-max-entries N] [--stat-cache-ttl N] [--stat-cache-max-entries N]\n\
                  [--metrics-listen ADDR]\n\
@@ -105,6 +106,7 @@ fn parse_args() -> (
     let mut log_level: Option<String> = None;
     let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
+    let mut storage_class: Option<String> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -180,6 +182,7 @@ fn parse_args() -> (
                 max_dirty_bytes = if v == 0 { None } else { Some(v) };
             }
             "--no-verify-crc64" => verify_crc64 = false,
+            "--storage-class" => storage_class = Some(iter.next().unwrap_or_else(|| usage())),
             "--disk-cache-dir" => {
                 disk_cache_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage())))
             }
@@ -321,6 +324,7 @@ fn parse_args() -> (
             total_mem_read_ratio,
             read_cache_max_bytes,
             verify_crc64,
+            storage_class,
         },
         mount_point,
         refresh_secs,
