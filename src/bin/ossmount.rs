@@ -28,7 +28,7 @@ use ossfs::{ObjectFs, OssConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ossmount [mount] --bucket BUCKET [--endpoint URL] [--region REGION]\n\
+        "usage: ossmount [mount] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
@@ -115,6 +115,10 @@ fn parse_args() -> (
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--version" => {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--bucket" => bucket = iter.next().unwrap_or_else(|| usage()),
             "--endpoint" => endpoint = Some(iter.next().unwrap_or_else(|| usage())),
             "--region" => region = iter.next().unwrap_or_else(|| usage()),
