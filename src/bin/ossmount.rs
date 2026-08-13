@@ -68,6 +68,61 @@ fn parse_mode(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 
+/// Mount options accepted as `--config` keys. Kept in sync with the CLI long
+/// option names (minus `--config` and `--version`, which are not mount options).
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "bucket",
+    "endpoint",
+    "region",
+    "prefix",
+    "force-path-style",
+    "refresh-secs",
+    "read-only",
+    "uid",
+    "gid",
+    "dir-mode",
+    "file-mode",
+    "allow-other",
+    "umask",
+    "no-rename-dir",
+    "rename-dir-limit",
+    "max-upload-bytes",
+    "max-concurrent-requests",
+    "read-ahead-bytes",
+    "no-ignore-fsync",
+    "max-dirty-bytes",
+    "credential-process",
+    "no-verify-crc64",
+    "content-md5",
+    "storage-class",
+    "multipart-size",
+    "multipart-concurrency",
+    "connect-timeout",
+    "readwrite-timeout",
+    "retries",
+    "notsup-compat-dir",
+    "disk-cache-dir",
+    "disk-cache-max-bytes",
+    "disk-cache-block-size",
+    "disk-cache-prefetch-blocks",
+    "disk-cache-prefetch-concurrency",
+    "disk-cache-verify-etag",
+    "disk-cache-etag-ttl",
+    "disk-cache-reserve-diskfree",
+    "disk-cache-free-space-ratio",
+    "negative-cache-ttl",
+    "negative-cache-max-entries",
+    "stat-cache-ttl",
+    "stat-cache-max-entries",
+    "total-mem-limit",
+    "total-mem-read-ratio",
+    "read-cache-max-bytes",
+    "metrics-listen",
+    "log-dir",
+    "log-level",
+    "metrics-log-interval",
+];
+
 /// Expand a JSON config file into CLI arguments. Each top-level key maps
 /// to a `--key` option: `true` emits a bare switch flag, `false` skips it,
 /// and other values are emitted as `--key value`. The credential keys
@@ -95,15 +150,19 @@ fn expand_config_file(path: &str) -> Result<Vec<String>, String> {
             unsafe { std::env::set_var(var, s) };
             continue;
         }
+        let normalized = key.replace('_', "-");
+        if !KNOWN_CONFIG_KEYS.contains(&normalized.as_str()) {
+            return Err(format!("unknown config key `{key}`"));
+        }
         match val {
-            serde_json::Value::Bool(true) => args.push(format!("--{}", key.replace('_', "-"))),
+            serde_json::Value::Bool(true) => args.push(format!("--{normalized}")),
             serde_json::Value::Bool(false) => {}
             serde_json::Value::String(s) => {
-                args.push(format!("--{}", key.replace('_', "-")));
+                args.push(format!("--{normalized}"));
                 args.push(s.clone());
             }
             serde_json::Value::Number(n) => {
-                args.push(format!("--{}", key.replace('_', "-")));
+                args.push(format!("--{normalized}"));
                 args.push(n.to_string());
             }
             _ => {
@@ -633,6 +692,11 @@ mod tests {
             err.contains("must be a string, number, or boolean"),
             "got: {err}"
         );
+
+        let unknown = dir.path().join("unknown.json");
+        std::fs::write(&unknown, r#"{"bucket":"b","buckte":true}"#).unwrap();
+        let err = expand_config_file(unknown.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("unknown config key `buckte`"), "got: {err}");
     }
 
     #[test]
