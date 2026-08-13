@@ -655,6 +655,11 @@ pub struct Metrics {
     s3_lists: AtomicU64,
     s3_puts: AtomicU64,
     s3_errors: AtomicU64,
+    s3_get_errors: AtomicU64,
+    s3_list_errors: AtomicU64,
+    s3_put_errors: AtomicU64,
+    s3_delete_errors: AtomicU64,
+    s3_multipart_errors: AtomicU64,
     read_cache_hits: AtomicU64,
     disk_cache_hits: AtomicU64,
     crc64_mismatches: AtomicU64,
@@ -669,6 +674,11 @@ pub struct MetricsSnapshot {
     pub s3_lists: u64,
     pub s3_puts: u64,
     pub s3_errors: u64,
+    pub s3_get_errors: u64,
+    pub s3_list_errors: u64,
+    pub s3_put_errors: u64,
+    pub s3_delete_errors: u64,
+    pub s3_multipart_errors: u64,
     pub read_cache_hits: u64,
     pub disk_cache_hits: u64,
     pub crc64_mismatches: u64,
@@ -683,6 +693,11 @@ impl Metrics {
             s3_lists: self.s3_lists.load(Ordering::Relaxed),
             s3_puts: self.s3_puts.load(Ordering::Relaxed),
             s3_errors: self.s3_errors.load(Ordering::Relaxed),
+            s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
+            s3_list_errors: self.s3_list_errors.load(Ordering::Relaxed),
+            s3_put_errors: self.s3_put_errors.load(Ordering::Relaxed),
+            s3_delete_errors: self.s3_delete_errors.load(Ordering::Relaxed),
+            s3_multipart_errors: self.s3_multipart_errors.load(Ordering::Relaxed),
             read_cache_hits: self.read_cache_hits.load(Ordering::Relaxed),
             disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
@@ -921,6 +936,7 @@ impl ObjectFs {
                 Ok(resp) => resp,
                 Err(e) => {
                     self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.s3_list_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(e).context("s3 list");
                 }
             };
@@ -1255,6 +1271,7 @@ impl ObjectFs {
             Err(e) if is_s3_invalid_range(&e) => return Ok(Vec::new()),
             Err(e) => {
                 self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                self.metrics.s3_get_errors.fetch_add(1, Ordering::Relaxed);
                 return Err(e).context("s3 get");
             }
         };
@@ -1370,6 +1387,7 @@ impl ObjectFs {
         }
         if let Err(e) = put.send().await {
             self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            self.metrics.s3_put_errors.fetch_add(1, Ordering::Relaxed);
             return Err(e).context("s3 put");
         }
 
@@ -1396,6 +1414,11 @@ impl ObjectFs {
             .await
             .inspect_err(|_| {
                 self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                self.metrics
+                    .s3_multipart_errors
+                    .fetch_add(1, Ordering::Relaxed);
             })
             .context("s3 create multipart upload")?;
         let upload_id = create
@@ -1544,6 +1567,11 @@ impl ObjectFs {
             .await
             .inspect_err(|_| {
                 self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                self.metrics
+                    .s3_delete_errors
+                    .fetch_add(1, Ordering::Relaxed);
             })
             .context("s3 delete")?;
         Ok(())
@@ -2943,7 +2971,7 @@ mod s3_mock_tests {
         let fs = test_fs(port, 32);
         let err = fs.read_range("/missing.bin", 0, 16).await.unwrap_err();
         assert!(err.to_string().contains("s3 get"));
-        assert_eq!(fs.metrics().s3_errors, 1);
+        assert_eq!(fs.metrics().s3_get_errors, 1);
     }
 
     #[tokio::test]
