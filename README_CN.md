@@ -125,6 +125,8 @@ ossmount mount --bucket my-bucket \
 | `--log-dir PATH` | 写入按天滚动的 `ossmount.log` |
 | `--log-level LEVEL` | 默认日志过滤级别（info/debug/warn）；可被 `RUST_LOG` 覆盖 |
 
+完整模板见仓库根目录 `ossfs.example.json`（键为长选项名；布尔开关用其开关名，如 `no-verify-crc64`）。示例：
+
 ```json
 {
   "bucket": "my-bucket",

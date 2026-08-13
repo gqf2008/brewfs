@@ -140,6 +140,8 @@ region / access key → *Save* → *Mount*.
 | `--log-dir PATH` | Write daily-rotating `ossmount.log` to PATH |
 | `--log-level LEVEL` | Default tracing filter (info/debug/warn); overridable by `RUST_LOG` |
 
+See `ossfs.example.json` in the repo root for a full template (keys are long option names; boolean switches use their switch name, e.g. `no-verify-crc64`). Example:
+
 ```json
 {
   "bucket": "my-bucket",

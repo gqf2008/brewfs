@@ -72,53 +72,48 @@ fn parse_mode(s: &str) -> Option<u32> {
 /// to a `--key` option: `true` emits a bare switch flag, `false` skips it,
 /// and other values are emitted as `--key value`. The credential keys
 /// `access_key_id` / `secret_access_key` are applied to the environment.
-fn expand_config_file(path: &str) -> Vec<String> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("ossmount: cannot read config file {path}: {e}");
-            std::process::exit(2);
-        }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("ossmount: invalid config JSON in {path}: {e}");
-            std::process::exit(2);
-        }
-    };
+fn expand_config_file(path: &str) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config file {path}: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid config JSON in {path}: {e}"))?;
     let Some(obj) = value.as_object() else {
-        eprintln!("ossmount: config file {path} must contain a JSON object");
-        std::process::exit(2);
+        return Err(format!("config file {path} must contain a JSON object"));
     };
     let mut args = Vec::new();
     for (key, val) in obj {
         if key == "access_key_id" || key == "secret_access_key" {
-            if let Some(s) = val.as_str() {
-                let var = if key == "access_key_id" {
-                    "AWS_ACCESS_KEY_ID"
-                } else {
-                    "AWS_SECRET_ACCESS_KEY"
-                };
-                // SAFETY: config expansion runs during arg parsing, before any threads spawn.
-                unsafe { std::env::set_var(var, s) };
-            }
+            let Some(s) = val.as_str() else {
+                return Err(format!("config key `{key}` must be a string"));
+            };
+            let var = if key == "access_key_id" {
+                "AWS_ACCESS_KEY_ID"
+            } else {
+                "AWS_SECRET_ACCESS_KEY"
+            };
+            // SAFETY: config expansion runs during arg parsing, before any threads spawn.
+            unsafe { std::env::set_var(var, s) };
             continue;
         }
         match val {
             serde_json::Value::Bool(true) => args.push(format!("--{}", key.replace('_', "-"))),
             serde_json::Value::Bool(false) => {}
-            other => {
-                let s = match other {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
+            serde_json::Value::String(s) => {
                 args.push(format!("--{}", key.replace('_', "-")));
-                args.push(s);
+                args.push(s.clone());
+            }
+            serde_json::Value::Number(n) => {
+                args.push(format!("--{}", key.replace('_', "-")));
+                args.push(n.to_string());
+            }
+            _ => {
+                return Err(format!(
+                    "config key `{key}` must be a string, number, or boolean"
+                ));
             }
         }
     }
-    args
+    Ok(args)
 }
 
 fn parse_args() -> (
@@ -194,7 +189,13 @@ fn parse_args() -> (
     while i < raw.len() {
         if raw[i] == "--config" || raw[i] == "-c" {
             let path = raw.get(i + 1).cloned().unwrap_or_else(|| usage());
-            args.extend(expand_config_file(&path));
+            match expand_config_file(&path) {
+                Ok(expanded) => args.extend(expanded),
+                Err(e) => {
+                    eprintln!("ossmount: {e}");
+                    std::process::exit(2);
+                }
+            }
             i += 2;
         } else {
             cli_args.push(raw[i].clone());
@@ -437,7 +438,10 @@ fn parse_args() -> (
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
-            other if other.starts_with("--") => usage(),
+            other if other.starts_with("--") => {
+                eprintln!("ossmount: unknown option: {other}");
+                usage();
+            }
             other => mount_point = Some(PathBuf::from(other)),
         }
     }
@@ -596,7 +600,7 @@ mod tests {
             r#"{"bucket":"b","read_only":true,"force_path_style":false,"max-concurrent-requests":64}"#,
         )
         .unwrap();
-        let args = expand_config_file(path.to_str().unwrap());
+        let args = expand_config_file(path.to_str().unwrap()).unwrap();
         assert_eq!(
             args.len(),
             5,
@@ -611,6 +615,24 @@ mod tests {
             let i = args.iter().position(|a| a == flag).expect("flag present");
             assert_eq!(args[i + 1], val, "value must follow its flag");
         }
+    }
+
+    #[test]
+    fn config_file_rejects_non_object_and_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let arr = dir.path().join("arr.json");
+        std::fs::write(&arr, "[1,2]").unwrap();
+        let err = expand_config_file(arr.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("must contain a JSON object"), "got: {err}");
+
+        let nested = dir.path().join("nested.json");
+        std::fs::write(&nested, r#"{"bucket":{"name":"b"}}"#).unwrap();
+        let err = expand_config_file(nested.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("must be a string, number, or boolean"),
+            "got: {err}"
+        );
     }
 
     #[test]
