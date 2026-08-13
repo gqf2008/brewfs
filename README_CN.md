@@ -182,7 +182,7 @@ FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无�
 ```bash
 cargo fmt --all --check
 cargo check --workspace
-cargo test --workspace --lib --bins
+cargo test --workspace --lib --bins --tests
 cargo clippy --workspace
 ```
 

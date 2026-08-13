@@ -203,7 +203,7 @@ do not use it as a database backend or for concurrent editors on the same file.
 ```bash
 cargo fmt --all --check
 cargo check --workspace
-cargo test --workspace --lib --bins
+cargo test --workspace --lib --bins --tests
 cargo clippy --workspace
 ```
 

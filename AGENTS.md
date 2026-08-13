@@ -36,7 +36,7 @@ At minimum, run the Rust job commands from `.github/workflows/ci.yml`:
 cargo fmt --all --check
 cargo check --workspace
 cargo build --workspace
-cargo test --workspace --lib --bins
+cargo test --workspace --lib --bins --tests
 cargo clippy --workspace
 git diff --check
 ```
