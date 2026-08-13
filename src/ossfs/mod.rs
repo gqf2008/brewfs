@@ -1007,6 +1007,7 @@ pub struct Metrics {
     prefetch_started: AtomicU64,
     prefetch_skipped: AtomicU64,
     prefetch_failed: AtomicU64,
+    list_throttled: AtomicU64,
     crc64_mismatches: AtomicU64,
 }
 
@@ -1040,6 +1041,7 @@ pub struct MetricsSnapshot {
     pub prefetch_inflight: usize,
     pub prefetch_skipped: u64,
     pub prefetch_failed: u64,
+    pub list_throttled: u64,
     pub crc64_mismatches: u64,
 }
 
@@ -1073,6 +1075,7 @@ impl Metrics {
             prefetch_inflight: 0,
             prefetch_skipped: self.prefetch_skipped.load(Ordering::Relaxed),
             prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
+            list_throttled: self.list_throttled.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
         }
     }
@@ -1391,6 +1394,7 @@ impl ObjectFs {
         loop {
             let wait = rate.lock().unwrap().reserve(Instant::now());
             let Some(wait) = wait else { return };
+            self.metrics.list_throttled.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(wait).await;
         }
     }

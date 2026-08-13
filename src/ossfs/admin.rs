@@ -84,6 +84,7 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         ("ossfs_prefetch_inflight", s.prefetch_inflight as u64),
         ("ossfs_prefetch_skipped_total", s.prefetch_skipped),
         ("ossfs_prefetch_failed_total", s.prefetch_failed),
+        ("ossfs_list_throttled_total", s.list_throttled),
         ("ossfs_crc64_mismatches_total", s.crc64_mismatches),
     ] {
         out.push_str(&format!("{name} {value}\n"));
@@ -168,6 +169,7 @@ mod tests {
             prefetch_inflight: 3,
             prefetch_skipped: 11,
             prefetch_failed: 12,
+            list_throttled: 13,
             crc64_mismatches: 8,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
