@@ -1262,7 +1262,8 @@ impl ObjectFs {
 
         let _permit = self.acquire().await?;
         let data = if self.disk_cache.is_some() {
-            self.read_range_disk(&key, offset, fetch_len).await?
+            self.read_range_disk(&key, offset, fetch_len, sequential)
+                .await?
         } else {
             self.read_range_uncached(&key, offset, fetch_len).await?
         };
@@ -1280,7 +1281,13 @@ impl ObjectFs {
     /// Read `fetch_len` bytes at `offset`, sourcing each `DISK_CACHE_BLOCK_SIZE`
     /// block from the on-disk cache when present and otherwise fetching and
     /// storing it. Returns at most `fetch_len` bytes (fewer near EOF).
-    async fn read_range_disk(&self, key: &str, offset: u64, fetch_len: usize) -> Result<Vec<u8>> {
+    async fn read_range_disk(
+        &self,
+        key: &str,
+        offset: u64,
+        fetch_len: usize,
+        prefetch_next: bool,
+    ) -> Result<Vec<u8>> {
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
         let block_size = cache.block_size;
         let end = offset.saturating_add(fetch_len as u64);
@@ -1288,6 +1295,7 @@ impl ObjectFs {
         let last_block = end.saturating_sub(1) / block_size;
         let mut out = Vec::with_capacity(fetch_len);
         let mut pos = offset;
+        let mut eof = false;
 
         for block in first_block..=last_block {
             let block_start = block * block_size;
@@ -1297,12 +1305,14 @@ impl ObjectFs {
             if let Some(block_data) = cache.read_block(key, block) {
                 self.metrics.disk_cache_hits.fetch_add(1, Ordering::Relaxed);
                 if within >= block_data.len() {
+                    eof = true;
                     break;
                 }
                 let take = want.min(block_data.len() - within);
                 out.extend_from_slice(&block_data[within..within + take]);
                 pos += take as u64;
                 if block_data.len() < block_size as usize || take < want {
+                    eof = true;
                     break;
                 }
                 continue;
@@ -1315,20 +1325,56 @@ impl ObjectFs {
                 .read_range_uncached(key, block_start, block_size as usize)
                 .await?;
             if fetched.is_empty() {
+                eof = true;
                 break;
             }
             let _ = cache.write_block(key, block, &fetched);
 
             if within >= fetched.len() {
+                eof = true;
                 break;
             }
             let take = want.min(fetched.len() - within);
             out.extend_from_slice(&fetched[within..within + take]);
             pos += take as u64;
             if fetched.len() < block_size as usize || take < want {
+                eof = true;
                 break;
             }
         }
+
+        if prefetch_next && !eof {
+            let cache = Arc::clone(cache);
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let limiter = Arc::clone(&self.limiter);
+            let key = key.to_string();
+            let next_block = last_block + 1;
+            tokio::spawn(async move {
+                let Ok(_permit) = limiter.acquire_owned().await else {
+                    return;
+                };
+                let start = next_block * cache.block_size;
+                let range = format!("bytes={}-{}", start, start + cache.block_size - 1);
+                let Ok(resp) = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .range(&range)
+                    .send()
+                    .await
+                else {
+                    return;
+                };
+                if let Ok(body) = resp.body.collect().await {
+                    let bytes = body.to_vec();
+                    if !bytes.is_empty() {
+                        let _ = cache.write_block(&key, next_block, &bytes);
+                    }
+                }
+            });
+        }
+
         Ok(out)
     }
 
@@ -3059,6 +3105,35 @@ mod s3_mock_tests {
             mock.get_count.load(Ordering::SeqCst),
             2,
             "second read must hit disk cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_cache_prefetches_next_block_on_sequential_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.read_ahead_window = 8 * 1024 * 1024;
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
+                .expect("cache"),
+        ));
+
+        let data: Vec<u8> = (0..13 * 1024 * 1024usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        mock.set_object("seq.bin", data);
+        fs.read_range("/seq.bin", 0, 1024).await.expect("read");
+        fs.read_range("/seq.bin", 1024, 1024).await.expect("read");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            fs.disk_cache
+                .as_ref()
+                .unwrap()
+                .read_block("seq.bin", 2)
+                .is_some(),
+            "sequential read should prefetch the next block"
         );
     }
 
