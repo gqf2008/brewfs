@@ -30,6 +30,8 @@ use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -96,6 +98,14 @@ pub struct OssConfig {
     /// CRC64-ECMA-182 checksum is computed locally on every object / multipart
     /// write and compared to the value OSS reports back after the upload.
     pub verify_crc64: bool,
+    /// Local disk cache directory for object-range blocks. When set, read
+    /// ranges that are not served from the in-memory read-ahead cache are
+    /// written here and reused on later reads (even across remounts).
+    /// Mirrors aliyun/ossfs disk cache.
+    pub disk_cache_dir: Option<PathBuf>,
+    /// Upper bound on disk-cache bytes; evicts oldest blocks when exceeded.
+    /// `Some(0)` disables the disk cache. Rounded up to 1 MiB units.
+    pub disk_cache_max_bytes: usize,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -258,6 +268,11 @@ const READ_CACHE_MAX_ENTRIES: usize = 256;
 const MAX_READ_SEQ_ENTRIES: usize = 4096;
 /// Unit size for the dirty-buffer budget (whole MiB permits).
 const DIRTY_BUDGET_UNIT: usize = 1 << 20;
+/// Block size for the disk cache. Reads are fetched and stored in these
+/// fixed-size chunks, mirroring aliyun/ossfs cache_block_size.
+const DISK_CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+/// Unit size for the disk-cache byte budget (whole MiB permits).
+const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
@@ -334,6 +349,141 @@ struct ReadCacheEntry {
     data: Vec<u8>,
 }
 
+/// Block-oriented on-disk cache for object ranges. Blocks are keyed by
+/// FNV-1a hash of the object key plus block index; each block file starts
+/// with the raw key so a hash collision is detected and treated as a miss.
+#[derive(Debug)]
+struct DiskCache {
+    dir: PathBuf,
+    max_bytes: u64,
+    used: AtomicU64,
+}
+
+impl DiskCache {
+    fn new(dir: PathBuf, max_bytes: usize) -> Result<Self> {
+        let max_bytes =
+            max_bytes.div_ceil(DISK_CACHE_BUDGET_UNIT) as u64 * DISK_CACHE_BUDGET_UNIT as u64;
+        std::fs::create_dir_all(&dir).context("create disk cache dir")?;
+        let cache = Self {
+            dir,
+            max_bytes,
+            used: AtomicU64::new(0),
+        };
+        cache.rescan_used();
+        Ok(cache)
+    }
+
+    fn path_for(&self, key: &str, block: u64) -> PathBuf {
+        self.dir.join(format!("{}-{:08x}.blk", fnv1a64(key), block))
+    }
+
+    fn read_block(&self, key: &str, block: u64) -> Option<Vec<u8>> {
+        let path = self.path_for(key, block);
+        let raw = std::fs::read(path).ok()?;
+        if raw.len() < 4 {
+            return None;
+        }
+        let klen = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        if raw.len() < 4 + klen || &raw[4..4 + klen] != key.as_bytes() {
+            return None;
+        }
+        Some(raw[4 + klen..].to_vec())
+    }
+
+    fn write_block(&self, key: &str, block: u64, data: &[u8]) -> Result<()> {
+        let mut header = Vec::with_capacity(4 + key.len() + data.len());
+        header.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        header.extend_from_slice(key.as_bytes());
+        header.extend_from_slice(data);
+        let final_path = self.path_for(key, block);
+        let tmp = self
+            .dir
+            .join(format!(".tmp-{:x}", fnv1a64(key).wrapping_add(block)));
+        std::fs::write(&tmp, &header).context("write disk cache block")?;
+        std::fs::rename(&tmp, &final_path).context("commit disk cache block")?;
+        let bytes = header.len() as u64;
+        self.used.fetch_add(bytes, Ordering::Relaxed);
+        if self.used.load(Ordering::Relaxed) > self.max_bytes {
+            self.evict();
+        }
+        Ok(())
+    }
+
+    fn evict(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "blk").unwrap_or(false))
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                Some((e.path(), meta.modified().ok()?, meta.len()))
+            })
+            .collect();
+        files.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+        let mut used = self.used.load(Ordering::Relaxed);
+        for (path, _mtime, len) in files.iter().rev() {
+            if used <= self.max_bytes {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                used = used.saturating_sub(*len);
+            }
+        }
+        self.used.store(used, Ordering::Relaxed);
+    }
+
+    fn rescan_used(&self) {
+        let mut used = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                if let Ok(meta) = e.metadata() {
+                    used += meta.len();
+                }
+            }
+        }
+        self.used.store(used, Ordering::Relaxed);
+    }
+
+    fn invalidate(&self, key: &str) {
+        let prefix = format!("{}-", fnv1a64(key));
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with(&prefix) {
+                    if let Ok(meta) = e.metadata() {
+                        let len = meta.len();
+                        if std::fs::remove_file(&path).is_ok() {
+                            self.used.fetch_sub(len, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        self.used.store(0, Ordering::Relaxed);
+    }
+}
+
+/// FNV-1a 64-bit hash used for disk-cache block file names.
+fn fnv1a64(s: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// Bounded read-ahead cache shared by all paths in one mount.
 #[derive(Default)]
 struct ReadCache {
@@ -367,6 +517,8 @@ pub struct ObjectFs {
     read_ahead_window: usize,
     /// Bounded read-ahead cache.
     read_cache: Mutex<ReadCache>,
+    /// Optional block-oriented on-disk read cache.
+    disk_cache: Option<Arc<DiskCache>>,
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
@@ -402,6 +554,13 @@ impl ObjectFs {
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         let ignore_fsync = config.ignore_fsync;
         let dirty_budget = DirtyBudget::new(config.max_dirty_bytes.unwrap_or(0));
+        let disk_cache = match &config.disk_cache_dir {
+            Some(dir) if config.disk_cache_max_bytes > 0 => Some(Arc::new(DiskCache::new(
+                dir.clone(),
+                config.disk_cache_max_bytes,
+            )?)),
+            _ => None,
+        };
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -424,6 +583,7 @@ impl ObjectFs {
             upload_budget_units: upload_budget_units.unwrap_or(0),
             read_ahead_window,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -778,7 +938,11 @@ impl ObjectFs {
         let fetch_len = read_fetch_len(len, window, sequential);
 
         let _permit = self.acquire().await?;
-        let data = self.read_range_uncached(&key, offset, fetch_len).await?;
+        let data = if self.disk_cache.is_some() {
+            self.read_range_disk(&key, offset, fetch_len).await?
+        } else {
+            self.read_range_uncached(&key, offset, fetch_len).await?
+        };
 
         if window > 0 && fetch_len > len {
             self.insert_read_cache(path, offset, data.clone());
@@ -788,6 +952,57 @@ impl ObjectFs {
         }
 
         Ok(data[..len.min(data.len())].to_vec())
+    }
+
+    /// Read `fetch_len` bytes at `offset`, sourcing each `DISK_CACHE_BLOCK_SIZE`
+    /// block from the on-disk cache when present and otherwise fetching and
+    /// storing it. Returns at most `fetch_len` bytes (fewer near EOF).
+    async fn read_range_disk(&self, key: &str, offset: u64, fetch_len: usize) -> Result<Vec<u8>> {
+        let cache = self.disk_cache.as_ref().expect("disk cache enabled");
+        let block_size = DISK_CACHE_BLOCK_SIZE;
+        let end = offset.saturating_add(fetch_len as u64);
+        let first_block = offset / block_size;
+        let last_block = end.saturating_sub(1) / block_size;
+        let mut out = Vec::with_capacity(fetch_len);
+        let mut pos = offset;
+
+        for block in first_block..=last_block {
+            let block_start = block * block_size;
+            let within = (pos - block_start) as usize;
+            let want = (end - pos).min(block_size - within as u64) as usize;
+
+            if let Some(block_data) = cache.read_block(key, block) {
+                if within >= block_data.len() {
+                    break;
+                }
+                let take = want.min(block_data.len() - within);
+                out.extend_from_slice(&block_data[within..within + take]);
+                pos += take as u64;
+                if block_data.len() < block_size as usize || take < want {
+                    break;
+                }
+                continue;
+            }
+
+            let fetched = self
+                .read_range_uncached(key, block_start, block_size as usize)
+                .await?;
+            if fetched.is_empty() {
+                break;
+            }
+            let _ = cache.write_block(key, block, &fetched);
+
+            if within >= fetched.len() {
+                break;
+            }
+            let take = want.min(fetched.len() - within);
+            out.extend_from_slice(&fetched[within..within + take]);
+            pos += take as u64;
+            if fetched.len() < block_size as usize || take < want {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Actual S3 GET for `len` bytes at `offset`. Caller holds a limiter
@@ -866,6 +1081,9 @@ impl ObjectFs {
 
     /// Drop cached read-ahead data for one path after a local mutation.
     fn invalidate_read_cache(&self, path: &str) {
+        if let Some(cache) = &self.disk_cache {
+            cache.invalidate(&self.key_for(path));
+        }
         let mut cache = self.read_cache.lock().unwrap();
         if let Some(old) = cache.entries.remove(path) {
             cache.bytes = cache.bytes.saturating_sub(old.data.len());
@@ -875,6 +1093,9 @@ impl ObjectFs {
 
     /// Drop all cached read-ahead data (used by recursive delete/rename).
     fn clear_read_cache(&self) {
+        if let Some(cache) = &self.disk_cache {
+            cache.clear();
+        }
         let mut cache = self.read_cache.lock().unwrap();
         cache.entries.clear();
         cache.bytes = 0;
@@ -1420,6 +1641,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1444,6 +1666,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1479,6 +1702,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1509,6 +1733,7 @@ mod tests {
             upload_budget_units: 1,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1544,6 +1769,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 1024,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1595,6 +1821,8 @@ mod tests {
             ignore_fsync: true,
             max_dirty_bytes: None,
             verify_crc64: false,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
             credential_process: None,
         }
         .normalize();
@@ -1618,6 +1846,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1662,6 +1891,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1700,6 +1930,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1737,6 +1968,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -1800,10 +2032,16 @@ mod s3_mock_tests {
         recorded: Arc<Mutex<Vec<MockRequest>>>,
         delay: Duration,
         entries: Arc<Mutex<Vec<(String, bool)>>>,
+        objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        get_count: Arc<AtomicUsize>,
         crc64: Mutex<u64>,
     }
 
     impl MockS3 {
+        fn set_object(&self, key: &str, data: Vec<u8>) {
+            self.objects.lock().unwrap().insert(key.to_string(), data);
+        }
+
         fn set_crc64(&self, v: u64) {
             *self.crc64.lock().unwrap() = v;
         }
@@ -1817,6 +2055,8 @@ mod s3_mock_tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 recorded: Arc::new(Mutex::new(Vec::new())),
                 delay,
+                objects: Arc::new(Mutex::new(HashMap::new())),
+                get_count: Arc::new(AtomicUsize::new(0)),
                 entries: Arc::new(Mutex::new(entries)),
                 crc64: Mutex::new(0),
             });
@@ -1855,7 +2095,11 @@ mod s3_mock_tests {
             }
         }
         let head = String::from_utf8_lossy(&buf[..header_end.unwrap()]);
+        let mut range_header: Option<String> = None;
         for line in head.lines() {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
+                range_header = Some(v.trim().to_string());
+            }
             if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                 content_length = v.trim().parse().unwrap_or(0);
             }
@@ -1902,10 +2146,52 @@ mod s3_mock_tests {
 
         tokio::time::sleep(mock.delay).await;
 
+        let mut get_body: Option<Vec<u8>> = None;
         let response = if query.contains("list-type=2") {
             let entries = mock.entries.lock().unwrap().clone();
             let body = list_xml(&entries);
             http_response(200, "application/xml", Some(&format!("{body}")))
+        } else if method == "GET" {
+            mock.get_count.fetch_add(1, Ordering::SeqCst);
+            let path = target.split('?').next().unwrap_or(&target);
+            let key = path
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            let objects = mock.objects.lock().unwrap();
+            match objects.get(&key) {
+                Some(object) => {
+                    let len = object.len();
+                    let (start, end) = match &range_header {
+                        Some(range) => {
+                            let range = range.trim().strip_prefix("bytes=").unwrap_or(range);
+                            match range.split_once('-') {
+                                Some((start, end)) => {
+                                    let start = start.parse::<usize>().unwrap_or(0).min(len);
+                                    let end = end
+                                        .parse::<usize>()
+                                        .ok()
+                                        .map(|e| e + 1)
+                                        .unwrap_or(len)
+                                        .min(len)
+                                        .max(start);
+                                    (start, end)
+                                }
+                                None => (0, len),
+                            }
+                        }
+                        None => (0, len),
+                    };
+                    get_body = Some(object[start..end].to_vec());
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        end - start
+                    )
+                }
+                None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            }
         } else if query.contains("uploads") && !query.contains("uploadid") {
             // InitiateMultipartUpload: POST /key?uploads
             let body = initiate_multipart_xml();
@@ -1937,6 +2223,9 @@ mod s3_mock_tests {
             )
         };
         let _ = stream.write_all(response.as_bytes()).await;
+        if let Some(body) = get_body {
+            let _ = stream.write_all(&body).await;
+        }
         let _ = stream.shutdown().await;
         mock.active.fetch_sub(1, Ordering::SeqCst);
     }
@@ -2010,6 +2299,7 @@ mod s3_mock_tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2246,6 +2536,55 @@ mod s3_mock_tests {
         mock.set_crc64(crc64ecma(&data));
 
         fs.write("/large-crc.bin", &data).await.expect("write");
+    }
+
+    #[tokio::test]
+    async fn disk_cache_serves_repeat_reads_without_s3() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+        ));
+
+        let data: Vec<u8> = (0..5 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
+        mock.set_object("big.bin", data.clone());
+
+        let off = 4 * 1024 * 1024 - 8;
+        let first = fs.read_range("/big.bin", off, 16).await.expect("read");
+        assert_eq!(first, data[off as usize..off as usize + 16]);
+        assert_eq!(mock.get_count.load(Ordering::SeqCst), 2); // crosses a block boundary
+
+        let second = fs.read_range("/big.bin", off, 16).await.expect("read");
+        assert_eq!(second, data[off as usize..off as usize + 16]);
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            2,
+            "second read must hit disk cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_cache_invalidated_by_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+        ));
+
+        let data: Vec<u8> = (0..1024usize).map(|i| i as u8).collect();
+        mock.set_object("small.bin", data.clone());
+        fs.read_range("/small.bin", 0, 1024).await.expect("read");
+        assert_eq!(mock.get_count.load(Ordering::SeqCst), 1);
+
+        fs.write("/small.bin", &data).await.expect("write");
+        fs.read_range("/small.bin", 0, 1024).await.expect("read");
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            2,
+            "write must invalidate the cached block"
+        );
     }
 
     #[tokio::test]

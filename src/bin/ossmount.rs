@@ -30,6 +30,7 @@ fn usage() -> ! {
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
+                 [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -70,6 +71,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut ignore_fsync = true;
     let mut max_dirty_bytes: Option<usize> = None;
     let mut credential_process: Option<String> = None;
+    let mut disk_cache_dir: Option<PathBuf> = None;
+    let mut disk_cache_max_bytes: usize = 0;
     let mut verify_crc64 = true;
     let mut mount_point: Option<PathBuf> = None;
 
@@ -142,6 +145,15 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
                 max_dirty_bytes = if v == 0 { None } else { Some(v) };
             }
             "--no-verify-crc64" => verify_crc64 = false,
+            "--disk-cache-dir" => {
+                disk_cache_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage())))
+            }
+            "--disk-cache-max-bytes" => {
+                disk_cache_max_bytes = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
             "--credential-process" => {
                 credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
@@ -179,6 +191,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
             ignore_fsync,
             max_dirty_bytes,
             credential_process,
+            disk_cache_dir,
+            disk_cache_max_bytes,
             verify_crc64,
         },
         mount_point,
