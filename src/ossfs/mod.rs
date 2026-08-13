@@ -2766,6 +2766,7 @@ mod s3_mock_tests {
         entries: Arc<Mutex<Vec<(String, bool)>>>,
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         get_count: Arc<AtomicUsize>,
+        head_count: Arc<AtomicUsize>,
         crc64: Mutex<u64>,
         head_etag: Mutex<String>,
     }
@@ -2794,6 +2795,7 @@ mod s3_mock_tests {
                 delay,
                 objects: Arc::new(Mutex::new(HashMap::new())),
                 get_count: Arc::new(AtomicUsize::new(0)),
+                head_count: Arc::new(AtomicUsize::new(0)),
                 entries: Arc::new(Mutex::new(entries)),
                 crc64: Mutex::new(0),
                 head_etag: Mutex::new("mock-etag".to_string()),
@@ -2952,6 +2954,7 @@ mod s3_mock_tests {
                 body.len()
             )
         } else if method == "HEAD" {
+            mock.head_count.fetch_add(1, Ordering::SeqCst);
             let path = target.split('?').next().unwrap_or(&target);
             let key = path
                 .trim_start_matches('/')
@@ -3380,6 +3383,24 @@ mod s3_mock_tests {
         mock.set_head_etag("changed");
         fs.read_range("/e.bin", 0, 1024).await.expect("refetch");
         assert_eq!(mock.get_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_etag_ttl_skips_repeated_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
+                .expect("cache"),
+        ));
+        fs.disk_cache_verify_etag = true;
+
+        let data: Vec<u8> = (0..5 * 1024 * 1024usize).map(|i| (i % 256) as u8).collect();
+        mock.set_object("t.bin", data);
+        fs.read_range("/t.bin", 0, 1024).await.expect("read");
+        fs.read_range("/t.bin", 0, 1024).await.expect("hit");
+        assert_eq!(mock.head_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
