@@ -34,7 +34,7 @@ fn usage() -> ! {
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
-                 [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N]\n\
+                 [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N]\n\
                  [--metrics-listen ADDR]\n\
                  [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
@@ -92,6 +92,7 @@ fn parse_args() -> (
     let mut read_cache_max_bytes: Option<usize> = None;
     let mut disk_cache_max_bytes: usize = 0;
     let mut disk_cache_block_size: Option<usize> = None;
+    let mut disk_cache_prefetch_blocks: usize = 1;
     let mut log_dir: Option<PathBuf> = None;
     let mut metrics_log_interval: u64 = 0;
     let mut log_level: Option<String> = None;
@@ -184,6 +185,12 @@ fn parse_args() -> (
                     .unwrap_or_else(|| usage());
                 disk_cache_block_size = if v == 0 { None } else { Some(v) };
             }
+            "--disk-cache-prefetch-blocks" => {
+                disk_cache_prefetch_blocks = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
             "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
             "--log-dir" => log_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage()))),
             "--log-level" => log_level = Some(iter.next().unwrap_or_else(|| usage())),
@@ -254,6 +261,7 @@ fn parse_args() -> (
             disk_cache_dir,
             disk_cache_max_bytes,
             disk_cache_block_size,
+            disk_cache_prefetch_blocks,
             total_mem_limit,
             total_mem_read_ratio,
             read_cache_max_bytes,
