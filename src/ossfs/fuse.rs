@@ -163,10 +163,10 @@ impl OssFs {
     }
 
     /// Block on an async ObjectFs call from a FUSE worker thread.
-    fn block_on<T>(
-        &self,
-        fut: impl std::future::Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<T> {
+    fn block_on<F>(&self, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
         self.rt.block_on(fut)
     }
 
