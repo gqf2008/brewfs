@@ -70,6 +70,8 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         ("ossfs_disk_cache_misses_total", s.disk_cache_misses),
         ("ossfs_prefetch_started_total", s.prefetch_started),
         ("ossfs_prefetch_inflight", s.prefetch_inflight as u64),
+        ("ossfs_prefetch_skipped_total", s.prefetch_skipped),
+        ("ossfs_prefetch_failed_total", s.prefetch_failed),
         ("ossfs_crc64_mismatches_total", s.crc64_mismatches),
     ] {
         out.push_str(&format!("{name} {value}\n"));
@@ -130,6 +132,8 @@ mod tests {
             disk_cache_misses: 13,
             prefetch_started: 10,
             prefetch_inflight: 3,
+            prefetch_skipped: 11,
+            prefetch_failed: 12,
             crc64_mismatches: 8,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));

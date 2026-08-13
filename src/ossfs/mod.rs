@@ -761,6 +761,8 @@ pub struct MetricsSnapshot {
     pub disk_cache_misses: u64,
     pub prefetch_started: u64,
     pub prefetch_inflight: usize,
+    pub prefetch_skipped: u64,
+    pub prefetch_failed: u64,
     pub crc64_mismatches: u64,
 }
 
@@ -786,6 +788,8 @@ impl Metrics {
             disk_cache_misses: self.disk_cache_misses.load(Ordering::Relaxed),
             prefetch_started: self.prefetch_started.load(Ordering::Relaxed),
             prefetch_inflight: 0,
+            prefetch_skipped: 0,
+            prefetch_failed: 0,
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
         }
     }
@@ -827,6 +831,9 @@ pub struct ObjectFs {
     prefetch_inflight: Arc<Mutex<HashSet<(String, u64)>>>,
     /// Caps concurrent background prefetch tasks.
     prefetch_sem: Arc<Semaphore>,
+    /// Prefetch dedup skips and failures (owned by background tasks).
+    prefetch_skipped: Arc<AtomicU64>,
+    prefetch_failed: Arc<AtomicU64>,
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
@@ -910,6 +917,8 @@ impl ObjectFs {
             prefetch_sem: Arc::new(Semaphore::new(
                 config.disk_cache_prefetch_concurrency.max(1),
             )),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -933,6 +942,8 @@ impl ObjectFs {
     pub fn metrics(&self) -> MetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
         snapshot.prefetch_inflight = self.prefetch_inflight.lock().unwrap().len();
+        snapshot.prefetch_skipped = self.prefetch_skipped.load(Ordering::Relaxed);
+        snapshot.prefetch_failed = self.prefetch_failed.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -1380,6 +1391,8 @@ impl ObjectFs {
             let key = key.to_string();
             let inflight = Arc::clone(&self.prefetch_inflight);
             let prefetch_sem = Arc::clone(&self.prefetch_sem);
+            let prefetch_skipped = Arc::clone(&self.prefetch_skipped);
+            let prefetch_failed = Arc::clone(&self.prefetch_failed);
             let first_next = last_block + 1;
             let count = self.disk_cache_prefetch_blocks;
             tokio::spawn(async move {
@@ -1390,6 +1403,7 @@ impl ObjectFs {
                     {
                         let mut set = inflight.lock().unwrap();
                         if !set.insert((key.clone(), block)) {
+                            prefetch_skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                     }
@@ -1406,6 +1420,7 @@ impl ObjectFs {
                         .send()
                         .await
                     else {
+                        prefetch_failed.fetch_add(1, Ordering::Relaxed);
                         inflight.lock().unwrap().remove(&(key.clone(), block));
                         return;
                     };
@@ -1416,6 +1431,9 @@ impl ObjectFs {
                             return;
                         }
                         let _ = cache.write_block(&key, block, &bytes);
+                    } else {
+                        prefetch_failed.fetch_add(1, Ordering::Relaxed);
+                        inflight.lock().unwrap().remove(&(key.clone(), block));
                     }
                     inflight.lock().unwrap().remove(&(key.clone(), block));
                 }
@@ -2099,6 +2117,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2129,6 +2149,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2170,6 +2192,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2206,6 +2230,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2247,6 +2273,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2444,6 +2472,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2494,6 +2524,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2538,6 +2570,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2581,6 +2615,8 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2917,6 +2953,8 @@ mod s3_mock_tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            prefetch_skipped: Arc::new(AtomicU64::new(0)),
+            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
