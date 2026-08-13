@@ -107,6 +107,15 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         0.0
     };
     out.push_str(&format!("ossfs_stat_cache_hit_ratio {stat_hit_ratio:.4}\n"));
+    let neg_total = s.stat_positive_cache_hits + s.stat_negative_cache_hits;
+    let neg_hit_ratio = if neg_total > 0 {
+        s.stat_negative_cache_hits as f64 / neg_total as f64
+    } else {
+        0.0
+    };
+    out.push_str(&format!(
+        "ossfs_negative_cache_hit_ratio {neg_hit_ratio:.4}\n"
+    ));
     let read_total = s.read_cache_hits + s.read_cache_misses;
     let read_hit_ratio = if read_total > 0 {
         s.read_cache_hits as f64 / read_total as f64
@@ -166,6 +175,7 @@ mod tests {
         assert!(body.contains("ossfs_avg_upload_bytes 24.60\n"));
         assert!(body.contains("ossfs_avg_download_bytes 152.00\n"));
         assert!(body.contains("ossfs_stat_cache_hit_ratio 0.5833\n"));
+        assert!(body.contains("ossfs_negative_cache_hit_ratio 0.5294\n"));
         assert!(body.contains("ossfs_read_cache_hit_ratio 0.3000\n"));
         assert!(body.contains("ossfs_disk_cache_hit_ratio 0.3500\n"));
     }
