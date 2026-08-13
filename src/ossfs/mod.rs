@@ -31,7 +31,7 @@ use aws_sdk_s3::{Client, config::BehaviorVersion};
 use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -813,6 +813,8 @@ pub struct ObjectFs {
     disk_cache: Option<Arc<DiskCache>>,
     /// Background prefetch depth for sequential disk-cache reads.
     disk_cache_prefetch_blocks: usize,
+    /// In-flight prefetch dedup: `(key, block)` currently being prefetched.
+    prefetch_inflight: Arc<Mutex<HashSet<(String, u64)>>>,
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
@@ -892,6 +894,7 @@ impl ObjectFs {
             read_cache_max_bytes,
             disk_cache,
             disk_cache_prefetch_blocks: config.disk_cache_prefetch_blocks,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1355,10 +1358,17 @@ impl ObjectFs {
             let bucket = self.bucket.clone();
             let limiter = Arc::clone(&self.limiter);
             let key = key.to_string();
+            let inflight = Arc::clone(&self.prefetch_inflight);
             let first_next = last_block + 1;
             let count = self.disk_cache_prefetch_blocks;
             tokio::spawn(async move {
                 for block in first_next..first_next + count as u64 {
+                    {
+                        let mut set = inflight.lock().unwrap();
+                        if !set.insert((key.clone(), block)) {
+                            continue;
+                        }
+                    }
                     let Ok(_permit) = limiter.clone().acquire_owned().await else {
                         return;
                     };
@@ -1372,15 +1382,18 @@ impl ObjectFs {
                         .send()
                         .await
                     else {
+                        inflight.lock().unwrap().remove(&(key.clone(), block));
                         return;
                     };
                     if let Ok(body) = resp.body.collect().await {
                         let bytes = body.to_vec();
                         if bytes.is_empty() {
+                            inflight.lock().unwrap().remove(&(key.clone(), block));
                             return;
                         }
                         let _ = cache.write_block(&key, block, &bytes);
                     }
+                    inflight.lock().unwrap().remove(&(key.clone(), block));
                 }
             });
         }
@@ -2060,6 +2073,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2088,6 +2102,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2127,6 +2142,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2161,6 +2177,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2200,6 +2217,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2394,6 +2412,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2442,6 +2461,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2484,6 +2504,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2525,6 +2546,7 @@ mod tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2859,6 +2881,7 @@ mod s3_mock_tests {
             read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
+            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
