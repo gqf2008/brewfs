@@ -431,19 +431,44 @@ impl DiskCache {
     }
 
     fn load_or_init_block_size(dir: &Path, requested: usize) -> Result<u64> {
+        let requested = requested.max(1) as u64;
         let meta = dir.join("cache.meta");
-        if let Ok(raw) = std::fs::read_to_string(&meta) {
-            if let Some(v) = raw
-                .lines()
-                .next()
-                .and_then(|l| l.strip_prefix("block_size="))
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                return Ok(v.max(1));
+        let existing = std::fs::read_to_string(&meta).ok().and_then(|raw| {
+            let mut version = None;
+            let mut block_size = None;
+            for line in raw.lines() {
+                if let Some(v) = line.strip_prefix("version=") {
+                    version = v.parse::<u64>().ok();
+                } else if let Some(v) = line.strip_prefix("block_size=") {
+                    block_size = v.parse::<u64>().ok();
+                }
+            }
+            Some((version, block_size))
+        });
+
+        let reuse = matches!(
+            existing,
+            Some((Some(1), Some(block))) if block == requested
+        );
+        if !reuse {
+            Self::clear_blocks(dir);
+            std::fs::write(&meta, format!("version=1\nblock_size={requested}\n"))?;
+        }
+        Ok(requested)
+    }
+
+    fn clear_blocks(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str());
+                if ext == Some("blk")
+                    || path.file_name().and_then(|n| n.to_str()) == Some("lru.order")
+                {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
-        std::fs::write(&meta, format!("block_size={}\n", requested.max(1)))?;
-        Ok(requested.max(1) as u64)
     }
 
     fn order_path(&self) -> PathBuf {
@@ -2199,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_cache_block_size_persists_in_meta() {
+    fn disk_cache_block_size_mismatch_rebuilds() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
             let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 2 * 1024 * 1024)
@@ -2208,7 +2233,7 @@ mod tests {
         }
         let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 1 * 1024 * 1024)
             .expect("reopen");
-        assert_eq!(cache.block_size, 2 * 1024 * 1024);
+        assert_eq!(cache.block_size, 1 * 1024 * 1024);
     }
 
     #[tokio::test]
