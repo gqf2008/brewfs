@@ -241,6 +241,34 @@ pub(crate) fn crc64ecma(data: &[u8]) -> u64 {
     crc ^ 0xFFFF_FFFF_FFFF_FFFF
 }
 
+/// Incremental CRC-64/ECMA-182 hasher, so a multipart upload can be verified
+/// while streaming a file from disk (see [`ObjectFs::write_from_file`]).
+struct Crc64Ecma {
+    crc: u64,
+}
+
+impl Crc64Ecma {
+    fn new() -> Self {
+        Self {
+            crc: 0xFFFF_FFFF_FFFF_FFFF,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        const POLY: u64 = 0xC96C_5795_D787_0F42;
+        for &b in data {
+            self.crc ^= b as u64;
+            for _ in 0..8 {
+                self.crc = (self.crc >> 1) ^ ((self.crc & 1).wrapping_neg() & POLY);
+            }
+        }
+    }
+
+    fn finalize(self) -> u64 {
+        self.crc ^ 0xFFFF_FFFF_FFFF_FFFF
+    }
+}
+
 /// Captures the `x-oss-hash-crc64ecma` response header before the SDK
 /// deserializes the output, so the write path can compare it to the locally
 /// computed checksum after the call returns.
@@ -2190,6 +2218,182 @@ impl ObjectFs {
         Ok(())
     }
 
+    /// Overwrite an object from a local file, streaming large files through
+    /// multipart so the process never holds the whole object in memory. Used
+    /// by the WinFsp adapter once a write buffer spills to disk.
+    pub async fn write_from_file(&self, path: &str, src: &Path) -> Result<()> {
+        let size = std::fs::metadata(src).context("stat spool file")?.len();
+        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
+        self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .upload_bytes_total
+            .fetch_add(size, Ordering::Relaxed);
+        self.ensure_writable()?;
+        self.invalidate_stat(path);
+        self.invalidate_read_cache(path);
+        let _budget = self.acquire_upload_budget(size as usize).await?;
+        if size > MULTIPART_THRESHOLD {
+            self.write_multipart_from_file(path, src, size).await
+        } else {
+            let data = tokio::fs::read(src).await.context("read spool file")?;
+            let _permit = self.acquire().await?;
+            self.put_whole_object(path, &data).await
+        }
+    }
+
+    /// Multipart upload reading part chunks directly from `src`, bounded by
+    /// [`Self::multipart_concurrency`] so memory stays at a few part sizes.
+    async fn write_multipart_from_file(&self, path: &str, src: &Path, size: u64) -> Result<()> {
+        let key = self.key_for(path);
+        let crc_slot = Arc::new(Mutex::new(None));
+        let mut hasher = self.verify_crc64.then(Crc64Ecma::new);
+
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key);
+        if let Some(sc) = &self.storage_class {
+            create = create.storage_class(sc.clone());
+        }
+        let create = create
+            .send()
+            .await
+            .inspect_err(|_| {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                self.metrics
+                    .s3_multipart_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            })
+            .context("s3 create multipart upload")?;
+        let upload_id = create
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
+            .to_string();
+
+        let local = Arc::new(Semaphore::new(self.multipart_concurrency));
+        let mut handles = tokio::task::JoinSet::new();
+        let mut file = tokio::fs::File::open(src)
+            .await
+            .context("open spool file")?;
+        let part_size = self.multipart_part_size as u64;
+        let mut remaining = size;
+        let mut part_number = 1i32;
+
+        while remaining > 0 {
+            let chunk_len = part_size.min(remaining) as usize;
+            let slot = local
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("multipart upload concurrency closed"))?;
+            let mut chunk = vec![0u8; chunk_len];
+            tokio::io::AsyncReadExt::read_exact(&mut file, &mut chunk)
+                .await
+                .context("read spool file chunk")?;
+            if let Some(h) = &mut hasher {
+                h.update(&chunk);
+            }
+            let part_md5 = self.content_md5.then(|| content_md5(&chunk));
+            let part_no = part_number;
+            let upload_id = upload_id.clone();
+            let key = key.clone();
+            let bucket = self.bucket.clone();
+            let client = self.client.clone();
+            let limiter = Arc::clone(&self.limiter);
+            handles.spawn(async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
+                let mut part = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_no)
+                    .body(ByteStream::from(chunk));
+                if let Some(md5) = part_md5 {
+                    part = part.content_md5(md5);
+                }
+                let resp = part.send().await.context("s3 upload part")?;
+                let etag = resp.e_tag().unwrap_or_default().to_string();
+                drop(slot);
+                Ok::<(i32, String), anyhow::Error>((part_no, etag))
+            });
+            part_number += 1;
+            remaining -= chunk_len as u64;
+        }
+
+        let mut parts = Vec::new();
+        let mut upload_error = None;
+        while let Some(joined) = handles.join_next().await {
+            match joined {
+                Ok(Ok((part_no, etag))) => {
+                    parts.push(
+                        CompletedPart::builder()
+                            .part_number(part_no)
+                            .e_tag(etag)
+                            .build(),
+                    );
+                }
+                Ok(Err(e)) => upload_error = Some(e),
+                Err(e) => {
+                    upload_error = Some(anyhow::anyhow!("multipart upload task panicked: {e}"))
+                }
+            }
+        }
+
+        if let Some(e) = upload_error {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(e);
+        }
+
+        parts.sort_by_key(|p| p.part_number);
+        let expected_crc = hasher.map(Crc64Ecma::finalize);
+        let mut complete = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .customize();
+        if expected_crc.is_some() {
+            complete = complete.interceptor(Crc64ResponseCapture {
+                slot: Arc::clone(&crc_slot),
+            });
+        }
+        if let Err(e) = complete.send().await {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(e).context("s3 complete multipart upload");
+        }
+        if let Some(expected) = expected_crc {
+            check_crc64_response(crc_slot, expected, &self.metrics)?;
+        }
+        Ok(())
+    }
+
     /// Create an empty directory marker object.
     pub async fn mkdir(&self, path: &str) -> Result<()> {
         self.invalidate_stat(path);
@@ -3980,6 +4184,75 @@ mod s3_mock_tests {
             reassembled, data,
             "multipart parts must reassemble to the original bytes in order"
         );
+    }
+
+    #[tokio::test]
+    async fn write_from_file_streams_multipart_without_whole_buffer() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("large.bin");
+        let data: Vec<u8> = (0..20 * 1024 * 1024usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        std::fs::write(&src, &data).expect("write spool");
+
+        fs.write_from_file("/large.bin", &src).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let lc = |t: &str| t.to_lowercase();
+        let creates = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploads")
+                    && !lc(&r.target).contains("uploadid")
+            })
+            .count();
+        assert_eq!(creates, 1, "exactly one initiate-multipart");
+
+        let mut parts: Vec<(i32, Vec<u8>)> = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && lc(&r.target).contains("partnumber"))
+            .map(|r| {
+                let query = r.target.split('?').nth(1).unwrap_or("");
+                let part_no = query
+                    .split('&')
+                    .find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        k.eq_ignore_ascii_case("partnumber")
+                            .then(|| v.parse::<i32>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                (part_no, r.body.clone())
+            })
+            .collect();
+        parts.sort_by_key(|(n, _)| *n);
+        let reassembled: Vec<u8> = parts.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(
+            reassembled, data,
+            "multipart parts must reassemble in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_from_file_small_uses_single_put() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("small.bin");
+        let data = vec![0x5Au8; 1024];
+        std::fs::write(&src, &data).expect("write spool");
+
+        fs.write_from_file("/small.bin", &src).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "small file must be a single PUT");
+        assert_eq!(recorded[0].method, "PUT");
+        assert!(!recorded[0].target.to_lowercase().contains("uploads"));
+        assert_eq!(recorded[0].body, data);
     }
 
     #[tokio::test]
