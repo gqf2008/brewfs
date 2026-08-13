@@ -3870,6 +3870,10 @@ mod s3_mock_tests {
         });
 
         tokio::time::sleep(mock.delay).await;
+        // 模拟的服务端处理（sleep）到此结束，先释放并发槽位再写响应。
+        // 若等写完响应再 -1，客户端读到响应即释放限流 permit 放入新请求，
+        // 新请求的 +1 会与这里滞后的 -1 重叠，把并发峰值虚记高一档（ flaky ）。
+        mock.active.fetch_sub(1, Ordering::SeqCst);
 
         let mut get_body: Option<Vec<u8>> = None;
         let response = if query.contains("list-type=2") {
@@ -3968,7 +3972,6 @@ mod s3_mock_tests {
             let _ = stream.write_all(&body).await;
         }
         let _ = stream.shutdown().await;
-        mock.active.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn http_response(status: u16, content_type: &str, body: Option<&String>) -> String {
