@@ -159,6 +159,27 @@ See `ossfs.example.json` in the repo root for a full template (keys are long opt
 FUSE directory reads use `readdirplus`, so each directory entry also returns its
 attributes without extra stat round trips.
 
+`--config` key reference (type / default; the authoritative list is `ossfs.example.json`):
+
+- `mount_point`: string (mount-point positional, required)
+- `bucket`: string (required)
+- `endpoint`: string
+- `region`: string (`us-east-1`)
+- `prefix`: string
+- `access_key_id` / `secret_access_key`: string (empty does not override env)
+
+- `uid` / `gid`: number (`0` = current user)
+- `dir-mode` / `file-mode` / `umask`: octal string (`0755` / `0644` / `0`)
+- Boolean switches (`true` enables, `false` skips): `force-path-style`, `read-only`, `allow-other`, `no-rename-dir`, `no-ignore-fsync`, `no-verify-crc64`, `content-md5`, `notsup-compat-dir`, `disk-cache-verify-etag`
+- `rename-dir-limit` / `max-upload-bytes` / `max-dirty-bytes` / `max-concurrent-requests` / `read-ahead-bytes` / `multipart-size` / `multipart-concurrency`: number
+- `list-rate-limit`: number, calls/sec (`0` = unlimited)
+- `storage-class` / `credential-process`: string
+- `connect-timeout` / `readwrite-timeout` / `retries`: number (`0` = SDK default)
+
+- Caches: `stat-cache-ttl` (`3`), `stat-cache-max-entries` (`4096`), `negative-cache-ttl` (`5`), `negative-cache-max-entries` (`4096`), `read-cache-max-bytes` (`67108864`), `total-mem-limit` (`0`), `total-mem-read-ratio` (`0.5`)
+- Disk cache: `disk-cache-dir`, `disk-cache-max-bytes`, `disk-cache-block-size`, `disk-cache-prefetch-blocks`, `disk-cache-prefetch-concurrency`, `disk-cache-etag-ttl`, `disk-cache-reserve-diskfree`, `disk-cache-free-space-ratio`
+- Logging/metrics: `log-dir`, `log-level`, `metrics-listen`, `metrics-log-interval`
+
 Credentials come from the environment (`AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`) or the AWS shared config. The tray injects them into
 the `ossmount` process it spawns.

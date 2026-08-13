@@ -143,6 +143,29 @@ ossmount mount --bucket my-bucket \
 
 FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无需额外 stat 往返。
 
+`--config` 键速查（类型 / 默认；完整与权威以 `ossfs.example.json` 为准）：
+
+- `mount_point`：字符串（挂载点位置参数，必填）
+- `bucket`：字符串（必填）
+- `endpoint`：字符串
+- `region`：字符串（`us-east-1`）
+- `prefix`：字符串
+- `access_key_id` / `secret_access_key`：字符串（空值不覆盖环境变量）
+
+- `uid` / `gid`：数字（`0` = 当前用户）
+- `dir-mode` / `file-mode` / `umask`：八进制字符串（`0755` / `0644` / `0`）
+- 布尔开关（`true` 开启，`false` 跳过）：`force-path-style`、`read-only`、`allow-other`、`no-rename-dir`、`no-ignore-fsync`、`no-verify-crc64`、`content-md5`、`notsup-compat-dir`、`disk-cache-verify-etag`
+- `rename-dir-limit` / `max-upload-bytes` / `max-dirty-bytes` / `max-concurrent-requests` / `read-ahead-bytes` / `multipart-size` / `multipart-concurrency`：数字
+- `list-rate-limit`：数字，次/秒（`0` = 不限）
+- `storage-class` / `credential-process`：字符串
+- `connect-timeout` / `readwrite-timeout` / `retries`：数字（`0` = SDK 默认）
+
+- 缓存：`stat-cache-ttl`（`3`）、`stat-cache-max-entries`（`4096`）、`negative-cache-ttl`（`5`）、`negative-cache-max-entries`（`4096`）、`read-cache-max-bytes`（`67108864`）、`total-mem-limit`（`0`）、`total-mem-read-ratio`（`0.5`）
+- 磁盘缓存：`disk-cache-dir`、`disk-cache-max-bytes`、`disk-cache-block-size`、`disk-cache-prefetch-blocks`、`disk-cache-prefetch-concurrency`、`disk-cache-etag-ttl`、`disk-cache-reserve-diskfree`、`disk-cache-free-space-ratio`
+- 日志/指标：`log-dir`、`log-level`、`metrics-listen`、`metrics-log-interval`
+
+
+
 凭据来自环境变量（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`）或 AWS 共享配置；托盘会把密钥注入其拉起的 `ossmount` 进程。
 
 ## 一致性
