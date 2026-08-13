@@ -308,6 +308,8 @@ const DISK_CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 const DISK_CACHE_META_VERSION: u64 = 2;
 /// Default maximum number of concurrent disk-cache prefetch tasks.
 const DISK_CACHE_PREFETCH_CONCURRENCY: usize = 4;
+/// How long an object ETag check is considered fresh before re-HEADing.
+const ETAG_CHECK_TTL: Duration = Duration::from_secs(10);
 /// Unit size for the disk-cache byte budget (whole MiB permits).
 const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 
@@ -859,6 +861,8 @@ pub struct ObjectFs {
     prefetch_sem: Arc<Semaphore>,
     /// Verify object ETag with HEAD before serving disk-cache blocks.
     disk_cache_verify_etag: bool,
+    /// path -> last successful ETag check (short TTL, see [`ETAG_CHECK_TTL`]).
+    etag_checked: Mutex<HashMap<String, Instant>>,
 
     /// Prefetch dedup skips and failures are tracked inside [`Metrics`].
     /// path -> end offset of its previous read (sequential-read hint).
@@ -945,6 +949,7 @@ impl ObjectFs {
                 config.disk_cache_prefetch_concurrency.max(1),
             )),
             disk_cache_verify_etag: config.disk_cache_verify_etag,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1470,6 +1475,14 @@ impl ObjectFs {
     }
 
     async fn verify_disk_cache_etag(&self, key: &str) {
+        {
+            let checked = self.etag_checked.lock().unwrap();
+            if let Some(at) = checked.get(key) {
+                if at.elapsed() < ETAG_CHECK_TTL {
+                    return;
+                }
+            }
+        }
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
         let Ok(resp) = self
             .client
@@ -1490,6 +1503,10 @@ impl ObjectFs {
         if cache.read_etag(key).as_deref() != Some(etag.as_str()) {
             cache.invalidate(key);
             cache.store_etag(key, &etag);
+            self.etag_checked
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), Instant::now());
         }
     }
 
@@ -2168,6 +2185,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2199,6 +2217,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2241,6 +2260,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2278,6 +2298,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2320,6 +2341,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2519,6 +2541,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2570,6 +2593,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2615,6 +2639,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2659,6 +2684,7 @@ mod tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -3017,6 +3043,7 @@ mod s3_mock_tests {
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
+            etag_checked: Mutex::new(HashMap::new()),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -3333,6 +3360,7 @@ mod s3_mock_tests {
         fs.read_range("/e.bin", 0, 1024).await.expect("hit");
         assert_eq!(mock.get_count.load(Ordering::SeqCst), 1);
 
+        fs.etag_checked.lock().unwrap().clear();
         mock.set_head_etag("changed");
         fs.read_range("/e.bin", 0, 1024).await.expect("refetch");
         assert_eq!(mock.get_count.load(Ordering::SeqCst), 2);
