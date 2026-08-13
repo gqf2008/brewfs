@@ -110,6 +110,8 @@ region / access key → *Save* → *Mount*.
 | `--disk-cache-block-size N` | Disk-cache block size, bytes (default `4194304`, `0` = default) |
 | `--disk-cache-prefetch-blocks N` | Sequential read background prefetch depth (default `1`, `0` = off) |
 | `--disk-cache-prefetch-concurrency N` | Max concurrent disk-cache prefetch tasks (default `4`) |
+| `--disk-cache-verify-etag` | Verify object ETag with a HEAD before serving disk-cache blocks |
+| `--disk-cache-etag-ttl N` | ETag re-check TTL in seconds (default `10`) |
 | `--total-mem-limit N` | Total read/write buffer budget; derives upload/dirty/read-cache limits |
 | `--total-mem-read-ratio R` | Fraction of `--total-mem-limit` reserved for read cache, `(0,1)` (default `0.5`) |
 | `--read-cache-max-bytes N` | In-memory read-ahead cache cap, bytes (default `67108864`) |

@@ -95,6 +95,8 @@ ossmount mount --bucket my-bucket \
 | `--disk-cache-block-size N` | 磁盘缓存块大小（默认 `4194304`，`0` = 默认） |
 | `--disk-cache-prefetch-blocks N` | 顺序读后台预取深度（默认 `1`，`0` = 关闭） |
 | `--disk-cache-prefetch-concurrency N` | 磁盘缓存预取任务最大并发（默认 `4`） |
+| `--disk-cache-verify-etag` | 服务磁盘缓存块前用 HEAD 校验对象 ETag |
+| `--disk-cache-etag-ttl N` | ETag 复检 TTL（秒，默认 `10`） |
 | `--total-mem-limit N` | 总读写缓冲预算，自动派生上传/脏/读缓存上限 |
 | `--total-mem-read-ratio R` | `--total-mem-limit` 中读缓存占比 `(0,1)`（默认 `0.5`） |
 | `--read-cache-max-bytes N` | 内存预读缓存上限（默认 `67108864`） |
