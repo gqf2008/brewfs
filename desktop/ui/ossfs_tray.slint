@@ -117,6 +117,8 @@ export component MainWindow inherits Window {
     callback open-record(int);
     callback toggle-record(int);
     callback delete-record(int);
+    callback import-config();
+    callback export-config(int);
     callback confirm-dialog();
     callback cancel-dialog();
     callback quit-app();
@@ -281,6 +283,11 @@ export component MainWindow inherits Window {
                                 }
 
                                 IconButton {
+                                    icon: @image-url("../assets/icons/export.svg");
+                                    tip: "导出配置";
+                                    clicked => { root.export-config(i); }
+                                }
+                                IconButton {
                                     icon: @image-url("../assets/icons/delete.svg");
                                     tip: "删除";
                                     clicked => { root.delete-record(i); }
@@ -358,6 +365,10 @@ export component MainWindow inherits Window {
                         overflow: elide;
                     }
 
+                    Button {
+                        text: "导入";
+                        clicked => { root.import-config(); }
+                    }
                     Button {
                         text: "添加配置";
                         icon: @image-url("../assets/icons/plus.svg");

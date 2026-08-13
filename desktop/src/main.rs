@@ -582,6 +582,99 @@ fn wire_callbacks(
         }
     });
 
+    // --- import a config from an `ossmount --config` JSON file ---
+    ui.on_import_config({
+        let ui_weak = ui_weak.clone();
+        let tray_weak = tray_weak.clone();
+        let state = state.clone();
+        let recent = recent.clone();
+        let hold = Rc::clone(&hold);
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("OSSFS 配置", &["json"])
+                .pick_file()
+            else {
+                return;
+            };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                ui.set_status_text("导入失败：无法读取所选文件".into());
+                return;
+            };
+            let p = match model::Profile::from_ossmount_config(&raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    ui.set_status_text(format!("导入失败：{e}").into());
+                    return;
+                }
+            };
+            if let Err(e) = p.validate() {
+                ui.set_status_text(format!("导入失败：{e}").into());
+                return;
+            }
+            {
+                let mut file = state.borrow_mut();
+                let mut name = p.name.clone();
+                let mut n = 1;
+                while file.profiles.iter().any(|q| q.name == name) {
+                    n += 1;
+                    name = format!("导入配置 {n}");
+                }
+                let mut p = p;
+                p.name = name;
+                file.profiles.push(p);
+                if let Err(e) = model::save_profiles(&file) {
+                    ui.set_status_text(format!("导入失败：{e}").into());
+                    return;
+                }
+            }
+            if let Some(tray) = tray_weak.upgrade() {
+                refresh(&ui, &tray, &state, &recent, &hold);
+            }
+            ui.set_status_text("已导入配置".into());
+        }
+    });
+
+    // --- export a record's config to an `ossmount --config` JSON file ---
+    ui.on_export_config({
+        let ui_weak = ui_weak.clone();
+        let state = state.clone();
+        move |index| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let p = {
+                let profiles = state.borrow();
+                let Some(p) = profiles.profiles.get(index as usize) else {
+                    ui.set_status_text("记录不存在".into());
+                    return;
+                };
+                p.clone()
+            };
+            let safe: String = p
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("{safe}.json"))
+                .add_filter("OSSFS 配置", &["json"])
+                .save_file()
+            else {
+                return;
+            };
+            if let Err(e) = std::fs::write(&path, p.to_ossmount_config()) {
+                ui.set_status_text(format!("导出失败：{e}").into());
+                return;
+            }
+            ui.set_status_text(format!("已导出配置到 {}", path.display()).into());
+        }
+    });
+
     // --- select a record -> load into the form ---
     // --- tray: open a mounted drive ---
     {

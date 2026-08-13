@@ -97,9 +97,6 @@ impl Profile {
     /// Serialize this profile into the same JSON shape `ossmount --config`
     /// accepts. Only the shared mount options are emitted; tray-only fields
     /// (`name` / `drive` / `mode` / payload-checksum toggle) are omitted.
-    // TODO: wire into the tray import/export UI once a native file dialog is
-    // available; the round-trip is already covered by tests.
-    #[allow(dead_code)]
     pub fn to_ossmount_config(&self) -> String {
         serde_json::to_string_pretty(&serde_json::json!({
             "mount_point": self.drive,
@@ -116,9 +113,6 @@ impl Profile {
 
     /// Build a tray profile from an `ossmount --config` JSON document.
     /// Tray-only fields are filled with sensible defaults.
-    // TODO: wire into the tray import/export UI once a native file dialog is
-    // available; the round-trip is already covered by tests.
-    #[allow(dead_code)]
     pub fn from_ossmount_config(json: &str) -> Result<Profile, String> {
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
