@@ -107,6 +107,14 @@ pub struct OssConfig {
     pub disk_cache_dir: Option<PathBuf>,
     /// Upper bound on disk-cache bytes; evicts oldest blocks when exceeded.
     /// `Some(0)` disables the disk cache. Rounded up to 1 MiB units.
+    /// Total process memory budget for read/write buffers. When set, it
+    /// overrides the read-cache / upload / dirty budgets with a fixed
+    /// 2:1:1 split (read cache : upload : dirty). Mirrors aliyun/ossfs
+    /// `total_mem_limit`. `Some(0)` disables the override.
+    pub total_mem_limit: Option<usize>,
+    /// Upper bound on the in-memory read-ahead cache in bytes. `None`
+    /// uses the default [`READ_CACHE_MAX_BYTES`].
+    pub read_cache_max_bytes: Option<usize>,
     pub disk_cache_max_bytes: usize,
 }
 
@@ -286,6 +294,25 @@ const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
 /// acquire call can represent are clamped.
+/// Derive effective memory budgets. When `total_mem_limit` is set it wins and
+/// splits 2:1:1 (read cache : upload bytes : dirty bytes); otherwise the
+/// individual options (and the default read-cache cap) are preserved.
+fn effective_memory_budgets(
+    total_mem_limit: Option<usize>,
+    max_upload_bytes: Option<usize>,
+    max_dirty_bytes: Option<usize>,
+    read_cache_max_bytes: Option<usize>,
+) -> (Option<usize>, Option<usize>, usize) {
+    match total_mem_limit {
+        Some(total) if total > 0 => (Some(total / 4), Some(total / 4), total / 2),
+        _ => (
+            max_upload_bytes,
+            max_dirty_bytes,
+            read_cache_max_bytes.unwrap_or(READ_CACHE_MAX_BYTES),
+        ),
+    }
+}
+
 fn upload_budget_units(max_bytes: Option<usize>) -> Option<usize> {
     let bytes = max_bytes?;
     if bytes == 0 {
@@ -567,6 +594,8 @@ pub struct ObjectFs {
     read_ahead_window: usize,
     /// Bounded read-ahead cache.
     read_cache: Mutex<ReadCache>,
+    /// Upper bound on in-memory read-ahead cache bytes.
+    read_cache_max_bytes: usize,
     /// Optional block-oriented on-disk read cache.
     disk_cache: Option<Arc<DiskCache>>,
     /// path -> end offset of its previous read (sequential-read hint).
@@ -602,10 +631,16 @@ impl ObjectFs {
             builder = builder.credentials_provider(CredentialProcessProvider::new(command.clone()));
         }
         let client = Client::from_conf(builder.build());
-        let upload_budget_units = upload_budget_units(config.max_upload_bytes);
+        let (max_upload_bytes, max_dirty_bytes, read_cache_max_bytes) = effective_memory_budgets(
+            config.total_mem_limit,
+            config.max_upload_bytes,
+            config.max_dirty_bytes,
+            config.read_cache_max_bytes,
+        );
+        let upload_budget_units = upload_budget_units(max_upload_bytes);
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         let ignore_fsync = config.ignore_fsync;
-        let dirty_budget = DirtyBudget::new(config.max_dirty_bytes.unwrap_or(0));
+        let dirty_budget = DirtyBudget::new(max_dirty_bytes.unwrap_or(0));
         let disk_cache = match &config.disk_cache_dir {
             Some(dir) if config.disk_cache_max_bytes > 0 => Some(Arc::new(DiskCache::new(
                 dir.clone(),
@@ -635,6 +670,7 @@ impl ObjectFs {
             upload_budget_units: upload_budget_units.unwrap_or(0),
             read_ahead_window,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes,
             disk_cache,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
@@ -1110,14 +1146,14 @@ impl ObjectFs {
     /// Insert a read-ahead window into the bounded cache, evicting arbitrary
     /// entries when the byte/entry budgets are exceeded.
     fn insert_read_cache(&self, path: &str, start: u64, data: Vec<u8>) {
-        if data.is_empty() || data.len() > READ_CACHE_MAX_BYTES {
+        if data.is_empty() || data.len() > self.read_cache_max_bytes {
             return;
         }
         let mut cache = self.read_cache.lock().unwrap();
         if let Some(old) = cache.entries.remove(path) {
             cache.bytes = cache.bytes.saturating_sub(old.data.len());
         }
-        while cache.bytes + data.len() > READ_CACHE_MAX_BYTES
+        while cache.bytes + data.len() > self.read_cache_max_bytes
             || cache.entries.len() >= READ_CACHE_MAX_ENTRIES
         {
             let key = cache.entries.keys().next().cloned();
@@ -1706,6 +1742,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1732,6 +1769,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1769,6 +1807,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1801,6 +1840,7 @@ mod tests {
             upload_budget_units: 1,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1838,6 +1878,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 1024,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1858,6 +1899,26 @@ mod tests {
         assert!(DirtyBudget::new(0).is_none());
         let budget = DirtyBudget::new(DIRTY_BUDGET_UNIT + 1).unwrap();
         assert_eq!(budget.max_units(), 2);
+    }
+
+    #[test]
+    fn total_mem_limit_derives_budgets() {
+        assert_eq!(
+            effective_memory_budgets(Some(64 * 1024 * 1024), None, None, None),
+            (
+                Some(16 * 1024 * 1024),
+                Some(16 * 1024 * 1024),
+                32 * 1024 * 1024
+            )
+        );
+        assert_eq!(
+            effective_memory_budgets(None, Some(5), Some(7), Some(9)),
+            (Some(5), Some(7), 9)
+        );
+        assert_eq!(
+            effective_memory_budgets(None, None, None, None),
+            (None, None, READ_CACHE_MAX_BYTES)
+        );
     }
 
     #[tokio::test]
@@ -1893,6 +1954,8 @@ mod tests {
             verify_crc64: false,
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
+            total_mem_limit: None,
+            read_cache_max_bytes: None,
             credential_process: None,
         }
         .normalize();
@@ -1916,6 +1979,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -1962,6 +2026,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -2002,6 +2067,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -2041,6 +2107,7 @@ mod tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
@@ -2373,6 +2440,7 @@ mod s3_mock_tests {
             upload_budget_units: 0,
             read_ahead_window: 0,
             read_cache: Mutex::new(ReadCache::default()),
+            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
             disk_cache: None,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,

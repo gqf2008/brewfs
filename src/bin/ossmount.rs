@@ -32,6 +32,7 @@ fn usage() -> ! {
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
                  [--metrics-listen ADDR]\n\
+                 [--total-mem-limit N] [--read-cache-max-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -73,6 +74,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
     let mut max_dirty_bytes: Option<usize> = None;
     let mut credential_process: Option<String> = None;
     let mut disk_cache_dir: Option<PathBuf> = None;
+    let mut total_mem_limit: Option<usize> = None;
+    let mut read_cache_max_bytes: Option<usize> = None;
     let mut disk_cache_max_bytes: usize = 0;
     let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
@@ -157,6 +160,20 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
                     .unwrap_or_else(|| usage());
             }
             "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
+            "--total-mem-limit" => {
+                let v: usize = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                total_mem_limit = if v == 0 { None } else { Some(v) };
+            }
+            "--read-cache-max-bytes" => {
+                let v: usize = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                read_cache_max_bytes = if v == 0 { None } else { Some(v) };
+            }
             "--credential-process" => {
                 credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
@@ -196,6 +213,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
             credential_process,
             disk_cache_dir,
             disk_cache_max_bytes,
+            total_mem_limit,
+            read_cache_max_bytes,
             verify_crc64,
         },
         mount_point,
