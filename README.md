@@ -15,10 +15,9 @@ local filesystem with **no local metadata database**. Paths are encoded
 directly into object keys, so any number of machines can mount the same bucket
 and see the same tree — a multi-machine "cloud drive".
 
-> This project was forked from [brewfs](https://github.com/brewfs/brewfs) and
-> slimmed down to the OSS network-drive use case. All metadata-backend code
-> (Redis / SQLx / etcd / TiKV, chunk cache, compaction, control plane) has been
-> removed.
+> OSSFS is a standalone project for the OSS network-drive use case. It has no
+> metadata backend — no Redis / SQLx / etcd / TiKV, no chunk cache, no
+> compaction, no control plane — the bucket is the only source of truth.
 
 ## Features
 

@@ -2,7 +2,7 @@ name: Build & Release (Desktop)
 
 # 与 ../abb 相同的发布方式：打 v* tag 时自动构建 macOS DMG 与 Windows 安装包，
 # 签名/公证后发 GitHub Release；也可手动触发（只出产物，不发 Release）。
-# 目标仓库：gqf2008/ossfs（OSSFS 独立项目，已与原 brewfs 分叉）。
+# 目标仓库：gqf2008/ossfs（OSSFS 独立项目）。
 #
 # 密钥说明（运行时判断，缺失时优雅降级）：
 #   APPLE_CERT_P12 / APPLE_CERT_PASSWORD / APPLE_TEAM_ID / APPLE_ID / APPLE_APP_PASSWORD

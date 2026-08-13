@@ -11,7 +11,7 @@
 
 OSSFS 把 S3 兼容存储桶（阿里云 OSS、MinIO、AWS S3 等）直接挂载为本地文件系统，**无本地元数据库**。路径直接编码为对象键，任意多台机器挂同一桶看到同一棵树——多机"云盘"。
 
-> 本项目由 [brewfs](https://github.com/brewfs/brewfs) 分叉而来，精简为纯 OSS 网盘场景；已删除全部元数据后端代码（Redis / SQLx / etcd / TiKV、块缓存、压缩、控制面）。
+> OSSFS 是面向纯 OSS 网盘场景的独立项目，无元数据后端——没有 Redis / SQLx / etcd / TiKV、块缓存、压缩、控制面；桶是唯一数据源。
 
 ## 特性
 
