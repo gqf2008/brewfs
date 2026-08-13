@@ -614,14 +614,8 @@ fn wire_callbacks(
             }
             {
                 let mut file = state.borrow_mut();
-                let mut name = p.name.clone();
-                let mut n = 1;
-                while file.profiles.iter().any(|q| q.name == name) {
-                    n += 1;
-                    name = format!("导入配置 {n}");
-                }
                 let mut p = p;
-                p.name = name;
+                p.name = unique_import_name(&file.profiles, &p.name);
                 file.profiles.push(p);
                 if let Err(e) = model::save_profiles(&file) {
                     ui.set_status_text(format!("导入失败：{e}").into());
@@ -649,17 +643,7 @@ fn wire_callbacks(
                 };
                 p.clone()
             };
-            let safe: String = p
-                .name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
+            let safe = sanitize_filename(&p.name);
             let Some(path) = rfd::FileDialog::new()
                 .set_file_name(format!("{safe}.json"))
                 .add_filter("OSSFS 配置", &["json"])
@@ -879,6 +863,31 @@ fn upsert_profile(file: &mut model::ProfilesFile, p: &model::Profile) {
         Some(i) => file.profiles[i] = p.clone(),
         None => file.profiles.push(p.clone()),
     }
+}
+
+/// Sanitize a profile name into a filesystem-safe file stem.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Return a profile name that does not collide with existing profiles, by
+/// appending a numeric suffix (`导入配置 2`, ...) when needed.
+fn unique_import_name(existing: &[model::Profile], base: &str) -> String {
+    let mut name = base.to_string();
+    let mut n = 1;
+    while existing.iter().any(|q| q.name == name) {
+        n += 1;
+        name = format!("{base} {n}");
+    }
+    name
 }
 
 fn refresh(
@@ -1613,5 +1622,34 @@ mod mac_dock_reopen {
         if !added.as_bool() {
             eprintln!("OSSFS: class_addMethod failed; Dock reopen may not show the window");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_filename_keeps_safe_chars() {
+        assert_eq!(sanitize_filename("OSS"), "OSS");
+        assert_eq!(sanitize_filename("a-b_c"), "a-b_c");
+        assert_eq!(sanitize_filename("a/b?"), "a_b_");
+    }
+
+    #[test]
+    fn unique_import_name_appends_suffix_on_collision() {
+        let profile = |name: &str| model::Profile {
+            name: name.to_string(),
+            ..model::Profile::default()
+        };
+        assert_eq!(unique_import_name(&[], "导入配置"), "导入配置");
+        assert_eq!(
+            unique_import_name(&[profile("导入配置")], "导入配置"),
+            "导入配置 2"
+        );
+        assert_eq!(
+            unique_import_name(&[profile("导入配置"), profile("导入配置 2")], "导入配置"),
+            "导入配置 3"
+        );
     }
 }
