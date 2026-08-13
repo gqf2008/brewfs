@@ -16,9 +16,13 @@
 //! The `MOUNT_POINT` is a drive letter (`Z:`) on Windows and a directory
 //! (e.g. `/Volumes/ossfs`) on macOS/Linux.
 
+use anyhow::Context as _;
+
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use tracing_subscriber::EnvFilter;
 
 use ossfs::{ObjectFs, OssConfig};
 
@@ -32,6 +36,7 @@ fn usage() -> ! {
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
                  [--metrics-listen ADDR]\n\
+                 [--log-dir PATH] [--log-level LEVEL]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
@@ -54,7 +59,14 @@ fn parse_mode(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 
-fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
+fn parse_args() -> (
+    OssConfig,
+    PathBuf,
+    u64,
+    Option<String>,
+    Option<PathBuf>,
+    Option<String>,
+) {
     let mut bucket = String::new();
     let mut endpoint: Option<String> = None;
     let mut region = "us-east-1".to_string();
@@ -78,6 +90,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
     let mut total_mem_read_ratio: f64 = 0.5;
     let mut read_cache_max_bytes: Option<usize> = None;
     let mut disk_cache_max_bytes: usize = 0;
+    let mut log_dir: Option<PathBuf> = None;
+    let mut log_level: Option<String> = None;
     let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
     let mut mount_point: Option<PathBuf> = None;
@@ -161,6 +175,8 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
                     .unwrap_or_else(|| usage());
             }
             "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
+            "--log-dir" => log_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage()))),
+            "--log-level" => log_level = Some(iter.next().unwrap_or_else(|| usage())),
             "--total-mem-limit" => {
                 let v: usize = iter
                     .next()
@@ -229,12 +245,26 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
         mount_point,
         refresh_secs,
         metrics_listen,
+        log_dir,
+        log_level,
     )
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (cfg, mount_point, refresh_secs, metrics_listen) = parse_args();
+    let (cfg, mount_point, refresh_secs, metrics_listen, log_dir, log_level) = parse_args();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level.as_deref().unwrap_or("info")));
+    if let Some(dir) = log_dir {
+        std::fs::create_dir_all(&dir).context("create log dir")?;
+        let appender = tracing_appender::rolling::daily(&dir, "ossmount.log");
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(appender)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
     let fs = Arc::new(ObjectFs::connect(cfg).await?);
     if let Some(addr) = metrics_listen {
         let metrics_fs = Arc::clone(&fs);
