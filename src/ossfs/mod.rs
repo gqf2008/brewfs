@@ -105,6 +105,14 @@ pub struct OssConfig {
     /// `STANDARD` / `STANDARD_IA` / `GLACIER` (S3). `None` keeps the bucket
     /// default.
     pub storage_class: Option<String>,
+    /// Multipart upload part size in bytes (mirrors aliyun/ossfs
+    /// `multipart_size`). `None` uses [`MULTIPART_PART_SIZE`]; values below
+    /// 5 MiB are clamped up to the S3 minimum.
+    pub multipart_size: Option<usize>,
+    /// Number of concurrent part uploads within one multipart write (mirrors
+    /// aliyun/ossfs `parallel_count`). `None` uses
+    /// [`MULTIPART_UPLOAD_CONCURRENCY`].
+    pub multipart_concurrency: Option<usize>,
     /// Local disk cache directory for object-range blocks. When set, read
     /// ranges that are not served from the in-memory read-ahead cache are
     /// written here and reused on later reads (even across remounts).
@@ -969,6 +977,10 @@ pub struct ObjectFs {
     verify_crc64: bool,
     /// Storage class for newly written objects (see [OssConfig::storage_class]).
     storage_class: Option<StorageClass>,
+    /// Multipart upload part size in bytes.
+    multipart_part_size: usize,
+    /// Concurrent in-flight part uploads within a single multipart write.
+    multipart_concurrency: usize,
     /// Monotonic operation counters.
     metrics: Arc<Metrics>,
     /// Dirty-buffer budget for the adapters; None when unlimited.
@@ -1057,6 +1069,14 @@ impl ObjectFs {
             ignore_fsync,
             verify_crc64: config.verify_crc64,
             storage_class: config.storage_class.map(|s| StorageClass::from(s.as_str())),
+            multipart_part_size: config
+                .multipart_size
+                .unwrap_or(MULTIPART_PART_SIZE as usize)
+                .max(5 * 1024 * 1024),
+            multipart_concurrency: config
+                .multipart_concurrency
+                .unwrap_or(MULTIPART_UPLOAD_CONCURRENCY)
+                .max(1),
             metrics: Arc::new(Metrics::default()),
             dirty_budget,
         })
@@ -1835,14 +1855,14 @@ impl ObjectFs {
             .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
             .to_string();
 
-        let local = Arc::new(Semaphore::new(MULTIPART_UPLOAD_CONCURRENCY));
+        let local = Arc::new(Semaphore::new(self.multipart_concurrency));
         let mut handles = tokio::task::JoinSet::new();
         let mut part_number = 1i32;
         let mut offset = 0usize;
 
         while offset < data.len() {
-            let end = (offset + MULTIPART_PART_SIZE as usize).min(data.len());
-            // Wait for a local slot so at most MULTIPART_UPLOAD_CONCURRENCY
+            let end = (offset + self.multipart_part_size).min(data.len());
+            // Wait for a local slot so at most self.multipart_concurrency
             // part chunks are materialized in memory at once.
             let slot = local
                 .clone()
@@ -2336,6 +2356,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: "ossfs/".into(),
@@ -2374,6 +2396,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2423,6 +2447,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2467,6 +2493,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2516,6 +2544,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2675,6 +2705,8 @@ mod tests {
             max_dirty_bytes: None,
             verify_crc64: false,
             storage_class: None,
+            multipart_size: None,
+            multipart_concurrency: None,
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
             disk_cache_block_size: None,
@@ -2728,6 +2760,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2786,6 +2820,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2838,6 +2874,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -2889,6 +2927,8 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
@@ -3265,6 +3305,8 @@ mod s3_mock_tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            multipart_part_size: MULTIPART_PART_SIZE as usize,
+            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
         }
@@ -3504,6 +3546,26 @@ mod s3_mock_tests {
         assert_eq!(
             reassembled, data,
             "multipart parts must reassemble to the original bytes in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_large_object_honors_custom_part_size() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.multipart_part_size = 6 * 1024 * 1024;
+
+        let data: Vec<u8> = vec![0xAAu8; 20 * 1024 * 1024];
+        fs.write("/large-custom.bin", &data).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let part_count = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && r.target.to_lowercase().contains("partnumber"))
+            .count();
+        assert_eq!(
+            part_count, 4,
+            "20 MiB with a 6 MiB part size must upload 4 parts"
         );
     }
 

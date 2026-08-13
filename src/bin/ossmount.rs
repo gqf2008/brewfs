@@ -33,7 +33,7 @@ fn usage() -> ! {
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
-                 [--storage-class SC]\n\
+                 [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N] [--negative-cache-ttl N] [--negative-cache-max-entries N] [--stat-cache-ttl N] [--stat-cache-max-entries N]\n\
                  [--metrics-listen ADDR]\n\
@@ -107,6 +107,8 @@ fn parse_args() -> (
     let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
     let mut storage_class: Option<String> = None;
+    let mut multipart_size: Option<usize> = None;
+    let mut multipart_concurrency: Option<usize> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -183,6 +185,20 @@ fn parse_args() -> (
             }
             "--no-verify-crc64" => verify_crc64 = false,
             "--storage-class" => storage_class = Some(iter.next().unwrap_or_else(|| usage())),
+            "--multipart-size" => {
+                let v: usize = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                multipart_size = if v == 0 { None } else { Some(v) };
+            }
+            "--multipart-concurrency" => {
+                let v: usize = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                multipart_concurrency = if v == 0 { None } else { Some(v) };
+            }
             "--disk-cache-dir" => {
                 disk_cache_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage())))
             }
@@ -325,6 +341,8 @@ fn parse_args() -> (
             read_cache_max_bytes,
             verify_crc64,
             storage_class,
+            multipart_size,
+            multipart_concurrency,
         },
         mount_point,
         refresh_secs,
