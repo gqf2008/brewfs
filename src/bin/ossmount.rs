@@ -34,7 +34,7 @@ fn usage() -> ! {
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
-                 [--content-md5]\n\
+                 [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
                  [--disk-cache-reserve-diskfree N] [--disk-cache-free-space-ratio R]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N] [--negative-cache-ttl N] [--negative-cache-max-entries N] [--stat-cache-ttl N] [--stat-cache-max-entries N]\n\
@@ -110,6 +110,9 @@ fn parse_args() -> (
     let mut verify_crc64 = true;
     let mut storage_class: Option<String> = None;
     let mut content_md5 = false;
+    let mut connect_timeout_secs: Option<u64> = None;
+    let mut readwrite_timeout_secs: Option<u64> = None;
+    let mut retries: Option<u32> = None;
     let mut multipart_size: Option<usize> = None;
     let mut multipart_concurrency: Option<usize> = None;
     let mut disk_cache_reserve_diskfree: u64 = 0;
@@ -311,6 +314,29 @@ fn parse_args() -> (
             "--credential-process" => {
                 credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
+            "--connect-timeout" => {
+                connect_timeout_secs = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--readwrite-timeout" => {
+                readwrite_timeout_secs = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--retries" => {
+                retries = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
             "--refresh-secs" => {
                 refresh_secs = iter
                     .next()
@@ -364,6 +390,9 @@ fn parse_args() -> (
             verify_crc64,
             storage_class,
             content_md5,
+            connect_timeout_secs,
+            readwrite_timeout_secs,
+            retries,
             multipart_size,
             multipart_concurrency,
         },

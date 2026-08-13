@@ -106,6 +106,9 @@ region / access key → *Save* → *Mount*.
 | `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |
 | `--max-dirty-bytes N` | Cap aggregate dirty whole-file write buffers (`0` = unlimited) |
 | `--credential-process CMD` | External credential process (standard AWS credential_process JSON) |
+| `--connect-timeout N` | Socket connect timeout in seconds (default: SDK default) |
+| `--readwrite-timeout N` | Read timeout in seconds (default: SDK default) |
+| `--retries N` | Additional retry attempts after the initial request (default: SDK default) |
 | `--no-verify-crc64` | Disable write-path CRC64-ECMA integrity verification (default on) |
 | `--content-md5` | Set Content-MD5 on uploads (cross-S3-compatible integrity fallback) |
 | `--storage-class SC` | Storage class for newly written objects (e.g. `Standard`/`IA`/`Archive` or `STANDARD`/`GLACIER`) |

@@ -95,6 +95,15 @@ pub struct OssConfig {
     /// command is executed on credential refresh and must emit the standard
     /// AWS credential-process JSON. Takes precedence over env/profile creds.
     pub credential_process: Option<String>,
+    /// Socket connect timeout in seconds (mirrors aliyun/ossfs
+    /// `connect_timeout`). `None` keeps the SDK default.
+    pub connect_timeout_secs: Option<u64>,
+    /// Read timeout in seconds (mirrors aliyun/ossfs `readwrite_timeout`).
+    /// `None` keeps the SDK default.
+    pub readwrite_timeout_secs: Option<u64>,
+    /// Additional retry attempts after the initial request (mirrors
+    /// aliyun/ossfs `retries`). `None` keeps the SDK default.
+    pub retries: Option<u32>,
     /// Verify each uploaded object's integrity against the `x-oss-hash-crc64ecma`
     /// header returned by OSS (mirrors aliyun/ossfs `enable_crc64`). The
     /// CRC64-ECMA-182 checksum is computed locally on every object / multipart
@@ -407,6 +416,12 @@ fn min_free_bytes(reserve: u64, ratio: Option<f64>, total: u64) -> u64 {
         .map(|r| (total as f64 * r.clamp(0.0, 0.99)) as u64)
         .unwrap_or(0);
     reserve.max(ratio_bytes)
+}
+
+/// Map `retries` (aliyun/ossfs semantics: additional attempts after the first)
+/// to the AWS SDK `max_attempts` (total attempts: initial + retries).
+fn s3_max_attempts(retries: u32) -> u32 {
+    retries.saturating_add(1).max(1)
 }
 
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
@@ -1103,6 +1118,27 @@ impl ObjectFs {
         }
         if let Some(command) = &config.credential_process {
             builder = builder.credentials_provider(CredentialProcessProvider::new(command.clone()));
+        }
+        if config.connect_timeout_secs.is_some() || config.readwrite_timeout_secs.is_some() {
+            let mut timeout = aws_smithy_types::timeout::TimeoutConfig::builder();
+            if let Some(secs) = config.connect_timeout_secs {
+                timeout = timeout.connect_timeout(Duration::from_secs(secs));
+            }
+            if let Some(secs) = config.readwrite_timeout_secs {
+                timeout = timeout.read_timeout(Duration::from_secs(secs));
+            }
+            let existing = loader
+                .timeout_config()
+                .cloned()
+                .map(aws_smithy_types::timeout::TimeoutConfig::into_builder)
+                .unwrap_or_else(aws_smithy_types::timeout::TimeoutConfig::builder);
+            builder = builder.timeout_config(timeout.take_unset_from(existing).build());
+        }
+        if let Some(retries) = config.retries {
+            builder = builder.retry_config(
+                aws_smithy_types::retry::RetryConfig::standard()
+                    .with_max_attempts(s3_max_attempts(retries)),
+            );
         }
         let client = Client::from_conf(builder.build());
         let (max_upload_bytes, max_dirty_bytes, read_cache_max_bytes) = effective_memory_budgets(
@@ -2695,6 +2731,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_max_attempts_maps_retries_to_total_attempts() {
+        assert_eq!(s3_max_attempts(0), 1);
+        assert_eq!(s3_max_attempts(1), 2);
+        assert_eq!(s3_max_attempts(2), 3);
+        assert_eq!(s3_max_attempts(u32::MAX), u32::MAX);
+    }
+
+    #[test]
     fn min_free_bytes_uses_max_of_reserve_and_ratio() {
         assert_eq!(min_free_bytes(0, None, 1000), 0);
         assert_eq!(min_free_bytes(100, None, 1000), 100);
@@ -2873,6 +2917,9 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
             multipart_size: None,
             multipart_concurrency: None,
             disk_cache_reserve_diskfree: 0,

@@ -91,6 +91,9 @@ ossmount mount --bucket my-bucket \
 | `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
 | `--max-dirty-bytes N` | 限制聚合的整文件写缓冲脏字节数（`0` = 不限制） |
 | `--credential-process CMD` | 外部凭据进程（标准 AWS credential_process JSON） |
+| `--connect-timeout N` | 套接字连接超时（秒，默认用 SDK 默认值） |
+| `--readwrite-timeout N` | 读超时（秒，默认用 SDK 默认值） |
+| `--retries N` | 首次请求后的额外重试次数（默认用 SDK 默认值） |
 | `--no-verify-crc64` | 关闭写路径 CRC64-ECMA 完整性校验（默认开启） |
 | `--content-md5` | 上传时设置 Content-MD5（跨 S3 兼容的完整性兜底） |
 | `--storage-class SC` | 新写对象的存储类型（如 `Standard`/`IA`/`Archive` 或 `STANDARD`/`GLACIER`） |
