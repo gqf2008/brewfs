@@ -35,6 +35,7 @@ fn usage() -> ! {
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
+                 [--notsup-compat-dir]\n\
                  [--disk-cache-reserve-diskfree N] [--disk-cache-free-space-ratio R]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N] [--negative-cache-ttl N] [--negative-cache-max-entries N] [--stat-cache-ttl N] [--stat-cache-max-entries N]\n\
@@ -110,6 +111,7 @@ fn parse_args() -> (
     let mut verify_crc64 = true;
     let mut storage_class: Option<String> = None;
     let mut content_md5 = false;
+    let mut notsup_compat_dir = false;
     let mut connect_timeout_secs: Option<u64> = None;
     let mut readwrite_timeout_secs: Option<u64> = None;
     let mut retries: Option<u32> = None;
@@ -193,6 +195,7 @@ fn parse_args() -> (
             }
             "--no-verify-crc64" => verify_crc64 = false,
             "--content-md5" => content_md5 = true,
+            "--notsup-compat-dir" => notsup_compat_dir = true,
             "--storage-class" => storage_class = Some(iter.next().unwrap_or_else(|| usage())),
             "--multipart-size" => {
                 let v: usize = iter
@@ -390,6 +393,7 @@ fn parse_args() -> (
             verify_crc64,
             storage_class,
             content_md5,
+            notsup_compat_dir,
             connect_timeout_secs,
             readwrite_timeout_secs,
             retries,

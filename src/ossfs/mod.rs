@@ -112,6 +112,9 @@ pub struct OssConfig {
     /// Set the `Content-MD5` header on single PUT and each multipart part
     /// (mirrors aliyun/ossfs `enable_content_md5`).
     pub content_md5: bool,
+    /// Skip legacy `_$folder$` directory-marker objects in listings
+    /// (mirrors aliyun/ossfs `notsup_compat_dir`).
+    pub notsup_compat_dir: bool,
     /// Storage class applied to newly written objects (mirrors aliyun/ossfs
     /// `storage_class`). Common values: `Standard`, `IA`, `Archive` (OSS) or
     /// `STANDARD` / `STANDARD_IA` / `GLACIER` (S3). `None` keeps the bucket
@@ -1089,6 +1092,8 @@ pub struct ObjectFs {
     storage_class: Option<StorageClass>,
     /// Set Content-MD5 on uploads (see [OssConfig::content_md5]).
     content_md5: bool,
+    /// Skip legacy `_$folder$` directory markers (see [OssConfig::notsup_compat_dir]).
+    notsup_compat_dir: bool,
     /// Multipart upload part size in bytes.
     multipart_part_size: usize,
     /// Concurrent in-flight part uploads within a single multipart write.
@@ -1205,6 +1210,7 @@ impl ObjectFs {
             verify_crc64: config.verify_crc64,
             storage_class: config.storage_class.map(|s| StorageClass::from(s.as_str())),
             content_md5: config.content_md5,
+            notsup_compat_dir: config.notsup_compat_dir,
             multipart_part_size: config
                 .multipart_size
                 .unwrap_or(MULTIPART_PART_SIZE as usize)
@@ -1369,6 +1375,9 @@ impl ObjectFs {
                     continue;
                 };
                 if name.is_empty() || name.ends_with('/') {
+                    continue;
+                }
+                if self.notsup_compat_dir && name.ends_with("_$folder$") {
                     continue;
                 }
                 out.push(DirEntry {
@@ -2498,6 +2507,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2539,6 +2549,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2591,6 +2602,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2638,6 +2650,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2690,6 +2703,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2917,6 +2931,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             connect_timeout_secs: None,
             readwrite_timeout_secs: None,
             retries: None,
@@ -2978,6 +2993,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3039,6 +3055,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3094,6 +3111,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3148,6 +3166,7 @@ mod tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3533,6 +3552,7 @@ mod s3_mock_tests {
             verify_crc64: false,
             storage_class: None,
             content_md5: false,
+            notsup_compat_dir: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3638,6 +3658,39 @@ mod s3_mock_tests {
             vec![("sub".to_string(), true), ("a.txt".to_string(), false)]
         );
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_skips_legacy_folder_markers_when_enabled() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("docs/sub_$folder$".into(), false),
+                ("docs/a.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        let mut fs = test_fs(port, 32);
+        fs.notsup_compat_dir = true;
+        let entries = fs.list("/docs").await.expect("list");
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["a.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_keeps_legacy_folder_markers_when_disabled() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("docs/sub_$folder$".into(), false),
+                ("docs/a.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+        let entries = fs.list("/docs").await.expect("list");
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["sub_$folder$".to_string(), "a.txt".to_string()]);
     }
 
     #[tokio::test]

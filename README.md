@@ -111,6 +111,7 @@ region / access key → *Save* → *Mount*.
 | `--retries N` | Additional retry attempts after the initial request (default: SDK default) |
 | `--no-verify-crc64` | Disable write-path CRC64-ECMA integrity verification (default on) |
 | `--content-md5` | Set Content-MD5 on uploads (cross-S3-compatible integrity fallback) |
+| `--notsup-compat-dir` | Skip legacy `_$folder$` directory-marker objects in listings |
 | `--storage-class SC` | Storage class for newly written objects (e.g. `Standard`/`IA`/`Archive` or `STANDARD`/`GLACIER`) |
 | `--multipart-size N` | Multipart part size, bytes (default `8388608`, clamped to `5242880` minimum) |
 | `--multipart-concurrency N` | Concurrent part uploads per multipart write (default `4`) |

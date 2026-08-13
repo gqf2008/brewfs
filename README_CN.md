@@ -96,6 +96,7 @@ ossmount mount --bucket my-bucket \
 | `--retries N` | 首次请求后的额外重试次数（默认用 SDK 默认值） |
 | `--no-verify-crc64` | 关闭写路径 CRC64-ECMA 完整性校验（默认开启） |
 | `--content-md5` | 上传时设置 Content-MD5（跨 S3 兼容的完整性兜底） |
+| `--notsup-compat-dir` | 目录列举时跳过 `_$folder$` 旧目录标记对象 |
 | `--storage-class SC` | 新写对象的存储类型（如 `Standard`/`IA`/`Archive` 或 `STANDARD`/`GLACIER`） |
 | `--multipart-size N` | 分片上传每片大小（默认 `8388608`，最小钳制 `5242880`） |
 | `--multipart-concurrency N` | 单次分片上传的并发片数（默认 `4`） |
