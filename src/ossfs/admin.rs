@@ -65,7 +65,9 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         ("ossfs_upload_bytes_total", s.upload_bytes_total),
         ("ossfs_download_bytes_total", s.download_bytes_total),
         ("ossfs_read_cache_hits_total", s.read_cache_hits),
+        ("ossfs_read_cache_misses_total", s.read_cache_misses),
         ("ossfs_disk_cache_hits_total", s.disk_cache_hits),
+        ("ossfs_disk_cache_misses_total", s.disk_cache_misses),
         ("ossfs_crc64_mismatches_total", s.crc64_mismatches),
     ] {
         out.push_str(&format!("{name} {value}\n"));
@@ -82,6 +84,20 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
     };
     out.push_str(&format!("ossfs_avg_upload_bytes {avg_upload:.2}\n"));
     out.push_str(&format!("ossfs_avg_download_bytes {avg_download:.2}\n"));
+    let read_total = s.read_cache_hits + s.read_cache_misses;
+    let read_hit_ratio = if read_total > 0 {
+        s.read_cache_hits as f64 / read_total as f64
+    } else {
+        0.0
+    };
+    let disk_total = s.disk_cache_hits + s.disk_cache_misses;
+    let disk_hit_ratio = if disk_total > 0 {
+        s.disk_cache_hits as f64 / disk_total as f64
+    } else {
+        0.0
+    };
+    out.push_str(&format!("ossfs_read_cache_hit_ratio {read_hit_ratio:.4}\n"));
+    out.push_str(&format!("ossfs_disk_cache_hit_ratio {disk_hit_ratio:.4}\n"));
     out
 }
 
@@ -107,12 +123,16 @@ mod tests {
             upload_bytes_total: 123,
             download_bytes_total: 456,
             read_cache_hits: 6,
+            read_cache_misses: 14,
             disk_cache_hits: 7,
+            disk_cache_misses: 13,
             crc64_mismatches: 8,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
         assert!(body.contains("ossfs_avg_upload_bytes 24.60\n"));
         assert!(body.contains("ossfs_avg_download_bytes 152.00\n"));
+        assert!(body.contains("ossfs_read_cache_hit_ratio 0.3000\n"));
+        assert!(body.contains("ossfs_disk_cache_hit_ratio 0.3500\n"));
     }
 }

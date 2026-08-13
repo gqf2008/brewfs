@@ -663,7 +663,9 @@ pub struct Metrics {
     upload_bytes_total: AtomicU64,
     download_bytes_total: AtomicU64,
     read_cache_hits: AtomicU64,
+    read_cache_misses: AtomicU64,
     disk_cache_hits: AtomicU64,
+    disk_cache_misses: AtomicU64,
     crc64_mismatches: AtomicU64,
 }
 
@@ -684,7 +686,9 @@ pub struct MetricsSnapshot {
     pub upload_bytes_total: u64,
     pub download_bytes_total: u64,
     pub read_cache_hits: u64,
+    pub read_cache_misses: u64,
     pub disk_cache_hits: u64,
+    pub disk_cache_misses: u64,
     pub crc64_mismatches: u64,
 }
 
@@ -705,7 +709,9 @@ impl Metrics {
             upload_bytes_total: self.upload_bytes_total.load(Ordering::Relaxed),
             download_bytes_total: self.download_bytes_total.load(Ordering::Relaxed),
             read_cache_hits: self.read_cache_hits.load(Ordering::Relaxed),
+            read_cache_misses: self.read_cache_misses.load(Ordering::Relaxed),
             disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
+            disk_cache_misses: self.disk_cache_misses.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
         }
     }
@@ -1170,6 +1176,11 @@ impl ObjectFs {
             return Ok(data);
         }
 
+        if window > 0 {
+            self.metrics
+                .read_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let sequential = if window > 0 {
             let seq = self.read_seq.lock().unwrap();
             seq.get(path) == Some(&offset)
@@ -1233,6 +1244,9 @@ impl ObjectFs {
                 continue;
             }
 
+            self.metrics
+                .disk_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
             let fetched = self
                 .read_range_uncached(key, block_start, block_size as usize)
                 .await?;
