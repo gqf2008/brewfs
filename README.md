@@ -78,6 +78,8 @@ ossmount mount --bucket my-bucket \
 ```
 
 Or use `ossfs-tray`: *Add config* → fill in name / drive / bucket / endpoint /
+
+Run `ossmount --version` to print the version.
 region / access key → *Save* → *Mount*.
 
 ## Configuration

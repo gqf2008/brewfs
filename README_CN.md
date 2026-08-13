@@ -65,6 +65,8 @@ ossmount mount --bucket my-bucket \
 
 或用 `ossfs-tray`：添加配置 → 填名称/盘符/Bucket/Endpoint/Region/密钥 → 保存 → 挂载。
 
+运行 `ossmount --version` 可查看版本号。
+
 ## 配置
 
 `ossmount mount` 参数：
