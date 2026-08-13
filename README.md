@@ -104,6 +104,19 @@ region / access key → *Save* → *Mount*.
 | `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |
 | `--max-dirty-bytes N` | Cap aggregate dirty whole-file write buffers (`0` = unlimited) |
 | `--credential-process CMD` | External credential process (standard AWS credential_process JSON) |
+| `--no-verify-crc64` | Disable write-path CRC64-ECMA integrity verification (default on) |
+| `--disk-cache-dir PATH` | Local disk cache directory for object-range blocks |
+| `--disk-cache-max-bytes N` | Disk cache byte budget; evicts LRU blocks when exceeded |
+| `--disk-cache-block-size N` | Disk-cache block size, bytes (default `4194304`, `0` = default) |
+| `--disk-cache-prefetch-blocks N` | Sequential read background prefetch depth (default `1`, `0` = off) |
+| `--disk-cache-prefetch-concurrency N` | Max concurrent disk-cache prefetch tasks (default `4`) |
+| `--total-mem-limit N` | Total read/write buffer budget; derives upload/dirty/read-cache limits |
+| `--total-mem-read-ratio R` | Fraction of `--total-mem-limit` reserved for read cache, `(0,1)` (default `0.5`) |
+| `--read-cache-max-bytes N` | In-memory read-ahead cache cap, bytes (default `67108864`) |
+| `--metrics-listen ADDR` | Serve Prometheus `/metrics` on `ADDR` |
+| `--metrics-log-interval N` | Emit a metrics snapshot to the log every N seconds (`0` = off) |
+| `--log-dir PATH` | Write daily-rotating `ossmount.log` to PATH |
+| `--log-level LEVEL` | Default tracing filter (info/debug/warn); overridable by `RUST_LOG` |
 
 FUSE directory reads use `readdirplus`, so each directory entry also returns its
 attributes without extra stat round trips.

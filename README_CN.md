@@ -89,6 +89,19 @@ ossmount mount --bucket my-bucket \
 | `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
 | `--max-dirty-bytes N` | 限制聚合的整文件写缓冲脏字节数（`0` = 不限制） |
 | `--credential-process CMD` | 外部凭据进程（标准 AWS credential_process JSON） |
+| `--no-verify-crc64` | 关闭写路径 CRC64-ECMA 完整性校验（默认开启） |
+| `--disk-cache-dir PATH` | 对象区间本地磁盘缓存目录 |
+| `--disk-cache-max-bytes N` | 磁盘缓存字节上限；超出后 LRU 逐出 |
+| `--disk-cache-block-size N` | 磁盘缓存块大小（默认 `4194304`，`0` = 默认） |
+| `--disk-cache-prefetch-blocks N` | 顺序读后台预取深度（默认 `1`，`0` = 关闭） |
+| `--disk-cache-prefetch-concurrency N` | 磁盘缓存预取任务最大并发（默认 `4`） |
+| `--total-mem-limit N` | 总读写缓冲预算，自动派生上传/脏/读缓存上限 |
+| `--total-mem-read-ratio R` | `--total-mem-limit` 中读缓存占比 `(0,1)`（默认 `0.5`） |
+| `--read-cache-max-bytes N` | 内存预读缓存上限（默认 `67108864`） |
+| `--metrics-listen ADDR` | 在 `ADDR` 提供 Prometheus `/metrics` |
+| `--metrics-log-interval N` | 每 N 秒输出一次指标快照日志（`0` = 关闭） |
+| `--log-dir PATH` | 写入按天滚动的 `ossmount.log` |
+| `--log-level LEVEL` | 默认日志过滤级别（info/debug/warn）；可被 `RUST_LOG` 覆盖 |
 
 FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无需额外 stat 往返。
 
