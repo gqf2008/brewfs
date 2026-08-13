@@ -420,6 +420,7 @@ pub struct DirtyPermit {
 struct ReadCacheEntry {
     start: u64,
     data: Vec<u8>,
+    last_used: Instant,
 }
 
 /// Block-oriented on-disk cache for object ranges. Blocks are keyed by
@@ -1606,13 +1607,14 @@ impl ObjectFs {
     /// Return a fully-cached window slice when `[offset, offset+len)` is
     /// entirely inside it.
     fn read_cache_hit(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
-        let cache = self.read_cache.lock().unwrap();
-        let entry = cache.entries.get(path)?;
+        let mut cache = self.read_cache.lock().unwrap();
+        let entry = cache.entries.get_mut(path)?;
         let end = entry.start.checked_add(entry.data.len() as u64)?;
         if offset < entry.start || offset.saturating_add(len as u64) > end {
             return None;
         }
         let start = (offset - entry.start) as usize;
+        entry.last_used = Instant::now();
         Some(entry.data[start..start + len].to_vec())
     }
 
@@ -1629,16 +1631,25 @@ impl ObjectFs {
         while cache.bytes + data.len() > self.read_cache_max_bytes
             || cache.entries.len() >= READ_CACHE_MAX_ENTRIES
         {
-            let key = cache.entries.keys().next().cloned();
+            let key = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone());
             let Some(key) = key else { break };
             if let Some(evicted) = cache.entries.remove(&key) {
                 cache.bytes = cache.bytes.saturating_sub(evicted.data.len());
             }
         }
         cache.bytes += data.len();
-        cache
-            .entries
-            .insert(path.to_string(), ReadCacheEntry { start, data });
+        cache.entries.insert(
+            path.to_string(),
+            ReadCacheEntry {
+                start,
+                data,
+                last_used: Instant::now(),
+            },
+        );
     }
 
     /// Track the end of the most recent read for sequential-prefetch
