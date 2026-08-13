@@ -3722,6 +3722,27 @@ mod s3_mock_tests {
     }
 
     #[tokio::test]
+    async fn list_rate_limit_throttles_recursive_walk() {
+        let (mock, port) =
+            MockS3::start(vec![("docs/a.txt".into(), false)], Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.list_rate = Some(Mutex::new(TokenBucket::new(2.0)));
+
+        // Burst capacity is 2; the 3rd list must wait and therefore count as
+        // throttled. The limiter delays but never drops, so all 3 requests
+        // still reach the mock.
+        for _ in 0..3 {
+            fs.list("/docs").await.expect("list");
+        }
+        let throttled = fs.metrics().list_throttled;
+        assert!(
+            throttled >= 1,
+            "expected at least one throttled list, got {throttled}"
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn stat_probes_implied_dir_with_max_keys_1() {
         let (mock, port) = MockS3::start(
             vec![("implied/f.txt".into(), false)],
