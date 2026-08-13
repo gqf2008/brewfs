@@ -906,54 +906,73 @@ impl FileSystemContext for OssMountContext {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
         }
-        // A spooled handle is materialized back to memory for truncation
-        // (rare); truncate-to-zero just discards the spool file.
-        if context.spool_path.lock().unwrap().is_some() {
-            let path = context.spool_path.lock().unwrap().clone().unwrap();
-            if new_size == 0 {
-                context.spool_path.lock().unwrap().take();
-                let _ = std::fs::remove_file(&path);
-                context.spool_size.store(0, Ordering::Release);
-            } else {
-                let read_path = path.clone();
-                let data = self
-                    .block_on(async move { tokio::fs::read(read_path).await })
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-                context.spool_path.lock().unwrap().take();
-                let _ = std::fs::remove_file(&path);
-                context.spool_size.store(0, Ordering::Release);
-                *context.write_buf.lock().unwrap() = Some(data);
-                context.loaded.store(true, Ordering::Release);
-            }
-        }
-        // Truncate-to-zero needs no original bytes: the empty buffer is
-        // authoritative, so no S3 fetch (covers the save-as/rewrite flow on
-        // handles opened without FILE_OVERWRITE).
+
         if new_size == 0 {
+            // Truncate-to-zero: discard spool and clear the buffer.
+            if let Some(path) = context.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            }
             let mut guard = context.write_buf.lock().unwrap();
             if let Some(buf) = guard.as_mut() {
                 buf.clear();
-                context.loaded.store(true, Ordering::Release);
             }
+            context.loaded.store(true, Ordering::Release);
         } else if !self.load_write_buf(context)? {
             // No write handle: truncation would require a read-modify-write.
             return Err(FspError::from(IoError::from_raw_os_error(
                 WIN32_NOT_SUPPORTED,
             )));
         }
-        self.block_on(self.reserve_dirty(context, new_size as usize))?;
-        let mut guard = context.write_buf.lock().unwrap();
-        let Some(buf) = guard.as_mut() else {
-            return Err(FspError::from(IoError::from_raw_os_error(
-                WIN32_NOT_SUPPORTED,
-            )));
-        };
-        buf.resize(new_size as usize, 0);
+
+        let spooled = context.spool_path.lock().unwrap().is_some();
+        if new_size > WRITE_SPOOL_THRESHOLD as u64 || spooled {
+            // Keep large sizes on disk (sparse) instead of allocating in RAM.
+            let path = if let Some(p) = context.spool_path.lock().unwrap().clone() {
+                p
+            } else {
+                let existing = context.write_buf.lock().unwrap().clone();
+                let path = std::env::temp_dir().join(format!(
+                    "ossfs-spool-{}-{}.tmp",
+                    std::process::id(),
+                    SPOOL_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                self.block_on(async {
+                    let mut file = tokio::fs::File::create(&path).await?;
+                    if let Some(existing) = existing.as_ref() {
+                        tokio::io::AsyncWriteExt::write_all(&mut file, existing).await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                *context.spool_path.lock().unwrap() = Some(path.clone());
+                path
+            };
+            self.block_on(async {
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await?;
+                file.set_len(new_size).await?;
+                Ok::<(), std::io::Error>(())
+            })
+            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            context.spool_size.store(new_size, Ordering::Release);
+        } else {
+            self.block_on(self.reserve_dirty(context, new_size as usize))?;
+            let mut guard = context.write_buf.lock().unwrap();
+            let Some(buf) = guard.as_mut() else {
+                return Err(FspError::from(IoError::from_raw_os_error(
+                    WIN32_NOT_SUPPORTED,
+                )));
+            };
+            buf.resize(new_size as usize, 0);
+        }
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
             name: context.path.clone(),
             is_dir: false,
-            size: buf.len() as u64,
+            size: new_size,
             mtime_secs: 0,
         };
         *file_info = file_info_from(&entry, context.index());
