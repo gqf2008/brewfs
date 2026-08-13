@@ -193,13 +193,20 @@ impl Intercept for Crc64ResponseCapture {
 /// Verify that `expected` matches the CRC64 value returned by OSS. The header
 /// is captured as a side effect of [`Crc64ResponseCapture`] on the operation
 /// that just completed.
-fn check_crc64_response(slot: Arc<Mutex<Option<u64>>>, expected: u64) -> Result<()> {
+fn check_crc64_response(
+    slot: Arc<Mutex<Option<u64>>>,
+    expected: u64,
+    metrics: &Metrics,
+) -> Result<()> {
     let actual = slot.lock().unwrap().take();
     match actual {
         Some(actual) if actual == expected => Ok(()),
-        Some(actual) => anyhow::bail!(
-            "crc64 mismatch: expected {expected}, got {actual} from x-oss-hash-crc64ecma"
-        ),
+        Some(actual) => {
+            metrics.crc64_mismatches.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!(
+                "crc64 mismatch: expected {expected}, got {actual} from x-oss-hash-crc64ecma"
+            )
+        }
         None => anyhow::bail!("x-oss-hash-crc64ecma header missing from upload response"),
     }
 }
@@ -491,6 +498,47 @@ struct ReadCache {
     bytes: usize,
 }
 
+/// Monotonic operation counters exposed by [`ObjectFs::metrics`].
+#[derive(Default)]
+pub struct Metrics {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    s3_gets: AtomicU64,
+    s3_lists: AtomicU64,
+    s3_puts: AtomicU64,
+    read_cache_hits: AtomicU64,
+    disk_cache_hits: AtomicU64,
+    crc64_mismatches: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`Metrics`] counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub reads: u64,
+    pub writes: u64,
+    pub s3_gets: u64,
+    pub s3_lists: u64,
+    pub s3_puts: u64,
+    pub read_cache_hits: u64,
+    pub disk_cache_hits: u64,
+    pub crc64_mismatches: u64,
+}
+
+impl Metrics {
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            reads: self.reads.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            s3_gets: self.s3_gets.load(Ordering::Relaxed),
+            s3_lists: self.s3_lists.load(Ordering::Relaxed),
+            s3_puts: self.s3_puts.load(Ordering::Relaxed),
+            read_cache_hits: self.read_cache_hits.load(Ordering::Relaxed),
+            disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
+            crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct ObjectFs {
     client: Client,
     bucket: String,
@@ -525,6 +573,8 @@ pub struct ObjectFs {
     ignore_fsync: bool,
     /// Verify uploaded objects via x-oss-hash-crc64ecma (see [OssConfig::verify_crc64]).
     verify_crc64: bool,
+    /// Monotonic operation counters.
+    metrics: Metrics,
     /// Dirty-buffer budget for the adapters; None when unlimited.
     dirty_budget: Option<DirtyBudget>,
 }
@@ -587,6 +637,7 @@ impl ObjectFs {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
+            metrics: Metrics::default(),
             dirty_budget,
         })
     }
@@ -602,6 +653,11 @@ impl ObjectFs {
     }
 
     /// Shared dirty-buffer budget for the adapters, when configured.
+    /// Snapshot of monotonic operation counters (for an admin/metrics endpoint).
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
     pub fn dirty_budget(&self) -> Option<DirtyBudget> {
         self.dirty_budget.clone()
     }
@@ -686,6 +742,7 @@ impl ObjectFs {
     }
 
     async fn list_impl(&self, dir: &str) -> Result<Vec<DirEntry>> {
+        self.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
         let prefix = self.list_prefix(dir);
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -909,6 +966,7 @@ impl ObjectFs {
     /// window-sized chunks and cached so subsequent sequential small reads do
     /// not pay an S3 round trip each.
     pub async fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.metrics.reads.fetch_add(1, Ordering::Relaxed);
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -918,6 +976,7 @@ impl ObjectFs {
         if window > 0
             && let Some(data) = self.read_cache_hit(path, offset, len)
         {
+            self.metrics.read_cache_hits.fetch_add(1, Ordering::Relaxed);
             self.note_read_end(path, offset.saturating_add(data.len() as u64));
             return Ok(data);
         }
@@ -972,6 +1031,7 @@ impl ObjectFs {
             let want = (end - pos).min(block_size - within as u64) as usize;
 
             if let Some(block_data) = cache.read_block(key, block) {
+                self.metrics.disk_cache_hits.fetch_add(1, Ordering::Relaxed);
                 if within >= block_data.len() {
                     break;
                 }
@@ -1008,6 +1068,7 @@ impl ObjectFs {
     /// Actual S3 GET for `len` bytes at `offset`. Caller holds a limiter
     /// permit.
     async fn read_range_uncached(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.metrics.s3_gets.fetch_add(1, Ordering::Relaxed);
         let end = offset.saturating_add(len as u64);
         let range = if offset == 0 && len == usize::MAX {
             "bytes=0-".to_string()
@@ -1106,6 +1167,8 @@ impl ObjectFs {
     /// are uploaded via S3 multipart so they are not limited by the single-PUT
     /// object-size cap and can be retried per part.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
+        self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
         self.ensure_writable()?;
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
@@ -1138,7 +1201,7 @@ impl ObjectFs {
         put.send().await.context("s3 put")?;
 
         if let Some(expected) = expected_crc {
-            check_crc64_response(crc_slot, expected)?;
+            check_crc64_response(crc_slot, expected, &self.metrics)?;
         }
         Ok(())
     }
@@ -1270,7 +1333,7 @@ impl ObjectFs {
             return Err(e).context("s3 complete multipart upload");
         }
         if let Some(expected) = expected_crc {
-            check_crc64_response(crc_slot, expected)?;
+            check_crc64_response(crc_slot, expected, &self.metrics)?;
         }
         Ok(())
     }
@@ -1645,6 +1708,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: "ossfs/".into(),
         };
@@ -1670,6 +1734,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1706,6 +1771,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1737,6 +1803,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1773,6 +1840,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1850,6 +1918,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1895,6 +1964,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1934,6 +2004,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -1972,6 +2043,7 @@ mod tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2303,6 +2375,7 @@ mod s3_mock_tests {
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
+            metrics: Metrics::default(),
             dirty_budget: None,
         }
     }
@@ -2585,6 +2658,29 @@ mod s3_mock_tests {
             2,
             "write must invalidate the cached block"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_count_reads_writes_and_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+        ));
+
+        let data = vec![0xAAu8; 1024];
+        mock.set_object("a.bin", data);
+        fs.read_range("/a.bin", 0, 1024).await.expect("read");
+        fs.read_range("/a.bin", 0, 1024).await.expect("read");
+        fs.write("/a.bin", &[1, 2, 3]).await.expect("write");
+
+        let m = fs.metrics();
+        assert_eq!(m.reads, 2);
+        assert_eq!(m.disk_cache_hits, 1);
+        assert_eq!(m.writes, 1);
+        assert_eq!(m.s3_gets, 1);
+        assert_eq!(m.s3_puts, 1);
     }
 
     #[tokio::test]
