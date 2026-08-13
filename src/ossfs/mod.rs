@@ -736,6 +736,8 @@ pub struct Metrics {
     disk_cache_hits: AtomicU64,
     disk_cache_misses: AtomicU64,
     prefetch_started: AtomicU64,
+    prefetch_skipped: AtomicU64,
+    prefetch_failed: AtomicU64,
     crc64_mismatches: AtomicU64,
 }
 
@@ -788,8 +790,8 @@ impl Metrics {
             disk_cache_misses: self.disk_cache_misses.load(Ordering::Relaxed),
             prefetch_started: self.prefetch_started.load(Ordering::Relaxed),
             prefetch_inflight: 0,
-            prefetch_skipped: 0,
-            prefetch_failed: 0,
+            prefetch_skipped: self.prefetch_skipped.load(Ordering::Relaxed),
+            prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
         }
     }
@@ -831,9 +833,8 @@ pub struct ObjectFs {
     prefetch_inflight: Arc<Mutex<HashSet<(String, u64)>>>,
     /// Caps concurrent background prefetch tasks.
     prefetch_sem: Arc<Semaphore>,
-    /// Prefetch dedup skips and failures (owned by background tasks).
-    prefetch_skipped: Arc<AtomicU64>,
-    prefetch_failed: Arc<AtomicU64>,
+
+    /// Prefetch dedup skips and failures are tracked inside [`Metrics`].
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
@@ -841,7 +842,7 @@ pub struct ObjectFs {
     /// Verify uploaded objects via x-oss-hash-crc64ecma (see [OssConfig::verify_crc64]).
     verify_crc64: bool,
     /// Monotonic operation counters.
-    metrics: Metrics,
+    metrics: Arc<Metrics>,
     /// Dirty-buffer budget for the adapters; None when unlimited.
     dirty_budget: Option<DirtyBudget>,
 }
@@ -917,12 +918,10 @@ impl ObjectFs {
             prefetch_sem: Arc::new(Semaphore::new(
                 config.disk_cache_prefetch_concurrency.max(1),
             )),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget,
         })
     }
@@ -942,8 +941,6 @@ impl ObjectFs {
     pub fn metrics(&self) -> MetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
         snapshot.prefetch_inflight = self.prefetch_inflight.lock().unwrap().len();
-        snapshot.prefetch_skipped = self.prefetch_skipped.load(Ordering::Relaxed);
-        snapshot.prefetch_failed = self.prefetch_failed.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -1391,8 +1388,7 @@ impl ObjectFs {
             let key = key.to_string();
             let inflight = Arc::clone(&self.prefetch_inflight);
             let prefetch_sem = Arc::clone(&self.prefetch_sem);
-            let prefetch_skipped = Arc::clone(&self.prefetch_skipped);
-            let prefetch_failed = Arc::clone(&self.prefetch_failed);
+            let metrics = Arc::clone(&self.metrics);
             let first_next = last_block + 1;
             let count = self.disk_cache_prefetch_blocks;
             tokio::spawn(async move {
@@ -1403,7 +1399,7 @@ impl ObjectFs {
                     {
                         let mut set = inflight.lock().unwrap();
                         if !set.insert((key.clone(), block)) {
-                            prefetch_skipped.fetch_add(1, Ordering::Relaxed);
+                            metrics.prefetch_skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                     }
@@ -1420,7 +1416,7 @@ impl ObjectFs {
                         .send()
                         .await
                     else {
-                        prefetch_failed.fetch_add(1, Ordering::Relaxed);
+                        metrics.prefetch_failed.fetch_add(1, Ordering::Relaxed);
                         inflight.lock().unwrap().remove(&(key.clone(), block));
                         return;
                     };
@@ -1432,7 +1428,7 @@ impl ObjectFs {
                         }
                         let _ = cache.write_block(&key, block, &bytes);
                     } else {
-                        prefetch_failed.fetch_add(1, Ordering::Relaxed);
+                        metrics.prefetch_failed.fetch_add(1, Ordering::Relaxed);
                         inflight.lock().unwrap().remove(&(key.clone(), block));
                     }
                     inflight.lock().unwrap().remove(&(key.clone(), block));
@@ -2117,12 +2113,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: "ossfs/".into(),
         };
@@ -2149,12 +2143,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2192,12 +2184,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2230,12 +2220,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2273,12 +2261,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2472,12 +2458,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2524,12 +2508,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2570,12 +2552,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2615,12 +2595,10 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
         };
@@ -2953,12 +2931,10 @@ mod s3_mock_tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            prefetch_skipped: Arc::new(AtomicU64::new(0)),
-            prefetch_failed: Arc::new(AtomicU64::new(0)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
         }
     }
