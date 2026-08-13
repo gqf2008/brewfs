@@ -129,6 +129,9 @@ pub struct OssConfig {
     /// Maximum concurrent background disk-cache prefetch tasks.
     /// `Some(0)` / `None` uses [`DISK_CACHE_PREFETCH_CONCURRENCY`].
     pub disk_cache_prefetch_concurrency: usize,
+    /// Verify object ETag with a HEAD before serving disk-cache blocks.
+    /// Detects remote changes made by other writers.
+    pub disk_cache_verify_etag: bool,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -476,12 +479,25 @@ impl DiskCache {
                 let path = entry.path();
                 let ext = path.extension().and_then(|e| e.to_str());
                 if ext == Some("blk")
+                    || ext == Some("etag")
                     || path.file_name().and_then(|n| n.to_str()) == Some("lru.order")
                 {
                     let _ = std::fs::remove_file(path);
                 }
             }
         }
+    }
+
+    fn etag_path(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{}.etag", fnv1a64(key)))
+    }
+
+    fn read_etag(&self, key: &str) -> Option<String> {
+        std::fs::read_to_string(self.etag_path(key)).ok()
+    }
+
+    fn store_etag(&self, key: &str, etag: &str) {
+        let _ = std::fs::write(self.etag_path(key), etag);
     }
 
     fn order_path(&self) -> PathBuf {
@@ -639,6 +655,7 @@ impl DiskCache {
     }
 
     fn invalidate(&self, key: &str) {
+        let _ = std::fs::remove_file(self.etag_path(key));
         self.order.lock().unwrap().retain(|(k, _)| k != key);
         self.save_order();
         let prefix = format!("{}-", fnv1a64(key));
@@ -659,6 +676,13 @@ impl DiskCache {
     }
 
     fn clear(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("etag") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 let _ = std::fs::remove_file(e.path());
@@ -833,6 +857,8 @@ pub struct ObjectFs {
     prefetch_inflight: Arc<Mutex<HashSet<(String, u64)>>>,
     /// Caps concurrent background prefetch tasks.
     prefetch_sem: Arc<Semaphore>,
+    /// Verify object ETag with HEAD before serving disk-cache blocks.
+    disk_cache_verify_etag: bool,
 
     /// Prefetch dedup skips and failures are tracked inside [`Metrics`].
     /// path -> end offset of its previous read (sequential-read hint).
@@ -918,6 +944,7 @@ impl ObjectFs {
             prefetch_sem: Arc::new(Semaphore::new(
                 config.disk_cache_prefetch_concurrency.max(1),
             )),
+            disk_cache_verify_etag: config.disk_cache_verify_etag,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1322,6 +1349,9 @@ impl ObjectFs {
         fetch_len: usize,
         prefetch_next: bool,
     ) -> Result<Vec<u8>> {
+        if self.disk_cache_verify_etag {
+            self.verify_disk_cache_etag(key).await;
+        }
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
         let block_size = cache.block_size;
         let end = offset.saturating_add(fetch_len as u64);
@@ -1437,6 +1467,30 @@ impl ObjectFs {
         }
 
         Ok(out)
+    }
+
+    async fn verify_disk_cache_etag(&self, key: &str) {
+        let cache = self.disk_cache.as_ref().expect("disk cache enabled");
+        let Ok(resp) = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        else {
+            return;
+        };
+        let Some(etag) = resp.e_tag().map(str::to_string) else {
+            return;
+        };
+        if etag.is_empty() {
+            return;
+        }
+        if cache.read_etag(key).as_deref() != Some(etag.as_str()) {
+            cache.invalidate(key);
+            cache.store_etag(key, &etag);
+        }
     }
 
     /// Actual S3 GET for `len` bytes at `offset`. Caller holds a limiter
@@ -2113,6 +2167,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2143,6 +2198,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2184,6 +2240,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2220,6 +2277,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2261,6 +2319,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2427,6 +2486,7 @@ mod tests {
             disk_cache_block_size: None,
             disk_cache_prefetch_blocks: 1,
             disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
             total_mem_limit: None,
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
@@ -2458,6 +2518,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2508,6 +2569,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2552,6 +2614,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2595,6 +2658,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2662,11 +2726,16 @@ mod s3_mock_tests {
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         get_count: Arc<AtomicUsize>,
         crc64: Mutex<u64>,
+        head_etag: Mutex<String>,
     }
 
     impl MockS3 {
         fn set_object(&self, key: &str, data: Vec<u8>) {
             self.objects.lock().unwrap().insert(key.to_string(), data);
+        }
+
+        fn set_head_etag(&self, v: &str) {
+            *self.head_etag.lock().unwrap() = v.to_string();
         }
 
         fn set_crc64(&self, v: u64) {
@@ -2686,6 +2755,7 @@ mod s3_mock_tests {
                 get_count: Arc::new(AtomicUsize::new(0)),
                 entries: Arc::new(Mutex::new(entries)),
                 crc64: Mutex::new(0),
+                head_etag: Mutex::new("mock-etag".to_string()),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -2841,7 +2911,22 @@ mod s3_mock_tests {
                 body.len()
             )
         } else if method == "HEAD" {
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            let path = target.split('?').next().unwrap_or(&target);
+            let key = path
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            let objects = mock.objects.lock().unwrap();
+            if objects.get(&key).is_some() {
+                let etag = mock.head_etag.lock().unwrap().clone();
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            }
         } else {
             // Plain PutObject / DeleteObject / ...
             let crc = *mock.crc64.lock().unwrap();
@@ -2931,6 +3016,7 @@ mod s3_mock_tests {
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
+            disk_cache_verify_etag: false,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -3228,6 +3314,28 @@ mod s3_mock_tests {
                 .is_some(),
             "sequential read should prefetch the next block"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_cache_etag_verification_invalidates_on_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.disk_cache = Some(Arc::new(
+            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
+                .expect("cache"),
+        ));
+        fs.disk_cache_verify_etag = true;
+
+        let data: Vec<u8> = (0..5 * 1024 * 1024usize).map(|i| (i % 256) as u8).collect();
+        mock.set_object("e.bin", data);
+        fs.read_range("/e.bin", 0, 1024).await.expect("read");
+        fs.read_range("/e.bin", 0, 1024).await.expect("hit");
+        assert_eq!(mock.get_count.load(Ordering::SeqCst), 1);
+
+        mock.set_head_etag("changed");
+        fs.read_range("/e.bin", 0, 1024).await.expect("refetch");
+        assert_eq!(mock.get_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
