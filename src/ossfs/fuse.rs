@@ -864,8 +864,7 @@ impl Filesystem for OssFs {
 
         // Streaming multipart already active: feed it directly.
         {
-            let stream = open_snapshot.stream.clone();
-            let mut guard = self.block_on(async move { stream.lock().await });
+            let mut guard = self.block_on(async { open_snapshot.stream.lock().await });
             if let Some(up) = guard.as_mut() {
                 if let Err(e) = self.block_on(up.write(data)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
