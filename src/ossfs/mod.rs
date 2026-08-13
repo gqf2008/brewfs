@@ -295,6 +295,8 @@ const DIRTY_BUDGET_UNIT: usize = 1 << 20;
 /// Block size for the disk cache. Reads are fetched and stored in these
 /// fixed-size chunks, mirroring aliyun/ossfs cache_block_size.
 const DISK_CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+/// Version for the disk-cache on-disk format (block checksum layout).
+const DISK_CACHE_META_VERSION: u64 = 2;
 /// Unit size for the disk-cache byte budget (whole MiB permits).
 const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 
@@ -448,11 +450,14 @@ impl DiskCache {
 
         let reuse = matches!(
             existing,
-            Some((Some(1), Some(block))) if block == requested
+            Some((Some(DISK_CACHE_META_VERSION), Some(block))) if block == requested
         );
         if !reuse {
             Self::clear_blocks(dir);
-            std::fs::write(&meta, format!("version=1\nblock_size={requested}\n"))?;
+            std::fs::write(
+                &meta,
+                format!("version={DISK_CACHE_META_VERSION}\nblock_size={requested}\n"),
+            )?;
         }
         Ok(requested)
     }
@@ -509,22 +514,31 @@ impl DiskCache {
 
     fn read_block(&self, key: &str, block: u64) -> Option<Vec<u8>> {
         let path = self.path_for(key, block);
-        let raw = std::fs::read(path).ok()?;
-        if raw.len() < 4 {
+        let raw = std::fs::read(&path).ok()?;
+        if raw.len() < 4 + 8 {
             return None;
         }
         let klen = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
-        if raw.len() < 4 + klen || &raw[4..4 + klen] != key.as_bytes() {
+        if raw.len() < 4 + klen + 8 || &raw[4..4 + klen] != key.as_bytes() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let crc = u64::from_le_bytes(raw[4 + klen..4 + klen + 8].try_into().unwrap());
+        let data = raw[4 + klen + 8..].to_vec();
+        if crc64ecma(&data) != crc {
+            let _ = std::fs::remove_file(&path);
             return None;
         }
         self.touch(key, block);
-        Some(raw[4 + klen..].to_vec())
+        Some(data)
     }
 
     fn write_block(&self, key: &str, block: u64, data: &[u8]) -> Result<()> {
-        let mut header = Vec::with_capacity(4 + key.len() + data.len());
+        let mut header = Vec::with_capacity(4 + key.len() + 8 + data.len());
         header.extend_from_slice(&(key.len() as u32).to_le_bytes());
         header.extend_from_slice(key.as_bytes());
+        let crc = crc64ecma(data);
+        header.extend_from_slice(&crc.to_le_bytes());
         header.extend_from_slice(data);
         let final_path = self.path_for(key, block);
         let tmp = self
@@ -2234,6 +2248,25 @@ mod tests {
         let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 1 * 1024 * 1024)
             .expect("reopen");
         assert_eq!(cache.block_size, 1 * 1024 * 1024);
+    }
+
+    #[test]
+    fn disk_cache_detects_corrupt_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
+            .expect("cache");
+        cache
+            .write_block("k", 0, &vec![0x5Au8; 1024])
+            .expect("write");
+
+        let path = cache.path_for("k", 0);
+        let mut raw = std::fs::read(&path).expect("read block");
+        let n = raw.len();
+        raw[n - 1] ^= 0xFF;
+        std::fs::write(&path, raw).expect("corrupt block");
+
+        assert_eq!(cache.read_block("k", 0), None);
+        assert!(!path.exists(), "corrupt block should be removed");
     }
 
     #[tokio::test]
