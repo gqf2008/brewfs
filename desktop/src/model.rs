@@ -102,6 +102,7 @@ impl Profile {
     #[allow(dead_code)]
     pub fn to_ossmount_config(&self) -> String {
         serde_json::to_string_pretty(&serde_json::json!({
+            "mount_point": self.drive,
             "bucket": self.s3_bucket,
             "endpoint": self.s3_endpoint,
             "region": self.s3_region,
@@ -130,10 +131,16 @@ impl Profile {
                 .unwrap_or_default()
                 .to_string()
         };
+        let drive = get_str("mount_point");
+        let drive = if drive.is_empty() {
+            default_drive()
+        } else {
+            drive
+        };
         Ok(Profile {
             name: "导入配置".into(),
             mode: "oss".into(),
-            drive: default_drive(),
+            drive,
             s3_bucket: get_str("bucket"),
             s3_endpoint: get_str("endpoint"),
             s3_region: get_str("region"),
@@ -537,6 +544,7 @@ mod tests {
         let p = oss_profile();
         let json = p.to_ossmount_config();
         let back = Profile::from_ossmount_config(&json).expect("import");
+        assert_eq!(back.drive, p.drive);
         assert_eq!(back.s3_bucket, p.s3_bucket);
         assert_eq!(back.s3_endpoint, p.s3_endpoint);
         assert_eq!(back.s3_region, p.s3_region);

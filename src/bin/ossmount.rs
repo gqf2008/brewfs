@@ -151,6 +151,13 @@ fn expand_config_file(path: &str) -> Result<Vec<String>, String> {
             unsafe { std::env::set_var(var, s) };
             continue;
         }
+        if key == "mount_point" {
+            let Some(s) = val.as_str() else {
+                return Err("config key `mount_point` must be a string".to_string());
+            };
+            args.push(s.to_string());
+            continue;
+        }
         let normalized = key.replace('_', "-");
         if !KNOWN_CONFIG_KEYS.contains(&normalized.as_str()) {
             return Err(format!("unknown config key `{key}`"));
@@ -725,7 +732,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         let obj = value.as_object().expect("object");
         for key in obj.keys() {
-            if key == "access_key_id" || key == "secret_access_key" {
+            if key == "access_key_id" || key == "secret_access_key" || key == "mount_point" {
                 continue;
             }
             let normalized = key.replace('_', "-");
@@ -734,6 +741,22 @@ mod tests {
                 "ossfs.example.json key `{key}` is not a known option"
             );
         }
+    }
+
+    #[test]
+    fn config_file_expands_mount_point_as_positional() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json");
+        std::fs::write(&path, r#"{"bucket":"b","mount_point":"Z:"}"#).unwrap();
+        let args = expand_config_file(path.to_str().unwrap()).unwrap();
+        assert!(
+            args.iter().any(|a| a == "Z:"),
+            "mount_point must be a bare positional"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--mount")),
+            "mount_point must not emit a --mount-point flag"
+        );
     }
 
     #[test]

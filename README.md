@@ -145,6 +145,7 @@ See `ossfs.example.json` in the repo root for a full template (keys are long opt
 
 ```json
 {
+  "mount_point": "Z:",
   "bucket": "my-bucket",
   "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
   "region": "cn-shanghai",

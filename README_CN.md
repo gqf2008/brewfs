@@ -130,6 +130,7 @@ ossmount mount --bucket my-bucket \
 
 ```json
 {
+  "mount_point": "Z:",
   "bucket": "my-bucket",
   "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
   "region": "cn-shanghai",
