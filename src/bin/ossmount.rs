@@ -36,7 +36,7 @@ fn usage() -> ! {
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
                  [--metrics-listen ADDR]\n\
-                 [--log-dir PATH] [--log-level LEVEL]\n\
+                 [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
@@ -66,6 +66,7 @@ fn parse_args() -> (
     Option<String>,
     Option<PathBuf>,
     Option<String>,
+    u64,
 ) {
     let mut bucket = String::new();
     let mut endpoint: Option<String> = None;
@@ -91,6 +92,7 @@ fn parse_args() -> (
     let mut read_cache_max_bytes: Option<usize> = None;
     let mut disk_cache_max_bytes: usize = 0;
     let mut log_dir: Option<PathBuf> = None;
+    let mut metrics_log_interval: u64 = 0;
     let mut log_level: Option<String> = None;
     let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
@@ -177,6 +179,12 @@ fn parse_args() -> (
             "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
             "--log-dir" => log_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage()))),
             "--log-level" => log_level = Some(iter.next().unwrap_or_else(|| usage())),
+            "--metrics-log-interval" => {
+                metrics_log_interval = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
             "--total-mem-limit" => {
                 let v: usize = iter
                     .next()
@@ -247,12 +255,14 @@ fn parse_args() -> (
         metrics_listen,
         log_dir,
         log_level,
+        metrics_log_interval,
     )
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (cfg, mount_point, refresh_secs, metrics_listen, log_dir, log_level) = parse_args();
+    let (cfg, mount_point, refresh_secs, metrics_listen, log_dir, log_level, metrics_log_interval) =
+        parse_args();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level.as_deref().unwrap_or("info")));
     if let Some(dir) = log_dir {
@@ -266,6 +276,35 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
     let fs = Arc::new(ObjectFs::connect(cfg).await?);
+    if metrics_log_interval > 0 {
+        let metrics_fs = Arc::clone(&fs);
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(metrics_log_interval));
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                let m = metrics_fs.metrics();
+                tracing::info!(
+                    reads = m.reads,
+                    writes = m.writes,
+                    s3_gets = m.s3_gets,
+                    s3_lists = m.s3_lists,
+                    s3_puts = m.s3_puts,
+                    s3_errors = m.s3_errors,
+                    s3_get_errors = m.s3_get_errors,
+                    s3_list_errors = m.s3_list_errors,
+                    s3_put_errors = m.s3_put_errors,
+                    s3_delete_errors = m.s3_delete_errors,
+                    s3_multipart_errors = m.s3_multipart_errors,
+                    read_cache_hits = m.read_cache_hits,
+                    disk_cache_hits = m.disk_cache_hits,
+                    crc64_mismatches = m.crc64_mismatches,
+                    "ossfs metrics snapshot"
+                );
+            }
+        });
+    }
     if let Some(addr) = metrics_listen {
         let metrics_fs = Arc::clone(&fs);
         tokio::spawn(async move {
