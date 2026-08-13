@@ -26,7 +26,8 @@ use tokio::runtime::Handle;
 use tracing::{info, warn};
 
 use super::{
-    DirEntry, DirtyBudget, DirtyPermit, MountAttr, ObjectFs, effective_mode, effective_owner,
+    DirEntry, DirtyBudget, DirtyPermit, MountAttr, ObjectFs, StreamingUpload, effective_mode,
+    effective_owner,
 };
 
 /// Attribute/entry cache lifetime. Object storage has no change notifications,
@@ -43,8 +44,6 @@ const NAME_MAX: u32 = 255;
 /// Above this size a write handle spills its buffer to a temp file so a large
 /// file copy cannot exhaust process memory.
 const WRITE_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
-/// Monotonic suffix for spool temp-file names.
-static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Stable per-path inode: FNV-1a 64-bit of the POSIX path. Deterministic so a
 /// path always maps to the same inode, mirroring the WinFsp adapter's
@@ -104,19 +103,10 @@ struct OpenFile {
     budget_units: Arc<AtomicUsize>,
     /// RAII permits for every reservation made by this handle.
     budget_permits: Arc<Mutex<Vec<DirtyPermit>>>,
-    /// When a write buffer grows beyond [`WRITE_SPOOL_THRESHOLD`], it is
-    /// spilled to this temp file and subsequent writes append there.
-    spool_path: Option<PathBuf>,
-    /// Logical size of the spooled file.
-    spool_size: u64,
-}
-
-/// Resize an open handle's write buffer (truncate/extend).
-fn set_size_buf(open: &mut OpenFile, new_size: u64) {
-    if let Some(buf) = open.write_buf.as_mut() {
-        buf.resize(new_size as usize, 0);
-        open.dirty = true;
-    }
+    /// Streaming multipart upload for large files (write-while-upload).
+    stream: Arc<tokio::sync::Mutex<Option<StreamingUpload>>>,
+    /// Current logical file size (set by setattr/truncate and write).
+    logical_size: u64,
 }
 
 /// FUSE filesystem bridging kernel requests to [`ObjectFs`].
@@ -268,8 +258,8 @@ impl OssFs {
                 .values()
                 .find(|o| o.path == path && o.loaded)
                 .map(|o| {
-                    if let Some(spool) = &o.spool_path {
-                        Some(o.spool_size)
+                    if o.logical_size > 0 {
+                        Some(o.logical_size)
                     } else {
                         o.write_buf.as_ref().map(|b| b.len() as u64)
                     }
@@ -282,34 +272,19 @@ impl OssFs {
         self.attr_of(path, &entry)
     }
 
-    /// Flush a dirty open file to the object store. Spooled handles stream
-    /// from their temp file; small handles upload the in-memory buffer.
+    /// Flush a dirty open file to the object store. A streaming handle
+    /// completes its multipart upload; a small handle uploads its buffer.
     fn flush_open(&self, open: &OpenFile) -> anyhow::Result<()> {
         if !open.dirty {
             return Ok(());
         }
-        if let Some(spool) = &open.spool_path {
-            self.block_on(self.fs.write_from_file(&open.path, spool))?;
-            let _ = std::fs::remove_file(spool);
+        if let Some(up) = self.block_on(async { open.stream.lock().await.take() }) {
+            self.block_on(up.finish())?;
             return Ok(());
         }
         if let Some(buf) = open.write_buf.as_ref() {
             self.block_on(self.fs.write(&open.path, buf))?;
         }
-        Ok(())
-    }
-
-    /// Materialize a spooled handle back into its in-memory buffer, used by
-    /// truncate/extend (rare on large files).
-    fn materialize_spool(&self, open: &mut OpenFile) -> anyhow::Result<()> {
-        let Some(spool) = open.spool_path.take() else {
-            return Ok(());
-        };
-        let data = self.block_on(tokio::fs::read(&spool))?;
-        let _ = std::fs::remove_file(&spool);
-        open.spool_size = 0;
-        open.write_buf = Some(data);
-        open.loaded = true;
         Ok(())
     }
 
@@ -457,24 +432,13 @@ impl Filesystem for OssFs {
                     let mut guard = self.files.lock().unwrap();
                     if let Some(open) = guard.get_mut(&fh.0)
                         && open.path == path
-                        && open.spool_path.is_some()
+                        && open.write_buf.is_some()
                     {
-                        if let Err(e) = self.materialize_spool(open) {
-                            warn!(path = %path, error = ?e, "ossfs setattr spool materialize failed");
-                            reply.error(Errno::EIO);
-                            return;
-                        }
+                        open.logical_size = new_size;
+                        open.dirty = true;
+                        handled = true;
                     }
                 }
-                let mut guard = self.files.lock().unwrap();
-                if let Some(open) = guard.get_mut(&fh.0)
-                    && open.path == path
-                    && open.write_buf.is_some()
-                {
-                    set_size_buf(open, new_size);
-                    handled = true;
-                }
-                drop(guard);
             }
             if !handled && let Err(e) = self.truncate_unopened(&path, new_size) {
                 warn!(path = %path, error = ?e, "ossfs setattr truncate failed");
@@ -710,8 +674,8 @@ impl Filesystem for OssFs {
                 dirty: false,
                 budget_units: Arc::new(AtomicUsize::new(0)),
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
-                spool_path: None,
-                spool_size: 0,
+                stream: Arc::new(tokio::sync::Mutex::new(None)),
+                logical_size: 0,
             },
         );
         reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -792,8 +756,8 @@ impl Filesystem for OssFs {
                 dirty: false,
                 budget_units: Arc::new(AtomicUsize::new(0)),
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
-                spool_path: None,
-                spool_size: 0,
+                stream: Arc::new(tokio::sync::Mutex::new(None)),
+                logical_size: 0,
             },
         );
         reply.created(
@@ -821,25 +785,6 @@ impl Filesystem for OssFs {
             reply.error(Errno::EBADF);
             return;
         };
-        if let Some(spool) = &open.spool_path {
-            let spool = spool.clone();
-            let mut buf = vec![0u8; size as usize];
-            match self.block_on(async move {
-                let mut file = tokio::fs::File::open(&spool).await?;
-                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset)).await?;
-                tokio::io::AsyncReadExt::read(&mut file, &mut buf).await
-            }) {
-                Ok(n) => {
-                    reply.data(&buf[..n]);
-                    return;
-                }
-                Err(e) => {
-                    warn!(path = %open.path, offset = offset, error = ?e, "ossfs spool read failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-        }
         if let Some(buf) = open.write_buf
             && open.loaded
         {
@@ -917,73 +862,69 @@ impl Filesystem for OssFs {
             return;
         }
 
-        // Spill to disk once the in-memory threshold is exceeded.
-        let (spooled_before, existing_buf) = {
-            let guard = self.files.lock().unwrap();
-            match guard.get(&fh.0) {
-                Some(o) => (o.spool_path.clone(), o.write_buf.clone()),
-                None => {
-                    drop(guard);
-                    reply.error(Errno::EBADF);
+        // Streaming multipart already active: feed it directly.
+        {
+            let stream = open_snapshot.stream.clone();
+            let mut guard = self.block_on(async move { stream.lock().await });
+            if let Some(up) = guard.as_mut() {
+                if let Err(e) = self.block_on(up.write(data)) {
+                    warn!(path = %path, error = ?e, "ossfs stream write failed");
+                    reply.error(Errno::EIO);
                     return;
                 }
-            }
-        };
-        if spooled_before.is_none() && new_size > WRITE_SPOOL_THRESHOLD {
-            let spool_path = std::env::temp_dir().join(format!(
-                "ossfs-spool-{}-{}.tmp",
-                std::process::id(),
-                SPOOL_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            let existing = existing_buf.clone();
-            if let Err(e) = self.block_on(async move {
-                let mut file = tokio::fs::File::create(&spool_path).await?;
-                if let Some(existing) = existing {
-                    tokio::io::AsyncWriteExt::write_all(&mut file, &existing).await?;
+                let end = offset.saturating_add(data.len() as u64);
+                let mut files = self.files.lock().unwrap();
+                if let Some(o) = files.get_mut(&fh.0) {
+                    if end > o.logical_size {
+                        o.logical_size = end;
+                    }
+                    o.dirty = true;
                 }
-                Ok::<(), std::io::Error>(())
-            }) {
-                warn!(path = %path, error = ?e, "ossfs spool create failed");
-                reply.error(Errno::EIO);
+                reply.written(data.len() as u32);
                 return;
-            }
-            let mut guard = self.files.lock().unwrap();
-            if let Some(open) = guard.get_mut(&fh.0) {
-                open.spool_path = Some(spool_path);
-                open.spool_size = existing_buf.as_ref().map(|b| b.len() as u64).unwrap_or(0);
             }
         }
 
-        let spool_now = self
-            .files
-            .lock()
-            .unwrap()
-            .get(&fh.0)
-            .and_then(|o| o.spool_path.clone());
-        if let Some(spool) = spool_now {
-            let start = offset;
-            if let Err(e) = self.block_on(async move {
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&spool)
-                    .await?;
-                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await?;
-                tokio::io::AsyncWriteExt::write_all(&mut file, data).await?;
-                Ok::<(), std::io::Error>(())
-            }) {
-                warn!(path = %path, error = ?e, "ossfs spool write failed");
+        // Switch to streaming multipart once the buffer exceeds the in-memory
+        // threshold.
+        if new_size > WRITE_SPOOL_THRESHOLD {
+            let existing = open_snapshot.write_buf.clone();
+            let mut up = match self.block_on(self.fs.begin_streaming_upload(&path)) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(path = %path, error = ?e, "ossfs begin streaming failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            if let Some(existing) = &existing
+                && !existing.is_empty()
+            {
+                if let Err(e) = self.block_on(up.write(existing)) {
+                    warn!(path = %path, error = ?e, "ossfs stream write failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+            if let Err(e) = self.block_on(up.write(data)) {
+                warn!(path = %path, error = ?e, "ossfs stream write failed");
                 reply.error(Errno::EIO);
                 return;
             }
-            let end = start + data.len() as u64;
-            let mut guard = self.files.lock().unwrap();
-            if let Some(open) = guard.get_mut(&fh.0) {
-                if end > open.spool_size {
-                    open.spool_size = end;
-                }
-                open.dirty = true;
+            let stream = open_snapshot.stream.clone();
+            self.block_on(async move { *stream.lock().await = Some(up) });
+            let mut files = self.files.lock().unwrap();
+            if let Some(o) = files.get_mut(&fh.0) {
+                o.write_buf = Some(Vec::new());
+                o.loaded = true;
+                o.logical_size = new_size as u64;
+                o.dirty = true;
             }
-        } else {
+            reply.written(data.len() as u32);
+            return;
+        }
+
+        {
             let mut guard = self.files.lock().unwrap();
             let Some(open) = guard.get_mut(&fh.0) else {
                 drop(guard);
@@ -1025,11 +966,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
-            if open.spool_path.is_some() {
-                o.spool_path = None;
-                o.spool_size = 0;
+            if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;
+                o.logical_size = 0;
             }
         }
         reply.ok();
@@ -1080,11 +1020,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
-            if open.spool_path.is_some() {
-                o.spool_path = None;
-                o.spool_size = 0;
+            if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;
+                o.logical_size = 0;
             }
         }
         reply.ok();
