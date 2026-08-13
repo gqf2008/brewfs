@@ -28,7 +28,7 @@ use ossfs::{ObjectFs, OssConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ossmount [mount] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
+        "usage: ossmount [mount] [--config PATH] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--allow-other] [--umask M]\n\
@@ -47,7 +47,10 @@ fn usage() -> ! {
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
-         env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY"
+         env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n\
+         --config PATH:  JSON config file; keys are long option names (CLI\n\
+                          args override file values). access_key_id /\n\
+                          secret_access_key keys set the AWS env creds."
     );
     std::process::exit(2);
 }
@@ -63,6 +66,59 @@ fn parse_mode(s: &str) -> Option<u32> {
         return u32::from_str_radix(s, 8).ok();
     }
     s.parse().ok()
+}
+
+/// Expand a JSON config file into CLI arguments. Each top-level key maps
+/// to a `--key` option: `true` emits a bare switch flag, `false` skips it,
+/// and other values are emitted as `--key value`. The credential keys
+/// `access_key_id` / `secret_access_key` are applied to the environment.
+fn expand_config_file(path: &str) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("ossmount: cannot read config file {path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ossmount: invalid config JSON in {path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        eprintln!("ossmount: config file {path} must contain a JSON object");
+        std::process::exit(2);
+    };
+    let mut args = Vec::new();
+    for (key, val) in obj {
+        if key == "access_key_id" || key == "secret_access_key" {
+            if let Some(s) = val.as_str() {
+                let var = if key == "access_key_id" {
+                    "AWS_ACCESS_KEY_ID"
+                } else {
+                    "AWS_SECRET_ACCESS_KEY"
+                };
+                // SAFETY: config expansion runs during arg parsing, before any threads spawn.
+                unsafe { std::env::set_var(var, s) };
+            }
+            continue;
+        }
+        match val {
+            serde_json::Value::Bool(true) => args.push(format!("--{}", key.replace('_', "-"))),
+            serde_json::Value::Bool(false) => {}
+            other => {
+                let s = match other {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                args.push(format!("--{}", key.replace('_', "-")));
+                args.push(s);
+            }
+        }
+    }
+    args
 }
 
 fn parse_args() -> (
@@ -126,10 +182,26 @@ fn parse_args() -> (
     let mut disk_cache_free_space_ratio: Option<f64> = None;
     let mut mount_point: Option<PathBuf> = None;
 
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("mount") {
-        args.remove(0);
+    let mut raw: Vec<String> = env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("mount") {
+        raw.remove(0);
     }
+    // Expand --config/-c JSON files first; CLI args are appended after so
+    // they override file values.
+    let mut args: Vec<String> = Vec::new();
+    let mut cli_args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == "--config" || raw[i] == "-c" {
+            let path = raw.get(i + 1).cloned().unwrap_or_else(|| usage());
+            args.extend(expand_config_file(&path));
+            i += 2;
+        } else {
+            cli_args.push(raw[i].clone());
+            i += 1;
+        }
+    }
+    args.extend(cli_args);
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -513,7 +585,33 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mode;
+    use super::{expand_config_file, parse_mode};
+
+    #[test]
+    fn config_file_expands_flags_and_skips_false_switches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json");
+        std::fs::write(
+            &path,
+            r#"{"bucket":"b","read_only":true,"force_path_style":false,"max-concurrent-requests":64}"#,
+        )
+        .unwrap();
+        let args = expand_config_file(path.to_str().unwrap());
+        assert_eq!(
+            args.len(),
+            5,
+            "one bool switch skipped, three keys expanded"
+        );
+        let has = |f: &str| args.iter().any(|a| a == f);
+        assert!(has("--bucket"));
+        assert!(has("--read-only"));
+        assert!(has("--max-concurrent-requests"));
+        assert!(!has("--force-path-style"));
+        for (flag, val) in [("--bucket", "b"), ("--max-concurrent-requests", "64")] {
+            let i = args.iter().position(|a| a == flag).expect("flag present");
+            assert_eq!(args[i + 1], val, "value must follow its flag");
+        }
+    }
 
     #[test]
     fn parses_octal_and_decimal_modes() {

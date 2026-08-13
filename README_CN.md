@@ -73,6 +73,7 @@ ossmount mount --bucket my-bucket \
 
 | 参数 | 含义 |
 |---|---|
+| `--config PATH` | JSON 配置文件（键为长选项名，CLI 参数覆盖文件；`access_key_id`/`secret_access_key` 写入 AWS 环境变量） |
 | `--bucket` | 桶名（必填） |
 | `--endpoint` | S3 兼容端点 URL（必填） |
 | `--region` | 区域（默认 `us-east-1`） |
@@ -123,6 +124,18 @@ ossmount mount --bucket my-bucket \
 | `--metrics-log-interval N` | 每 N 秒输出一次指标快照日志（`0` = 关闭） |
 | `--log-dir PATH` | 写入按天滚动的 `ossmount.log` |
 | `--log-level LEVEL` | 默认日志过滤级别（info/debug/warn）；可被 `RUST_LOG` 覆盖 |
+
+```json
+{
+  "bucket": "my-bucket",
+  "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+  "region": "cn-shanghai",
+  "read_only": false,
+  "max-concurrent-requests": 64,
+  "access_key_id": "AK",
+  "secret_access_key": "SK"
+}
+```
 
 FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无需额外 stat 往返。
 

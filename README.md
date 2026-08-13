@@ -88,6 +88,7 @@ region / access key → *Save* → *Mount*.
 
 | Option | Meaning |
 |---|---|
+| `--config PATH` | JSON config file (keys are long option names; CLI args override file values; `access_key_id`/`secret_access_key` set AWS env creds) |
 | `--bucket` | Bucket name (required) |
 | `--endpoint` | S3-compatible endpoint URL (required) |
 | `--region` | Region (default `us-east-1`) |
@@ -138,6 +139,18 @@ region / access key → *Save* → *Mount*.
 | `--metrics-log-interval N` | Emit a metrics snapshot to the log every N seconds (`0` = off) |
 | `--log-dir PATH` | Write daily-rotating `ossmount.log` to PATH |
 | `--log-level LEVEL` | Default tracing filter (info/debug/warn); overridable by `RUST_LOG` |
+
+```json
+{
+  "bucket": "my-bucket",
+  "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+  "region": "cn-shanghai",
+  "read_only": false,
+  "max-concurrent-requests": 64,
+  "access_key_id": "AK",
+  "secret_access_key": "SK"
+}
+```
 
 FUSE directory reads use `readdirplus`, so each directory entry also returns its
 attributes without extra stat round trips.
