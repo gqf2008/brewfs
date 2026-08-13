@@ -325,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
                     reads = m.reads,
                     writes = m.writes,
                     s3_gets = m.s3_gets,
+                    s3_heads = m.s3_heads,
                     s3_lists = m.s3_lists,
                     s3_puts = m.s3_puts,
                     s3_errors = m.s3_errors,

@@ -749,6 +749,7 @@ pub struct Metrics {
     reads: AtomicU64,
     writes: AtomicU64,
     s3_gets: AtomicU64,
+    s3_heads: AtomicU64,
     s3_lists: AtomicU64,
     s3_puts: AtomicU64,
     s3_errors: AtomicU64,
@@ -775,6 +776,7 @@ pub struct MetricsSnapshot {
     pub reads: u64,
     pub writes: u64,
     pub s3_gets: u64,
+    pub s3_heads: u64,
     pub s3_lists: u64,
     pub s3_puts: u64,
     pub s3_errors: u64,
@@ -802,6 +804,7 @@ impl Metrics {
             reads: self.reads.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
             s3_gets: self.s3_gets.load(Ordering::Relaxed),
+            s3_heads: self.s3_heads.load(Ordering::Relaxed),
             s3_lists: self.s3_lists.load(Ordering::Relaxed),
             s3_puts: self.s3_puts.load(Ordering::Relaxed),
             s3_errors: self.s3_errors.load(Ordering::Relaxed),
@@ -1202,6 +1205,7 @@ impl ObjectFs {
     /// HEAD, then prefix probe as a last resort). Caller must hold a limiter
     /// permit.
     async fn stat_uncached_impl(&self, path: &str) -> Result<Option<DirEntry>> {
+        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
         if path == "/" {
             return Ok(Some(DirEntry {
                 name: String::new(),
@@ -1480,6 +1484,7 @@ impl ObjectFs {
     }
 
     async fn verify_disk_cache_etag(&self, key: &str) {
+        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
         {
             let checked = self.etag_checked.lock().unwrap();
             if let Some(at) = checked.get(key) {
