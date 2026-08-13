@@ -105,6 +105,7 @@ region / access key → *Save* → *Mount*.
 | `--no-rename-dir` | Disable recursive directory rename |
 | `--rename-dir-limit N` | Max objects copied by one directory rename (default `2000000`, `0` = unlimited) |
 | `--max-concurrent-requests N` | Cap on in-flight S3 requests (default `32`, `0` = default) |
+| `--list-rate-limit R` | Directory-enumeration (ListObjects) rate cap, calls/sec (default `0` = unlimited) |
 | `--max-upload-bytes N` | Cap aggregate in-flight write bytes (`0` = unlimited) |
 | `--read-ahead-bytes N` | Sequential-read prefetch window, bytes (default `8388608`, `0` = off) |
 | `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |

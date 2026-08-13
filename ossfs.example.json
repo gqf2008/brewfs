@@ -14,6 +14,7 @@
   "no-rename-dir": false,
   "rename-dir-limit": 2000000,
   "max-concurrent-requests": 32,
+  "list-rate-limit": 0,
   "max-upload-bytes": 0,
   "read-ahead-bytes": 8388608,
   "no-ignore-fsync": false,

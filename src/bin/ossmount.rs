@@ -33,7 +33,7 @@ fn usage() -> ! {
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--allow-other] [--umask M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
-                 [--max-concurrent-requests N]\n\
+                 [--max-concurrent-requests N] [--list-rate-limit R]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
@@ -88,6 +88,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rename-dir-limit",
     "max-upload-bytes",
     "max-concurrent-requests",
+    "list-rate-limit",
     "read-ahead-bytes",
     "no-ignore-fsync",
     "max-dirty-bytes",
@@ -200,6 +201,7 @@ fn parse_args() -> (
     let mut allow_rename_dir = true;
     let mut rename_dir_limit: Option<u64> = Some(2_000_000);
     let mut max_concurrent_requests: Option<usize> = None;
+    let mut list_rate_limit: Option<f64> = None;
     let mut max_upload_bytes: Option<usize> = None;
     let mut read_ahead_bytes: Option<usize> = Some(8 * 1024 * 1024);
     let mut ignore_fsync = true;
@@ -314,6 +316,14 @@ fn parse_args() -> (
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
                 max_concurrent_requests = if v == 0 { None } else { Some(v) };
+            }
+            "--list-rate-limit" => {
+                list_rate_limit = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|r| *r > 0.0)
+                        .unwrap_or_else(|| usage()),
+                );
             }
             "--rename-dir-limit" => {
                 let v: u64 = iter
@@ -516,6 +526,7 @@ fn parse_args() -> (
             force_path_style,
             prefix,
             max_concurrent_requests,
+            list_rate_limit,
             read_only,
             uid,
             gid,

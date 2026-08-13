@@ -55,6 +55,9 @@ pub struct OssConfig {
     /// default [`MAX_CONCURRENT_S3_REQUESTS`]; explicit values let high-RTT
     /// or low-memory mounts tune the bound (0/None = default, never disable).
     pub max_concurrent_requests: Option<usize>,
+    /// Cap on directory-enumeration (`ListObjects`) rate in calls/second
+    /// (mirrors a readdir soft-limit). `None`/`Some(0)` disables it.
+    pub list_rate_limit: Option<f64>,
     /// Mount the filesystem read-only: reject write / mkdir / delete / rename.
     pub read_only: bool,
     /// POSIX ownership / permission defaults applied to every object by the
@@ -523,6 +526,42 @@ impl DirtyBudget {
 /// releases the reserved MiB permits back to the budget.
 pub struct DirtyPermit {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Token-bucket rate limiter for directory enumerations. Bounds how
+/// fast a recursive scan (`find /`) can drive `ListObjects` calls while a
+/// single normal directory read is served immediately (burst capacity).
+struct TokenBucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: f64) -> Self {
+        let burst = rate.max(1.0);
+        Self {
+            rate,
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    /// Refill and reserve one token. `None` means a token is available now;
+    /// `Some(dur)` is how long to wait before retrying.
+    fn reserve(&mut self, now: Instant) -> Option<Duration> {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            None
+        } else {
+            Some(Duration::from_secs_f64((1.0 - self.tokens) / self.rate))
+        }
+    }
 }
 
 /// One cached read-ahead window for a path.
@@ -1049,6 +1088,8 @@ pub struct ObjectFs {
     negative: Mutex<HashMap<String, Instant>>,
     /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
     limiter: Arc<Semaphore>,
+    /// Optional directory-enumeration rate limiter (see [OssConfig::list_rate_limit]).
+    list_rate: Option<Mutex<TokenBucket>>,
     /// Read-only mount: reject all mutations.
     read_only: bool,
     /// Open the FUSE mount to all users (see [OssConfig::allow_other]).
@@ -1185,6 +1226,10 @@ impl ObjectFs {
             limiter: Arc::new(Semaphore::new(effective_max_concurrent_requests(
                 config.max_concurrent_requests,
             ))),
+            list_rate: config
+                .list_rate_limit
+                .filter(|r| *r > 0.0)
+                .map(|r| Mutex::new(TokenBucket::new(r))),
             read_only: config.read_only,
             allow_other: config.allow_other,
             mount_attr: MountAttr {
@@ -1335,8 +1380,19 @@ impl ObjectFs {
 
     /// List the immediate children of `dir`.
     pub async fn list(&self, dir: &str) -> Result<Vec<DirEntry>> {
+        self.acquire_list_permit().await;
         let _permit = self.acquire().await?;
         self.list_impl(dir).await
+    }
+
+    /// Await a token from the directory-enumeration rate limiter, if set.
+    async fn acquire_list_permit(&self) {
+        let Some(rate) = &self.list_rate else { return };
+        loop {
+            let wait = rate.lock().unwrap().reserve(Instant::now());
+            let Some(wait) = wait else { return };
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn list_impl(&self, dir: &str) -> Result<Vec<DirEntry>> {
@@ -2498,6 +2554,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2541,6 +2598,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2597,6 +2655,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: true,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2646,6 +2705,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2700,6 +2760,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2919,6 +2980,20 @@ mod tests {
         assert!(!path.exists(), "corrupt block should be removed");
     }
 
+    #[test]
+    fn token_bucket_limits_burst_and_refills() {
+        let mut b = TokenBucket::new(10.0);
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            assert!(b.reserve(t0).is_none(), "burst allows 10 immediate tokens");
+        }
+        assert!(b.reserve(t0).is_some(), "11th token must wait");
+        let t1 = t0 + Duration::from_secs_f64(0.2);
+        assert!(b.reserve(t1).is_none());
+        assert!(b.reserve(t1).is_none());
+        assert!(b.reserve(t1).is_some());
+    }
+
     #[tokio::test]
     async fn dirty_budget_acquire_and_drop_releases_permits() {
         let budget = DirtyBudget::new(2 * DIRTY_BUDGET_UNIT).unwrap();
@@ -2938,6 +3013,7 @@ mod tests {
             force_path_style: false,
             prefix: "ossfs".into(),
             max_concurrent_requests: None,
+            list_rate_limit: None,
             read_only: false,
             uid: 0,
             gid: 0,
@@ -2993,6 +3069,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3056,6 +3133,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3113,6 +3191,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3169,6 +3248,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3556,6 +3636,7 @@ mod s3_mock_tests {
             limiter: Arc::new(Semaphore::new(limit)),
             read_only: false,
             allow_other: false,
+            list_rate: None,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
