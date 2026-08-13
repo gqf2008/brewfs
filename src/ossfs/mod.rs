@@ -120,6 +120,9 @@ pub struct OssConfig {
     /// uses the default [`READ_CACHE_MAX_BYTES`].
     pub read_cache_max_bytes: Option<usize>,
     pub disk_cache_max_bytes: usize,
+    /// Disk-cache block size in bytes. `Some(0)` / `None` uses
+    /// [`DISK_CACHE_BLOCK_SIZE`].
+    pub disk_cache_block_size: Option<usize>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -401,6 +404,7 @@ struct ReadCacheEntry {
 struct DiskCache {
     dir: PathBuf,
     max_bytes: u64,
+    block_size: u64,
     used: AtomicU64,
     /// In-process LRU order of cached blocks: `(key, block)` with the most
     /// recently used entry at the back. Populated lazily on read/write; a
@@ -409,13 +413,14 @@ struct DiskCache {
 }
 
 impl DiskCache {
-    fn new(dir: PathBuf, max_bytes: usize) -> Result<Self> {
+    fn new(dir: PathBuf, max_bytes: usize, block_size: usize) -> Result<Self> {
         let max_bytes =
             max_bytes.div_ceil(DISK_CACHE_BUDGET_UNIT) as u64 * DISK_CACHE_BUDGET_UNIT as u64;
         std::fs::create_dir_all(&dir).context("create disk cache dir")?;
         let cache = Self {
             dir,
             max_bytes,
+            block_size: (block_size.max(1)) as u64,
             used: AtomicU64::new(0),
             order: Mutex::new(VecDeque::new()),
         };
@@ -795,6 +800,9 @@ impl ObjectFs {
             Some(dir) if config.disk_cache_max_bytes > 0 => Some(Arc::new(DiskCache::new(
                 dir.clone(),
                 config.disk_cache_max_bytes,
+                config
+                    .disk_cache_block_size
+                    .unwrap_or(DISK_CACHE_BLOCK_SIZE as usize),
             )?)),
             _ => None,
         };
@@ -1218,7 +1226,7 @@ impl ObjectFs {
     /// storing it. Returns at most `fetch_len` bytes (fewer near EOF).
     async fn read_range_disk(&self, key: &str, offset: u64, fetch_len: usize) -> Result<Vec<u8>> {
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
-        let block_size = DISK_CACHE_BLOCK_SIZE;
+        let block_size = cache.block_size;
         let end = offset.saturating_add(fetch_len as u64);
         let first_block = offset / block_size;
         let last_block = end.saturating_sub(1) / block_size;
@@ -2119,7 +2127,12 @@ mod tests {
     #[test]
     fn disk_cache_lru_evicts_least_recently_used() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("cache");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            5 * 1024 * 1024,
+            DISK_CACHE_BLOCK_SIZE as usize,
+        )
+        .expect("cache");
         let two_mib = vec![0xA5u8; 2 * 1024 * 1024];
 
         cache.write_block("k", 0, &two_mib).expect("write A");
@@ -2140,13 +2153,23 @@ mod tests {
         let two_mib = vec![0xB5u8; 2 * 1024 * 1024];
 
         {
-            let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("cache");
+            let cache = DiskCache::new(
+                dir.path().to_path_buf(),
+                5 * 1024 * 1024,
+                DISK_CACHE_BLOCK_SIZE as usize,
+            )
+            .expect("cache");
             cache.write_block("k", 0, &two_mib).expect("write A");
             cache.write_block("k", 1, &two_mib).expect("write B");
             cache.read_block("k", 0); // touch A
         }
 
-        let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("reopen");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            5 * 1024 * 1024,
+            DISK_CACHE_BLOCK_SIZE as usize,
+        )
+        .expect("reopen");
         cache
             .write_block("k", 2, &two_mib)
             .expect("write C triggers evict");
@@ -2191,6 +2214,7 @@ mod tests {
             verify_crc64: false,
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
             total_mem_limit: None,
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
@@ -2925,7 +2949,12 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                DISK_CACHE_BLOCK_SIZE as usize,
+            )
+            .expect("cache"),
         ));
 
         let data: Vec<u8> = (0..5 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
@@ -2951,7 +2980,12 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                DISK_CACHE_BLOCK_SIZE as usize,
+            )
+            .expect("cache"),
         ));
 
         let data: Vec<u8> = (0..1024usize).map(|i| i as u8).collect();
@@ -2974,7 +3008,12 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                DISK_CACHE_BLOCK_SIZE as usize,
+            )
+            .expect("cache"),
         ));
 
         let data = vec![0xAAu8; 1024];
