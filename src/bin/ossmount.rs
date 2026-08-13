@@ -667,7 +667,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_config_file, parse_mode};
+    use super::{KNOWN_CONFIG_KEYS, expand_config_file, parse_mode};
 
     #[test]
     fn config_file_expands_flags_and_skips_false_switches() {
@@ -716,6 +716,24 @@ mod tests {
         std::fs::write(&unknown, r#"{"bucket":"b","buckte":true}"#).unwrap();
         let err = expand_config_file(unknown.to_str().unwrap()).unwrap_err();
         assert!(err.contains("unknown config key `buckte`"), "got: {err}");
+    }
+
+    #[test]
+    fn example_config_keys_are_all_known() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ossfs.example.json");
+        let raw = std::fs::read_to_string(&path).expect("example file");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let obj = value.as_object().expect("object");
+        for key in obj.keys() {
+            if key == "access_key_id" || key == "secret_access_key" {
+                continue;
+            }
+            let normalized = key.replace('_', "-");
+            assert!(
+                KNOWN_CONFIG_KEYS.contains(&normalized.as_str()),
+                "ossfs.example.json key `{key}` is not a known option"
+            );
+        }
     }
 
     #[test]
