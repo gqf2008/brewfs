@@ -300,6 +300,8 @@ async fn main() -> anyhow::Result<()> {
                     read_cache_hits = m.read_cache_hits,
                     disk_cache_hits = m.disk_cache_hits,
                     crc64_mismatches = m.crc64_mismatches,
+                    upload_bytes_total = m.upload_bytes_total,
+                    download_bytes_total = m.download_bytes_total,
                     "ossfs metrics snapshot"
                 );
             }

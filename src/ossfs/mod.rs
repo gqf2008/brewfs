@@ -660,6 +660,8 @@ pub struct Metrics {
     s3_put_errors: AtomicU64,
     s3_delete_errors: AtomicU64,
     s3_multipart_errors: AtomicU64,
+    upload_bytes_total: AtomicU64,
+    download_bytes_total: AtomicU64,
     read_cache_hits: AtomicU64,
     disk_cache_hits: AtomicU64,
     crc64_mismatches: AtomicU64,
@@ -679,6 +681,8 @@ pub struct MetricsSnapshot {
     pub s3_put_errors: u64,
     pub s3_delete_errors: u64,
     pub s3_multipart_errors: u64,
+    pub upload_bytes_total: u64,
+    pub download_bytes_total: u64,
     pub read_cache_hits: u64,
     pub disk_cache_hits: u64,
     pub crc64_mismatches: u64,
@@ -698,6 +702,8 @@ impl Metrics {
             s3_put_errors: self.s3_put_errors.load(Ordering::Relaxed),
             s3_delete_errors: self.s3_delete_errors.load(Ordering::Relaxed),
             s3_multipart_errors: self.s3_multipart_errors.load(Ordering::Relaxed),
+            upload_bytes_total: self.upload_bytes_total.load(Ordering::Relaxed),
+            download_bytes_total: self.download_bytes_total.load(Ordering::Relaxed),
             read_cache_hits: self.read_cache_hits.load(Ordering::Relaxed),
             disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
@@ -1275,8 +1281,11 @@ impl ObjectFs {
                 return Err(e).context("s3 get");
             }
         };
-        let body = resp.body.collect().await.context("s3 get body")?;
-        Ok(body.to_vec())
+        let bytes = resp.body.collect().await.context("s3 get body")?.to_vec();
+        self.metrics
+            .download_bytes_total
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(bytes)
     }
 
     /// Return a fully-cached window slice when `[offset, offset+len)` is
@@ -1356,6 +1365,9 @@ impl ObjectFs {
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .upload_bytes_total
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.ensure_writable()?;
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
@@ -2963,6 +2975,8 @@ mod s3_mock_tests {
         assert_eq!(m.writes, 1);
         assert_eq!(m.s3_gets, 1);
         assert_eq!(m.s3_puts, 1);
+        assert_eq!(m.upload_bytes_total, 3);
+        assert_eq!(m.download_bytes_total, 1024);
     }
 
     #[tokio::test]
