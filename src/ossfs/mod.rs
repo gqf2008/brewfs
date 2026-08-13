@@ -65,6 +65,12 @@ pub struct OssConfig {
     pub gid: u32,
     pub dir_mode: u32,
     pub file_mode: u32,
+    /// Open the FUSE mount to all users (mirrors aliyun/ossfs
+    /// `allow_other`). FUSE-only.
+    pub allow_other: bool,
+    /// Additional permission mask applied on top of `dir_mode`/`file_mode`
+    /// (mirrors aliyun/ossfs `umask`). `0` applies no extra mask.
+    pub umask: u32,
     /// Allow directory renames. Directory rename is implemented as a
     /// recursive copy + delete; disabling it avoids unbounded tree copies
     /// (mirrors aliyun/ossfs `allow_rename_dir`).
@@ -188,6 +194,7 @@ pub struct MountAttr {
     pub gid: u32,
     pub dir_mode: u32,
     pub file_mode: u32,
+    pub umask: u32,
 }
 
 impl Default for MountAttr {
@@ -197,6 +204,7 @@ impl Default for MountAttr {
             gid: 0,
             dir_mode: 0o755,
             file_mode: 0o644,
+            umask: 0,
         }
     }
 }
@@ -209,12 +217,9 @@ pub(crate) fn effective_owner(configured: u32, current: u32) -> u32 {
 
 /// Resolve the FUSE permission bits for an object: directory vs file.
 #[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32) -> u16 {
-    if is_dir {
-        dir_mode as u16
-    } else {
-        file_mode as u16
-    }
+pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32, umask: u32) -> u16 {
+    let base = if is_dir { dir_mode } else { file_mode };
+    (base & !umask) as u16
 }
 
 /// Compute the CRC-64/ECMA-182 checksum used by Aliyun OSS
@@ -1046,6 +1051,8 @@ pub struct ObjectFs {
     limiter: Arc<Semaphore>,
     /// Read-only mount: reject all mutations.
     read_only: bool,
+    /// Open the FUSE mount to all users (see [OssConfig::allow_other]).
+    allow_other: bool,
     /// POSIX ownership / permission defaults for the FUSE adapters.
     mount_attr: MountAttr,
     /// Whether directory renames are allowed at all.
@@ -1179,11 +1186,13 @@ impl ObjectFs {
                 config.max_concurrent_requests,
             ))),
             read_only: config.read_only,
+            allow_other: config.allow_other,
             mount_attr: MountAttr {
                 uid: config.uid,
                 gid: config.gid,
                 dir_mode: config.dir_mode,
                 file_mode: config.file_mode,
+                umask: config.umask,
             },
             allow_rename_dir: config.allow_rename_dir,
             rename_dir_limit: config.rename_dir_limit,
@@ -1249,6 +1258,11 @@ impl ObjectFs {
     /// POSIX ownership / permission defaults applied by the FUSE adapters.
     pub fn mount_attr(&self) -> MountAttr {
         self.mount_attr
+    }
+
+    /// Whether the FUSE mount is opened to all users (`allow_other`).
+    pub fn allow_other(&self) -> bool {
+        self.allow_other
     }
 
     /// Acquire the in-flight write-byte budget for `data_len` bytes.
@@ -2483,6 +2497,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2525,6 +2540,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2565,8 +2581,10 @@ mod tests {
     fn effective_owner_and_mode_resolve_defaults() {
         assert_eq!(effective_owner(0, 1000), 1000);
         assert_eq!(effective_owner(42, 1000), 42);
-        assert_eq!(effective_mode(true, 0o755, 0o644), 0o755);
-        assert_eq!(effective_mode(false, 0o755, 0o644), 0o644);
+        assert_eq!(effective_mode(true, 0o755, 0o644, 0), 0o755);
+        assert_eq!(effective_mode(false, 0o755, 0o644, 0), 0o644);
+        assert_eq!(effective_mode(false, 0o755, 0o644, 0o022), 0o644);
+        assert_eq!(effective_mode(true, 0o777, 0o666, 0o022), 0o755);
     }
 
     #[tokio::test]
@@ -2578,6 +2596,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: true,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2626,6 +2645,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2679,6 +2699,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -2922,6 +2943,8 @@ mod tests {
             gid: 0,
             dir_mode: 0o755,
             file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
             allow_rename_dir: true,
             rename_dir_limit: Some(2_000_000),
             max_upload_bytes: None,
@@ -2969,6 +2992,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3031,6 +3055,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3087,6 +3112,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3142,6 +3168,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,
@@ -3528,6 +3555,7 @@ mod s3_mock_tests {
             negative: Mutex::new(HashMap::new()),
             limiter: Arc::new(Semaphore::new(limit)),
             read_only: false,
+            allow_other: false,
             mount_attr: MountAttr::default(),
             allow_rename_dir: true,
             rename_dir_limit: None,

@@ -99,6 +99,8 @@ region / access key → *Save* → *Mount*.
 | `--gid N` | Owner gid shown on every object (0 = mounting user) |
 | `--dir-mode M` | Directory permission bits, octal (default `755`) |
 | `--file-mode M` | File permission bits, octal (default `644`) |
+| `--allow-other` | Open the FUSE mount to all users (macOS/Linux only) |
+| `--umask M` | Extra permission mask applied on top of dir/file-mode, octal (default `0`) |
 | `--no-rename-dir` | Disable recursive directory rename |
 | `--rename-dir-limit N` | Max objects copied by one directory rename (default `2000000`, `0` = unlimited) |
 | `--max-concurrent-requests N` | Cap on in-flight S3 requests (default `32`, `0` = default) |

@@ -31,6 +31,7 @@ fn usage() -> ! {
         "usage: ossmount [mount] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
+                 [--allow-other] [--umask M]\n\
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--max-concurrent-requests N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
@@ -84,6 +85,8 @@ fn parse_args() -> (
     let mut gid: u32 = 0;
     let mut dir_mode: u32 = 0o755;
     let mut file_mode: u32 = 0o644;
+    let mut allow_other = false;
+    let mut umask: u32 = 0;
     let mut allow_rename_dir = true;
     let mut rename_dir_limit: Option<u64> = Some(2_000_000);
     let mut max_concurrent_requests: Option<usize> = None;
@@ -161,6 +164,13 @@ fn parse_args() -> (
             }
             "--file-mode" => {
                 file_mode = iter
+                    .next()
+                    .and_then(|v| parse_mode(&v))
+                    .unwrap_or_else(|| usage());
+            }
+            "--allow-other" => allow_other = true,
+            "--umask" => {
+                umask = iter
                     .next()
                     .and_then(|v| parse_mode(&v))
                     .unwrap_or_else(|| usage());
@@ -376,6 +386,8 @@ fn parse_args() -> (
             gid,
             dir_mode,
             file_mode,
+            allow_other,
+            umask,
             allow_rename_dir,
             rename_dir_limit,
             max_upload_bytes,

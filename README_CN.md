@@ -84,6 +84,8 @@ ossmount mount --bucket my-bucket \
 | `--gid N` | 所有对象显示的属组 gid（0 = 当前挂载用户） |
 | `--dir-mode M` | 目录权限位，八进制（默认 `755`） |
 | `--file-mode M` | 文件权限位，八进制（默认 `644`） |
+| `--allow-other` | FUSE 挂载对所有用户开放（仅 macOS/Linux） |
+| `--umask M` | 在 dir/file-mode 之上额外施加的权限掩码，八进制（默认 `0`） |
 | `--no-rename-dir` | 禁用目录递归重命名 |
 | `--rename-dir-limit N` | 单次目录重命名最多拷贝的对象数（默认 `2000000`，`0` = 不限制） |
 | `--max-concurrent-requests N` | 同时在途的 S3 请求上限（默认 `32`，`0` = 默认） |

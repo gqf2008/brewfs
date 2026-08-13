@@ -207,13 +207,23 @@ impl OssFs {
         let (kind, perm, nlink) = if entry.is_dir {
             (
                 FileType::Directory,
-                effective_mode(true, self.mount_attr.dir_mode, self.mount_attr.file_mode),
+                effective_mode(
+                    true,
+                    self.mount_attr.dir_mode,
+                    self.mount_attr.file_mode,
+                    self.mount_attr.umask,
+                ),
                 2u32,
             )
         } else {
             (
                 FileType::RegularFile,
-                effective_mode(false, self.mount_attr.dir_mode, self.mount_attr.file_mode),
+                effective_mode(
+                    false,
+                    self.mount_attr.dir_mode,
+                    self.mount_attr.file_mode,
+                    self.mount_attr.umask,
+                ),
                 1u32,
             )
         };
@@ -1159,9 +1169,13 @@ fn macos_fuse_backend() -> Option<&'static str> {
     }
 }
 
-fn build_config() -> Config {
+fn build_config(allow_other: bool) -> Config {
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("OSSFS-OSS".to_string())];
+    if allow_other {
+        cfg.mount_options
+            .push(MountOption::CUSTOM("allow_other".to_string()));
+    }
     #[cfg(target_os = "macos")]
     {
         let subtype = match macos_fuse_backend() {
@@ -1299,10 +1313,11 @@ pub async fn mount_oss_fuse(
         );
     }
 
+    let allow_other = fs.allow_other();
     let handle = Handle::current();
     let dirs = Arc::new(Mutex::new(HashSet::new()));
     let oss_fs = OssFs::new(fs, handle, Arc::clone(&dirs));
-    let session = fuser::spawn_mount2(oss_fs, mount_point, &build_config())
+    let session = fuser::spawn_mount2(oss_fs, mount_point, &build_config(allow_other))
         .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e}", mount_point.display()))?;
 
     // FUSE-T performs the real NFS mount asynchronously after the FUSE
