@@ -92,6 +92,13 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
     };
     out.push_str(&format!("ossfs_avg_upload_bytes {avg_upload:.2}\n"));
     out.push_str(&format!("ossfs_avg_download_bytes {avg_download:.2}\n"));
+    let stat_total = s.stat_cache_hits + s.s3_stat_heads;
+    let stat_hit_ratio = if stat_total > 0 {
+        s.stat_cache_hits as f64 / stat_total as f64
+    } else {
+        0.0
+    };
+    out.push_str(&format!("ossfs_stat_cache_hit_ratio {stat_hit_ratio:.4}\n"));
     let read_total = s.read_cache_hits + s.read_cache_misses;
     let read_hit_ratio = if read_total > 0 {
         s.read_cache_hits as f64 / read_total as f64
@@ -148,6 +155,7 @@ mod tests {
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
         assert!(body.contains("ossfs_avg_upload_bytes 24.60\n"));
         assert!(body.contains("ossfs_avg_download_bytes 152.00\n"));
+        assert!(body.contains("ossfs_stat_cache_hit_ratio 0.5833\n"));
         assert!(body.contains("ossfs_read_cache_hit_ratio 0.3000\n"));
         assert!(body.contains("ossfs_disk_cache_hit_ratio 0.3500\n"));
     }
