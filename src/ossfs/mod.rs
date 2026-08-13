@@ -1215,8 +1215,14 @@ impl ObjectFs {
     /// positive cache).
     fn negative_insert(&self, path: &str) {
         let mut cache = self.negative.lock().unwrap();
-        if cache.len() >= self.negative_max_entries {
-            cache.clear();
+        if cache.len() >= self.negative_max_entries && !cache.contains_key(path) {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            }
         }
         cache.insert(path.to_string(), Instant::now());
     }
