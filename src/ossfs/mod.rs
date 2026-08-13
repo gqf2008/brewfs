@@ -126,6 +126,9 @@ pub struct OssConfig {
     /// Number of consecutive blocks to prefetch in the background after a
     /// sequential disk-cache read. `0` disables prefetch.
     pub disk_cache_prefetch_blocks: usize,
+    /// Maximum concurrent background disk-cache prefetch tasks.
+    /// `Some(0)` / `None` uses [`DISK_CACHE_PREFETCH_CONCURRENCY`].
+    pub disk_cache_prefetch_concurrency: usize,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -300,6 +303,8 @@ const DIRTY_BUDGET_UNIT: usize = 1 << 20;
 const DISK_CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 /// Version for the disk-cache on-disk format (block checksum layout).
 const DISK_CACHE_META_VERSION: u64 = 2;
+/// Default maximum number of concurrent disk-cache prefetch tasks.
+const DISK_CACHE_PREFETCH_CONCURRENCY: usize = 4;
 /// Unit size for the disk-cache byte budget (whole MiB permits).
 const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 
@@ -815,6 +820,8 @@ pub struct ObjectFs {
     disk_cache_prefetch_blocks: usize,
     /// In-flight prefetch dedup: `(key, block)` currently being prefetched.
     prefetch_inflight: Arc<Mutex<HashSet<(String, u64)>>>,
+    /// Caps concurrent background prefetch tasks.
+    prefetch_sem: Arc<Semaphore>,
     /// path -> end offset of its previous read (sequential-read hint).
     read_seq: Mutex<HashMap<String, u64>>,
     /// Whether FUSE fsync should be a no-op (whole-file buffered writes).
@@ -895,6 +902,9 @@ impl ObjectFs {
             disk_cache,
             disk_cache_prefetch_blocks: config.disk_cache_prefetch_blocks,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(
+                config.disk_cache_prefetch_concurrency.max(1),
+            )),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1359,9 +1369,13 @@ impl ObjectFs {
             let limiter = Arc::clone(&self.limiter);
             let key = key.to_string();
             let inflight = Arc::clone(&self.prefetch_inflight);
+            let prefetch_sem = Arc::clone(&self.prefetch_sem);
             let first_next = last_block + 1;
             let count = self.disk_cache_prefetch_blocks;
             tokio::spawn(async move {
+                let Ok(_prefetch_guard) = prefetch_sem.acquire_owned().await else {
+                    return;
+                };
                 for block in first_next..first_next + count as u64 {
                     {
                         let mut set = inflight.lock().unwrap();
@@ -2074,6 +2088,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2103,6 +2118,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2143,6 +2159,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2178,6 +2195,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2218,6 +2236,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2383,6 +2402,7 @@ mod tests {
             disk_cache_max_bytes: 0,
             disk_cache_block_size: None,
             disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
             total_mem_limit: None,
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
@@ -2413,6 +2433,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2462,6 +2483,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2505,6 +2527,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2547,6 +2570,7 @@ mod tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2882,6 +2906,7 @@ mod s3_mock_tests {
             disk_cache: None,
             disk_cache_prefetch_blocks: 1,
             prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
