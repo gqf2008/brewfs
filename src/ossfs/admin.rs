@@ -1,0 +1,88 @@
+//! Minimal Prometheus-style metrics endpoint for `ossmount`.
+//!
+//! `serve_metrics` binds a TCP listener and serves `GET /metrics` with the
+//! monotonic counters exposed by [`ObjectFs::metrics`]. It intentionally
+//! avoids any external HTTP dependency: the request grammar is tiny and the
+//! endpoint is meant for local observability only.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use super::{MetricsSnapshot, ObjectFs};
+
+/// Serve `GET /metrics` on `addr` until the process exits. The returned future
+/// never completes normally; bind/accept errors are returned to the caller.
+pub async fn serve_metrics(addr: &str, fs: Arc<ObjectFs>) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind metrics listener {addr}"))?;
+
+    loop {
+        let (mut stream, _peer) = listener
+            .accept()
+            .await
+            .context("accept metrics connection")?;
+        let fs = Arc::clone(&fs);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let response = if request.starts_with("GET /metrics") || request.starts_with("GET /") {
+                let body = format_prometheus(&fs.metrics());
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+fn format_prometheus(s: &MetricsSnapshot) -> String {
+    let mut out = String::with_capacity(256);
+    for (name, value) in [
+        ("ossfs_reads_total", s.reads),
+        ("ossfs_writes_total", s.writes),
+        ("ossfs_s3_gets_total", s.s3_gets),
+        ("ossfs_s3_lists_total", s.s3_lists),
+        ("ossfs_s3_puts_total", s.s3_puts),
+        ("ossfs_read_cache_hits_total", s.read_cache_hits),
+        ("ossfs_disk_cache_hits_total", s.disk_cache_hits),
+        ("ossfs_crc64_mismatches_total", s.crc64_mismatches),
+    ] {
+        out.push_str(&format!("{name} {value}\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_prometheus;
+    use crate::ossfs::MetricsSnapshot;
+
+    #[test]
+    fn formats_prometheus_lines() {
+        let body = format_prometheus(&MetricsSnapshot {
+            reads: 1,
+            writes: 2,
+            s3_gets: 3,
+            s3_lists: 4,
+            s3_puts: 5,
+            read_cache_hits: 6,
+            disk_cache_hits: 7,
+            crc64_mismatches: 8,
+        });
+        assert!(body.contains("ossfs_reads_total 1\n"));
+        assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
+    }
+}

@@ -31,6 +31,7 @@ fn usage() -> ! {
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
+                 [--metrics-listen ADDR]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -52,7 +53,7 @@ fn parse_mode(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 
-fn parse_args() -> (OssConfig, PathBuf, u64) {
+fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
     let mut bucket = String::new();
     let mut endpoint: Option<String> = None;
     let mut region = "us-east-1".to_string();
@@ -73,6 +74,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
     let mut credential_process: Option<String> = None;
     let mut disk_cache_dir: Option<PathBuf> = None;
     let mut disk_cache_max_bytes: usize = 0;
+    let mut metrics_listen: Option<String> = None;
     let mut verify_crc64 = true;
     let mut mount_point: Option<PathBuf> = None;
 
@@ -154,6 +156,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
             "--credential-process" => {
                 credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
@@ -197,13 +200,22 @@ fn parse_args() -> (OssConfig, PathBuf, u64) {
         },
         mount_point,
         refresh_secs,
+        metrics_listen,
     )
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (cfg, mount_point, refresh_secs) = parse_args();
+    let (cfg, mount_point, refresh_secs, metrics_listen) = parse_args();
     let fs = Arc::new(ObjectFs::connect(cfg).await?);
+    if let Some(addr) = metrics_listen {
+        let metrics_fs = Arc::clone(&fs);
+        tokio::spawn(async move {
+            if let Err(e) = ossfs::admin::serve_metrics(&addr, metrics_fs).await {
+                eprintln!("metrics server {addr} failed: {e:#}");
+            }
+        });
+    }
 
     #[cfg(windows)]
     {

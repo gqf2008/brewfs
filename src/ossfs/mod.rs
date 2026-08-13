@@ -16,6 +16,8 @@
 //! This module is cross-platform; the platform mount adapters live in
 //! [`crate::ossfs::winfsp`] (Windows only) and [`crate::ossfs::fuse`] (macOS/Linux).
 
+pub mod admin;
+
 #[cfg(not(windows))]
 pub mod fuse;
 #[cfg(windows)]
