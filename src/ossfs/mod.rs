@@ -31,7 +31,7 @@ use aws_sdk_s3::{Client, config::BehaviorVersion};
 use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -402,6 +402,10 @@ struct DiskCache {
     dir: PathBuf,
     max_bytes: u64,
     used: AtomicU64,
+    /// In-process LRU order of cached blocks: `(key, block)` with the most
+    /// recently used entry at the back. Populated lazily on read/write; a
+    /// cold-start eviction falls back to mtime.
+    order: Mutex<VecDeque<(String, u64)>>,
 }
 
 impl DiskCache {
@@ -413,6 +417,7 @@ impl DiskCache {
             dir,
             max_bytes,
             used: AtomicU64::new(0),
+            order: Mutex::new(VecDeque::new()),
         };
         cache.rescan_used();
         Ok(cache)
@@ -432,6 +437,7 @@ impl DiskCache {
         if raw.len() < 4 + klen || &raw[4..4 + klen] != key.as_bytes() {
             return None;
         }
+        self.touch(key, block);
         Some(raw[4 + klen..].to_vec())
     }
 
@@ -446,6 +452,7 @@ impl DiskCache {
             .join(format!(".tmp-{:x}", fnv1a64(key).wrapping_add(block)));
         std::fs::write(&tmp, &header).context("write disk cache block")?;
         std::fs::rename(&tmp, &final_path).context("commit disk cache block")?;
+        self.touch(key, block);
         let bytes = header.len() as u64;
         self.used.fetch_add(bytes, Ordering::Relaxed);
         if self.used.load(Ordering::Relaxed) > self.max_bytes {
@@ -454,7 +461,45 @@ impl DiskCache {
         Ok(())
     }
 
+    fn touch(&self, key: &str, block: u64) {
+        let mut order = self.order.lock().unwrap();
+        if let Some(pos) = order.iter().position(|(k, b)| k == key && *b == block) {
+            if let Some(entry) = order.remove(pos) {
+                order.push_back(entry);
+            }
+        } else {
+            order.push_back((key.to_string(), block));
+        }
+    }
+
     fn evict(&self) {
+        let mut used = self.used.load(Ordering::Relaxed);
+        while used > self.max_bytes {
+            let (key, block) = {
+                let mut order = self.order.lock().unwrap();
+                let Some(entry) = order.pop_front() else {
+                    break;
+                };
+                entry
+            };
+            let path = self.path_for(&key, block);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let len = meta.len();
+                if std::fs::remove_file(&path).is_ok() {
+                    used = used.saturating_sub(len);
+                }
+            }
+        }
+        self.used.store(used, Ordering::Relaxed);
+
+        // Cold start (or stale order) fallback: if the in-memory LRU did not
+        // bring us under budget, fall back to oldest-mtime eviction.
+        if self.used.load(Ordering::Relaxed) > self.max_bytes {
+            self.evict_by_mtime();
+        }
+    }
+
+    fn evict_by_mtime(&self) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -478,7 +523,6 @@ impl DiskCache {
         }
         self.used.store(used, Ordering::Relaxed);
     }
-
     fn rescan_used(&self) {
         let mut used = 0u64;
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -492,6 +536,7 @@ impl DiskCache {
     }
 
     fn invalidate(&self, key: &str) {
+        self.order.lock().unwrap().retain(|(k, _)| k != key);
         let prefix = format!("{}-", fnv1a64(key));
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
@@ -515,6 +560,7 @@ impl DiskCache {
                 let _ = std::fs::remove_file(e.path());
             }
         }
+        self.order.lock().unwrap().clear();
         self.used.store(0, Ordering::Relaxed);
     }
 }
@@ -1929,6 +1975,24 @@ mod tests {
             effective_memory_budgets(None, 0.5, None, None, None),
             (None, None, READ_CACHE_MAX_BYTES)
         );
+    }
+
+    #[test]
+    fn disk_cache_lru_evicts_least_recently_used() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("cache");
+        let two_mib = vec![0xA5u8; 2 * 1024 * 1024];
+
+        cache.write_block("k", 0, &two_mib).expect("write A");
+        cache.write_block("k", 1, &two_mib).expect("write B");
+        cache.read_block("k", 0); // touch A
+        cache
+            .write_block("k", 2, &two_mib)
+            .expect("write C triggers evict");
+
+        assert!(cache.path_for("k", 0).exists(), "A must survive");
+        assert!(cache.path_for("k", 2).exists(), "C must survive");
+        assert!(!cache.path_for("k", 1).exists(), "B must be evicted as LRU");
     }
 
     #[tokio::test]
