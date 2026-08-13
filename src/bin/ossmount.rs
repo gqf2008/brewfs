@@ -34,7 +34,7 @@ fn usage() -> ! {
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
-                 [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag]\n\
+                 [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N]\n\
                  [--metrics-listen ADDR]\n\
                  [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
@@ -95,6 +95,7 @@ fn parse_args() -> (
     let mut disk_cache_prefetch_blocks: usize = 1;
     let mut disk_cache_prefetch_concurrency: usize = 4;
     let mut disk_cache_verify_etag = false;
+    let mut disk_cache_etag_ttl_secs: u64 = 10;
     let mut log_dir: Option<PathBuf> = None;
     let mut metrics_log_interval: u64 = 0;
     let mut log_level: Option<String> = None;
@@ -200,6 +201,12 @@ fn parse_args() -> (
                     .unwrap_or_else(|| usage());
             }
             "--disk-cache-verify-etag" => disk_cache_verify_etag = true,
+            "--disk-cache-etag-ttl" => {
+                disk_cache_etag_ttl_secs = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
             "--metrics-listen" => metrics_listen = Some(iter.next().unwrap_or_else(|| usage())),
             "--log-dir" => log_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| usage()))),
             "--log-level" => log_level = Some(iter.next().unwrap_or_else(|| usage())),
@@ -273,6 +280,7 @@ fn parse_args() -> (
             disk_cache_prefetch_blocks,
             disk_cache_prefetch_concurrency,
             disk_cache_verify_etag,
+            disk_cache_etag_ttl_secs,
             total_mem_limit,
             total_mem_read_ratio,
             read_cache_max_bytes,

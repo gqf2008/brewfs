@@ -132,6 +132,8 @@ pub struct OssConfig {
     /// Verify object ETag with a HEAD before serving disk-cache blocks.
     /// Detects remote changes made by other writers.
     pub disk_cache_verify_etag: bool,
+    /// ETag re-check TTL in seconds (default 10).
+    pub disk_cache_etag_ttl_secs: u64,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -863,6 +865,8 @@ pub struct ObjectFs {
     disk_cache_verify_etag: bool,
     /// path -> last successful ETag check (short TTL, see [`ETAG_CHECK_TTL`]).
     etag_checked: Mutex<HashMap<String, Instant>>,
+    /// TTL for cached ETag checks.
+    etag_ttl: Duration,
 
     /// Prefetch dedup skips and failures are tracked inside [`Metrics`].
     /// path -> end offset of its previous read (sequential-read hint).
@@ -950,6 +954,7 @@ impl ObjectFs {
             )),
             disk_cache_verify_etag: config.disk_cache_verify_etag,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: Duration::from_secs(config.disk_cache_etag_ttl_secs.max(1)),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1478,7 +1483,7 @@ impl ObjectFs {
         {
             let checked = self.etag_checked.lock().unwrap();
             if let Some(at) = checked.get(key) {
-                if at.elapsed() < ETAG_CHECK_TTL {
+                if at.elapsed() < self.etag_ttl {
                     return;
                 }
             }
@@ -2186,6 +2191,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2218,6 +2224,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2261,6 +2268,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2299,6 +2307,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2342,6 +2351,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2509,6 +2519,7 @@ mod tests {
             disk_cache_prefetch_blocks: 1,
             disk_cache_prefetch_concurrency: 4,
             disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
             total_mem_limit: None,
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
@@ -2542,6 +2553,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2594,6 +2606,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2640,6 +2653,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2685,6 +2699,7 @@ mod tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -3044,6 +3059,7 @@ mod s3_mock_tests {
             prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
+            etag_ttl: ETAG_CHECK_TTL,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
