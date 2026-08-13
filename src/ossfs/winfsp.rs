@@ -33,14 +33,11 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
 const WIN32_FILE_NOT_FOUND: i32 = 2;
 const WIN32_ACCESS_DENIED: i32 = 5;
-const WIN32_NOT_SUPPORTED: i32 = 50;
 const WIN32_INVALID_PARAMETER: i32 = 87;
 
 /// Above this size a write handle spills its buffer to a temp file so a large
 /// file copy cannot exhaust process memory.
 const WRITE_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
-/// Monotonic suffix for spool temp-file names.
-static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Periodic directory refresh: when the OS has an active directory watch
 // (Explorer window open), WinFsp calls our notifier every REFRESH_INTERVAL_MS
@@ -161,7 +158,7 @@ pub struct OssFileContext {
     /// Streaming multipart upload for large files (write-while-upload).
     stream: tokio::sync::Mutex<Option<StreamingUpload>>,
     /// Logical size reported while a streaming upload is in flight.
-    stream_size: AtomicU64,
+    logical_size: AtomicU64,
 }
 
 impl OssFileContext {
@@ -319,7 +316,7 @@ impl OssMountContext {
             up.finish()
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-            ctx.stream_size.store(0, Ordering::Release);
+            ctx.logical_size.store(0, Ordering::Release);
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
             return Ok(());
@@ -356,31 +353,6 @@ impl OssMountContext {
         let mut state = self.refresh.lock().unwrap();
         state.record_browsed(dir);
         state.store_snapshot(dir, entries);
-    }
-
-    /// Lazily fetch the object's current content into the write buffer on
-    /// first use. No-op once loaded; returns `Ok(false)` for non-write
-    /// handles (caller should fail with ACCESS_DENIED).
-    fn load_write_buf(&self, context: &OssFileContext) -> winfsp::Result<bool> {
-        if context.loaded.load(Ordering::Acquire) {
-            return Ok(context.write_buf.lock().unwrap().is_some());
-        }
-        let data = self
-            .block_on(self.fs.read_range(&context.path, 0, usize::MAX))
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        self.block_on(self.reserve_dirty(context, data.len()))?;
-        let mut guard = context.write_buf.lock().unwrap();
-        let Some(buf) = guard.as_mut() else {
-            return Ok(false);
-        };
-        // Another operation (e.g. overwrite/truncate) may have loaded or
-        // cleared the buffer while we were fetching; theirs wins.
-        if context.loaded.load(Ordering::Acquire) {
-            return Ok(true);
-        }
-        *buf = data;
-        context.loaded.store(true, Ordering::Release);
-        Ok(true)
     }
 }
 
@@ -659,7 +631,7 @@ impl FileSystemContext for OssMountContext {
             None
         } else if write {
             // Lazy: the existing content is fetched on the first write or
-            // truncate that needs it (see load_write_buf), so opening a file
+            // truncate that needs it (see write_async), so opening a file
             // for write never downloads the whole object.
             Some(Vec::new())
         } else {
@@ -679,7 +651,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
-            stream_size: AtomicU64::new(0),
+            logical_size: AtomicU64::new(0),
         })
     }
 
@@ -725,7 +697,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
-            stream_size: AtomicU64::new(0),
+            logical_size: AtomicU64::new(0),
         })
     }
 
@@ -775,13 +747,13 @@ impl FileSystemContext for OssMountContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let stream_size = context.stream_size.load(Ordering::Acquire);
-        if stream_size > 0 {
+        let logical_size = context.logical_size.load(Ordering::Acquire);
+        if logical_size > 0 {
             *file_info = file_info_from(
                 &DirEntry {
                     name: context.path.clone(),
                     is_dir: context.is_dir,
-                    size: stream_size,
+                    size: logical_size,
                     mtime_secs: 0,
                 },
                 context.index(),
@@ -839,7 +811,7 @@ impl FileSystemContext for OssMountContext {
             let _ = std::fs::remove_file(&path);
             context.spool_size.store(0, Ordering::Release);
         }
-        context.stream_size.store(0, Ordering::Release);
+        context.logical_size.store(0, Ordering::Release);
         if let Some(buf) = context.write_buf.lock().unwrap().as_mut() {
             buf.clear();
         }
@@ -885,8 +857,8 @@ impl FileSystemContext for OssMountContext {
         // Object storage has no settable timestamps; nothing to do. Prefer
         // the in-memory size for a loaded write handle (matches get_file_info
         // and the FUSE adapter's effective_attr).
-        let buf_size = if context.stream_size.load(Ordering::Acquire) > 0 {
-            Some(context.stream_size.load(Ordering::Acquire))
+        let buf_size = if context.logical_size.load(Ordering::Acquire) > 0 {
+            Some(context.logical_size.load(Ordering::Acquire))
         } else if context.spool_path.lock().unwrap().is_some() {
             Some(context.spool_size.load(Ordering::Acquire))
         } else {
@@ -933,88 +905,30 @@ impl FileSystemContext for OssMountContext {
         &self,
         context: &Self::FileContext,
         new_size: u64,
-        set_allocation_size: bool,
+        _set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
         }
 
-        // Pre-allocation hint (Windows Explorer sets this to the source size):
-        // don't materialize anything; the actual bytes arrive via write_async
-        // and stream/spool from there.
-        if set_allocation_size {
-            context.dirty.store(true, Ordering::Release);
-            let entry = DirEntry {
-                name: context.path.clone(),
-                is_dir: false,
-                size: new_size,
-                mtime_secs: 0,
-            };
-            *file_info = file_info_from(&entry, context.index());
-            return Ok(());
-        }
-
         if new_size == 0 {
-            // Truncate-to-zero: discard spool and clear the buffer.
+            // Truncate to zero: discard spool and clear the buffer.
             if let Some(path) = context.spool_path.lock().unwrap().take() {
                 let _ = std::fs::remove_file(&path);
                 context.spool_size.store(0, Ordering::Release);
             }
+            context.logical_size.store(0, Ordering::Release);
             let mut guard = context.write_buf.lock().unwrap();
             if let Some(buf) = guard.as_mut() {
                 buf.clear();
             }
             context.loaded.store(true, Ordering::Release);
-        } else if !self.load_write_buf(context)? {
-            // No write handle: truncation would require a read-modify-write.
-            return Err(FspError::from(IoError::from_raw_os_error(
-                WIN32_NOT_SUPPORTED,
-            )));
-        }
-
-        let spooled = context.spool_path.lock().unwrap().is_some();
-        if new_size > WRITE_SPOOL_THRESHOLD as u64 || spooled {
-            // Keep large sizes on disk (sparse) instead of allocating in RAM.
-            let path = if let Some(p) = context.spool_path.lock().unwrap().clone() {
-                p
-            } else {
-                let existing = context.write_buf.lock().unwrap().clone();
-                let path = std::env::temp_dir().join(format!(
-                    "ossfs-spool-{}-{}.tmp",
-                    std::process::id(),
-                    SPOOL_SEQ.fetch_add(1, Ordering::Relaxed)
-                ));
-                self.block_on(async {
-                    let mut file = tokio::fs::File::create(&path).await?;
-                    if let Some(existing) = existing.as_ref() {
-                        tokio::io::AsyncWriteExt::write_all(&mut file, existing).await?;
-                    }
-                    Ok::<(), std::io::Error>(())
-                })
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-                *context.spool_path.lock().unwrap() = Some(path.clone());
-                path
-            };
-            self.block_on(async {
-                let file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .await?;
-                file.set_len(new_size).await?;
-                Ok::<(), std::io::Error>(())
-            })
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-            context.spool_size.store(new_size, Ordering::Release);
         } else {
-            self.block_on(self.reserve_dirty(context, new_size as usize))?;
-            let mut guard = context.write_buf.lock().unwrap();
-            let Some(buf) = guard.as_mut() else {
-                return Err(FspError::from(IoError::from_raw_os_error(
-                    WIN32_NOT_SUPPORTED,
-                )));
-            };
-            buf.resize(new_size as usize, 0);
+            // Pre-allocation and SetEndOfFile only change the logical size;
+            // the actual bytes are streamed/buffered by write_async. Never
+            // materialize the file here (that was the 20GB OOM source).
+            context.logical_size.store(new_size, Ordering::Release);
         }
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
@@ -1122,20 +1036,20 @@ impl AsyncFileSystemContext for OssMountContext {
                     .await
                     .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
                 let base = if write_to_eof {
-                    context.stream_size.load(Ordering::Acquire)
+                    context.logical_size.load(Ordering::Acquire)
                 } else {
                     offset
                 };
                 let end = base.saturating_add(buffer.len() as u64);
-                let cur = context.stream_size.load(Ordering::Acquire);
+                let cur = context.logical_size.load(Ordering::Acquire);
                 if end > cur {
-                    context.stream_size.store(end, Ordering::Release);
+                    context.logical_size.store(end, Ordering::Release);
                 }
                 context.dirty.store(true, Ordering::Release);
                 let entry = DirEntry {
                     name: context.path.clone(),
                     is_dir: false,
-                    size: context.stream_size.load(Ordering::Acquire),
+                    size: context.logical_size.load(Ordering::Acquire),
                     mtime_secs: 0,
                 };
                 *file_info = file_info_from(&entry, context.index());
@@ -1196,9 +1110,11 @@ impl AsyncFileSystemContext for OssMountContext {
             *context.write_buf.lock().unwrap() = Some(Vec::new());
             context.loaded.store(true, Ordering::Release);
             *context.stream.lock().await = Some(up);
-            context
-                .stream_size
-                .store(new_size as u64, Ordering::Release);
+            let sz = context
+                .logical_size
+                .load(Ordering::Acquire)
+                .max(new_size as u64);
+            context.logical_size.store(sz, Ordering::Release);
             context.dirty.store(true, Ordering::Release);
             let entry = DirEntry {
                 name: context.path.clone(),
