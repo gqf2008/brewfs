@@ -70,6 +70,18 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
     ] {
         out.push_str(&format!("{name} {value}\n"));
     }
+    let avg_upload = if s.s3_puts > 0 {
+        s.upload_bytes_total as f64 / s.s3_puts as f64
+    } else {
+        0.0
+    };
+    let avg_download = if s.s3_gets > 0 {
+        s.download_bytes_total as f64 / s.s3_gets as f64
+    } else {
+        0.0
+    };
+    out.push_str(&format!("ossfs_avg_upload_bytes {avg_upload:.2}\n"));
+    out.push_str(&format!("ossfs_avg_download_bytes {avg_download:.2}\n"));
     out
 }
 
@@ -100,5 +112,7 @@ mod tests {
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
+        assert!(body.contains("ossfs_avg_upload_bytes 24.60\n"));
+        assert!(body.contains("ossfs_avg_download_bytes 152.00\n"));
     }
 }
