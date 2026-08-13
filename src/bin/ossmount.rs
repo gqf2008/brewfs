@@ -142,13 +142,15 @@ fn expand_config_file(path: &str) -> Result<Vec<String>, String> {
             let Some(s) = val.as_str() else {
                 return Err(format!("config key `{key}` must be a string"));
             };
-            let var = if key == "access_key_id" {
-                "AWS_ACCESS_KEY_ID"
-            } else {
-                "AWS_SECRET_ACCESS_KEY"
-            };
-            // SAFETY: config expansion runs during arg parsing, before any threads spawn.
-            unsafe { std::env::set_var(var, s) };
+            if !s.is_empty() {
+                let var = if key == "access_key_id" {
+                    "AWS_ACCESS_KEY_ID"
+                } else {
+                    "AWS_SECRET_ACCESS_KEY"
+                };
+                // SAFETY: config expansion runs during arg parsing, before any threads spawn.
+                unsafe { std::env::set_var(var, s) };
+            }
             continue;
         }
         if key == "mount_point" {
@@ -756,6 +758,24 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.starts_with("--mount")),
             "mount_point must not emit a --mount-point flag"
+        );
+    }
+
+    #[test]
+    fn config_file_ignores_empty_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json");
+        std::fs::write(
+            &path,
+            r#"{"bucket":"b","access_key_id":"","secret_access_key":""}"#,
+        )
+        .unwrap();
+        let args = expand_config_file(path.to_str().unwrap()).unwrap();
+        assert!(args.iter().any(|a| a == "--bucket"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("access_key") || a.contains("secret_access"))
         );
     }
 
