@@ -136,6 +136,14 @@ pub struct OssConfig {
     /// Disk-cache block size in bytes. `Some(0)` / `None` uses
     /// [`DISK_CACHE_BLOCK_SIZE`].
     pub disk_cache_block_size: Option<usize>,
+    /// Keep at least this many bytes free on the disk cache's filesystem.
+    /// When a cache write would drop free space below this floor the block
+    /// is skipped (mirrors aliyun/ossfs `ensure_diskfree`).
+    pub disk_cache_reserve_diskfree: u64,
+    /// Keep at least this fraction of the cache filesystem free. Combined
+    /// with [`Self::disk_cache_reserve_diskfree`] via `max` (mirrors
+    /// aliyun/ossfs `free_space_ratio`).
+    pub disk_cache_free_space_ratio: Option<f64>,
     /// Number of consecutive blocks to prefetch in the background after a
     /// sequential disk-cache read. `0` disables prefetch.
     pub disk_cache_prefetch_blocks: usize,
@@ -336,6 +344,58 @@ const ETAG_CHECK_TTL: Duration = Duration::from_secs(10);
 /// Unit size for the disk-cache byte budget (whole MiB permits).
 const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 
+/// `(total_capacity_bytes, available_bytes)` for the filesystem containing
+/// `dir`. Best-effort: returns `None` when the OS query is unavailable, in
+/// which case free-space protection is skipped.
+#[cfg(windows)]
+fn disk_space(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            &mut total,
+            &mut free,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some((total, available))
+    }
+}
+
+#[cfg(not(windows))]
+fn disk_space(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = stat.f_frsize.max(1) as u64;
+    Some((
+        (stat.f_blocks as u64).saturating_mul(frsize),
+        (stat.f_bavail as u64).saturating_mul(frsize),
+    ))
+}
+
+/// Effective free-space floor: `max(reserve_bytes, ratio * total_bytes)`.
+fn min_free_bytes(reserve: u64, ratio: Option<f64>, total: u64) -> u64 {
+    let ratio_bytes = ratio
+        .map(|r| (total as f64 * r.clamp(0.0, 0.99)) as u64)
+        .unwrap_or(0);
+    reserve.max(ratio_bytes)
+}
+
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
 /// acquire call can represent are clamped.
@@ -449,13 +509,25 @@ struct DiskCache {
     /// recently used entry at the back. Populated lazily on read/write; a
     /// cold-start eviction falls back to mtime.
     order: Mutex<VecDeque<(String, u64)>>,
+    /// Free-space floor on the cache filesystem; writes are skipped below it.
+    min_free_bytes: u64,
 }
 
 impl DiskCache {
-    fn new(dir: PathBuf, max_bytes: usize, block_size: usize) -> Result<Self> {
+    fn new(
+        dir: PathBuf,
+        max_bytes: usize,
+        block_size: usize,
+        reserve_diskfree: u64,
+        free_space_ratio: Option<f64>,
+    ) -> Result<Self> {
         let max_bytes =
             max_bytes.div_ceil(DISK_CACHE_BUDGET_UNIT) as u64 * DISK_CACHE_BUDGET_UNIT as u64;
         std::fs::create_dir_all(&dir).context("create disk cache dir")?;
+        let min_free_bytes = {
+            let (total, _avail) = disk_space(&dir).unwrap_or((0, 0));
+            min_free_bytes(reserve_diskfree, free_space_ratio, total)
+        };
         let block_size = Self::load_or_init_block_size(&dir, block_size)?;
         let cache = Self {
             dir,
@@ -463,6 +535,7 @@ impl DiskCache {
             block_size,
             used: AtomicU64::new(0),
             order: Mutex::new(VecDeque::new()),
+            min_free_bytes,
         };
         cache.load_order();
         if cache.order.lock().unwrap().is_empty() {
@@ -587,6 +660,15 @@ impl DiskCache {
     }
 
     fn write_block(&self, key: &str, block: u64, data: &[u8]) -> Result<()> {
+        let header_len = (4 + key.len() + 8 + data.len()) as u64;
+        if self.min_free_bytes > 0
+            && let Some((_, avail)) = disk_space(&self.dir)
+            && avail.saturating_sub(header_len) < self.min_free_bytes
+        {
+            // Refusing to cache keeps the disk above the free-space floor.
+            // The read still succeeds; it is just not persisted locally.
+            return Ok(());
+        }
         let mut header = Vec::with_capacity(4 + key.len() + 8 + data.len());
         header.extend_from_slice(&(key.len() as u32).to_le_bytes());
         header.extend_from_slice(key.as_bytes());
@@ -1026,6 +1108,8 @@ impl ObjectFs {
                 config
                     .disk_cache_block_size
                     .unwrap_or(DISK_CACHE_BLOCK_SIZE as usize),
+                config.disk_cache_reserve_diskfree,
+                config.disk_cache_free_space_ratio,
             )?)),
             _ => None,
         };
@@ -2585,12 +2669,47 @@ mod tests {
     }
 
     #[test]
+    fn min_free_bytes_uses_max_of_reserve_and_ratio() {
+        assert_eq!(min_free_bytes(0, None, 1000), 0);
+        assert_eq!(min_free_bytes(100, None, 1000), 100);
+        assert_eq!(min_free_bytes(0, Some(0.1), 1000), 100);
+        assert_eq!(min_free_bytes(50, Some(0.1), 1000), 100);
+        assert_eq!(min_free_bytes(200, Some(0.1), 1000), 200);
+    }
+
+    #[test]
+    fn disk_cache_skips_write_below_free_space_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+            u64::MAX,
+            None,
+        )
+        .expect("cache");
+        cache.write_block("k", 0, b"data").expect("write");
+
+        let blocks = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "blk").unwrap_or(false))
+            .count();
+        assert_eq!(
+            blocks, 0,
+            "write must be skipped below the free-space floor"
+        );
+    }
+
+    #[test]
     fn disk_cache_lru_evicts_least_recently_used() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = DiskCache::new(
             dir.path().to_path_buf(),
             5 * 1024 * 1024,
             DISK_CACHE_BLOCK_SIZE as usize,
+            0,
+            None,
         )
         .expect("cache");
         let two_mib = vec![0xA5u8; 2 * 1024 * 1024];
@@ -2617,6 +2736,8 @@ mod tests {
                 dir.path().to_path_buf(),
                 5 * 1024 * 1024,
                 DISK_CACHE_BLOCK_SIZE as usize,
+                0,
+                None,
             )
             .expect("cache");
             cache.write_block("k", 0, &two_mib).expect("write A");
@@ -2628,6 +2749,8 @@ mod tests {
             dir.path().to_path_buf(),
             5 * 1024 * 1024,
             DISK_CACHE_BLOCK_SIZE as usize,
+            0,
+            None,
         )
         .expect("reopen");
         cache
@@ -2645,20 +2768,38 @@ mod tests {
     fn disk_cache_block_size_mismatch_rebuilds() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
-            let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 2 * 1024 * 1024)
-                .expect("cache");
+            let cache = DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                2 * 1024 * 1024,
+                0,
+                None,
+            )
+            .expect("cache");
             assert_eq!(cache.block_size, 2 * 1024 * 1024);
         }
-        let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 1 * 1024 * 1024)
-            .expect("reopen");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            1 * 1024 * 1024,
+            0,
+            None,
+        )
+        .expect("reopen");
         assert_eq!(cache.block_size, 1 * 1024 * 1024);
     }
 
     #[test]
     fn disk_cache_detects_corrupt_block() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
-            .expect("cache");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            4 * 1024 * 1024,
+            0,
+            None,
+        )
+        .expect("cache");
         cache
             .write_block("k", 0, &vec![0x5Au8; 1024])
             .expect("write");
@@ -2707,6 +2848,8 @@ mod tests {
             storage_class: None,
             multipart_size: None,
             multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
             disk_cache_block_size: None,
@@ -3593,6 +3736,8 @@ mod s3_mock_tests {
                 dir.path().to_path_buf(),
                 64 * 1024 * 1024,
                 DISK_CACHE_BLOCK_SIZE as usize,
+                0,
+                None,
             )
             .expect("cache"),
         ));
@@ -3621,8 +3766,14 @@ mod s3_mock_tests {
         let mut fs = test_fs(port, 32);
         fs.read_ahead_window = 8 * 1024 * 1024;
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
-                .expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                4 * 1024 * 1024,
+                0,
+                None,
+            )
+            .expect("cache"),
         ));
 
         let data: Vec<u8> = (0..13 * 1024 * 1024usize)
@@ -3649,8 +3800,14 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
-                .expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                4 * 1024 * 1024,
+                0,
+                None,
+            )
+            .expect("cache"),
         ));
         fs.disk_cache_verify_etag = true;
 
@@ -3672,8 +3829,14 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
         fs.disk_cache = Some(Arc::new(
-            DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 4 * 1024 * 1024)
-                .expect("cache"),
+            DiskCache::new(
+                dir.path().to_path_buf(),
+                64 * 1024 * 1024,
+                4 * 1024 * 1024,
+                0,
+                None,
+            )
+            .expect("cache"),
         ));
         fs.disk_cache_verify_etag = true;
 
@@ -3694,6 +3857,8 @@ mod s3_mock_tests {
                 dir.path().to_path_buf(),
                 64 * 1024 * 1024,
                 DISK_CACHE_BLOCK_SIZE as usize,
+                0,
+                None,
             )
             .expect("cache"),
         ));
@@ -3722,6 +3887,8 @@ mod s3_mock_tests {
                 dir.path().to_path_buf(),
                 64 * 1024 * 1024,
                 DISK_CACHE_BLOCK_SIZE as usize,
+                0,
+                None,
             )
             .expect("cache"),
         ));

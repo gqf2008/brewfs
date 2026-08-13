@@ -34,6 +34,7 @@ fn usage() -> ! {
                  [--no-rename-dir] [--rename-dir-limit N] [--max-upload-bytes N]\n\
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
+                 [--disk-cache-reserve-diskfree N] [--disk-cache-free-space-ratio R]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N] [--disk-cache-block-size N] [--disk-cache-prefetch-blocks N] [--disk-cache-prefetch-concurrency N] [--disk-cache-verify-etag] [--disk-cache-etag-ttl N] [--negative-cache-ttl N] [--negative-cache-max-entries N] [--stat-cache-ttl N] [--stat-cache-max-entries N]\n\
                  [--metrics-listen ADDR]\n\
@@ -109,6 +110,8 @@ fn parse_args() -> (
     let mut storage_class: Option<String> = None;
     let mut multipart_size: Option<usize> = None;
     let mut multipart_concurrency: Option<usize> = None;
+    let mut disk_cache_reserve_diskfree: u64 = 0;
+    let mut disk_cache_free_space_ratio: Option<f64> = None;
     let mut mount_point: Option<PathBuf> = None;
 
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -228,6 +231,20 @@ fn parse_args() -> (
                     .unwrap_or_else(|| usage());
             }
             "--disk-cache-verify-etag" => disk_cache_verify_etag = true,
+            "--disk-cache-reserve-diskfree" => {
+                disk_cache_reserve_diskfree = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
+            "--disk-cache-free-space-ratio" => {
+                disk_cache_free_space_ratio = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|r| *r > 0.0 && *r < 1.0)
+                        .unwrap_or_else(|| usage()),
+                );
+            }
             "--disk-cache-etag-ttl" => {
                 disk_cache_etag_ttl_secs = iter
                     .next()
@@ -328,6 +345,8 @@ fn parse_args() -> (
             disk_cache_dir,
             disk_cache_max_bytes,
             disk_cache_block_size,
+            disk_cache_reserve_diskfree,
+            disk_cache_free_space_ratio,
             disk_cache_prefetch_blocks,
             disk_cache_prefetch_concurrency,
             disk_cache_verify_etag,
