@@ -44,7 +44,7 @@ jobs:
         run: cargo build --workspace
 
       - name: Test workspace
-        run: cargo test --workspace --lib --bins -- --test-threads=1
+        run: cargo test --workspace --lib --bins --tests -- --test-threads=1
 
       - name: Clippy
         run: cargo clippy --workspace
