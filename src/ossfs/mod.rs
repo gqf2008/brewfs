@@ -654,6 +654,7 @@ pub struct Metrics {
     s3_gets: AtomicU64,
     s3_lists: AtomicU64,
     s3_puts: AtomicU64,
+    s3_errors: AtomicU64,
     read_cache_hits: AtomicU64,
     disk_cache_hits: AtomicU64,
     crc64_mismatches: AtomicU64,
@@ -667,6 +668,7 @@ pub struct MetricsSnapshot {
     pub s3_gets: u64,
     pub s3_lists: u64,
     pub s3_puts: u64,
+    pub s3_errors: u64,
     pub read_cache_hits: u64,
     pub disk_cache_hits: u64,
     pub crc64_mismatches: u64,
@@ -680,6 +682,7 @@ impl Metrics {
             s3_gets: self.s3_gets.load(Ordering::Relaxed),
             s3_lists: self.s3_lists.load(Ordering::Relaxed),
             s3_puts: self.s3_puts.load(Ordering::Relaxed),
+            s3_errors: self.s3_errors.load(Ordering::Relaxed),
             read_cache_hits: self.read_cache_hits.load(Ordering::Relaxed),
             disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
@@ -914,7 +917,13 @@ impl ObjectFs {
             if let Some(tok) = token.as_deref() {
                 req = req.continuation_token(tok);
             }
-            let resp = req.send().await.context("s3 list")?;
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(e).context("s3 list");
+                }
+            };
             for cp in resp.common_prefixes() {
                 if let Some(p) = cp.prefix() {
                     let name = p
@@ -1244,7 +1253,10 @@ impl ObjectFs {
         {
             Ok(resp) => resp,
             Err(e) if is_s3_invalid_range(&e) => return Ok(Vec::new()),
-            Err(e) => return Err(e).context("s3 get"),
+            Err(e) => {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e).context("s3 get");
+            }
         };
         let body = resp.body.collect().await.context("s3 get body")?;
         Ok(body.to_vec())
@@ -1356,7 +1368,10 @@ impl ObjectFs {
                 slot: Arc::clone(&crc_slot),
             });
         }
-        put.send().await.context("s3 put")?;
+        if let Err(e) = put.send().await {
+            self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(e).context("s3 put");
+        }
 
         if let Some(expected) = expected_crc {
             check_crc64_response(crc_slot, expected, &self.metrics)?;
@@ -1379,6 +1394,9 @@ impl ObjectFs {
             .key(&key)
             .send()
             .await
+            .inspect_err(|_| {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
             .context("s3 create multipart upload")?;
         let upload_id = create
             .upload_id()
@@ -1524,6 +1542,9 @@ impl ObjectFs {
             .key(&key)
             .send()
             .await
+            .inspect_err(|_| {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
             .context("s3 delete")?;
         Ok(())
     }
@@ -2914,6 +2935,15 @@ mod s3_mock_tests {
         assert_eq!(m.writes, 1);
         assert_eq!(m.s3_gets, 1);
         assert_eq!(m.s3_puts, 1);
+    }
+
+    #[tokio::test]
+    async fn s3_errors_increment_on_get_failure() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let err = fs.read_range("/missing.bin", 0, 16).await.unwrap_err();
+        assert!(err.to_string().contains("s3 get"));
+        assert_eq!(fs.metrics().s3_errors, 1);
     }
 
     #[tokio::test]
