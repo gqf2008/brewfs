@@ -335,12 +335,11 @@ fn parse_args() -> (
                 max_concurrent_requests = if v == 0 { None } else { Some(v) };
             }
             "--list-rate-limit" => {
-                list_rate_limit = Some(
-                    iter.next()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|r| *r > 0.0)
-                        .unwrap_or_else(|| usage()),
-                );
+                let v: f64 = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                list_rate_limit = if v > 0.0 { Some(v) } else { None };
             }
             "--rename-dir-limit" => {
                 let v: u64 = iter
@@ -425,12 +424,17 @@ fn parse_args() -> (
                     .unwrap_or_else(|| usage());
             }
             "--disk-cache-free-space-ratio" => {
-                disk_cache_free_space_ratio = Some(
-                    iter.next()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|r| *r > 0.0 && *r < 1.0)
-                        .unwrap_or_else(|| usage()),
-                );
+                let v: f64 = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                disk_cache_free_space_ratio = if v == 0.0 {
+                    None
+                } else if v > 0.0 && v < 1.0 {
+                    Some(v)
+                } else {
+                    usage();
+                };
             }
             "--disk-cache-etag-ttl" => {
                 disk_cache_etag_ttl_secs = iter
@@ -496,20 +500,18 @@ fn parse_args() -> (
                 credential_process = Some(iter.next().unwrap_or_else(|| usage()))
             }
             "--connect-timeout" => {
-                connect_timeout_secs = Some(
-                    iter.next()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|v| *v > 0)
-                        .unwrap_or_else(|| usage()),
-                );
+                let v: u64 = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                connect_timeout_secs = if v > 0 { Some(v) } else { None };
             }
             "--readwrite-timeout" => {
-                readwrite_timeout_secs = Some(
-                    iter.next()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|v| *v > 0)
-                        .unwrap_or_else(|| usage()),
-                );
+                let v: u64 = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                readwrite_timeout_secs = if v > 0 { Some(v) } else { None };
             }
             "--retries" => {
                 retries = Some(
