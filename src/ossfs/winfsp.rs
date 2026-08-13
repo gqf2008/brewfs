@@ -320,6 +320,10 @@ impl OssMountContext {
             let _ = std::fs::remove_file(&path);
             ctx.spool_path.lock().unwrap().take();
             ctx.spool_size.store(0, Ordering::Release);
+            // The object is now authoritative; drop the stale in-memory
+            // prefix so a later read on this handle re-fetches from S3.
+            *ctx.write_buf.lock().unwrap() = Some(Vec::new());
+            ctx.loaded.store(false, Ordering::Release);
             return Ok(());
         }
         let data = ctx.write_buf.lock().unwrap().clone();
