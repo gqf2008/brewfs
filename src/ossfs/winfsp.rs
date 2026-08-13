@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::future::Future;
 use std::io::Error as IoError;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
@@ -35,6 +35,12 @@ const WIN32_FILE_NOT_FOUND: i32 = 2;
 const WIN32_ACCESS_DENIED: i32 = 5;
 const WIN32_NOT_SUPPORTED: i32 = 50;
 const WIN32_INVALID_PARAMETER: i32 = 87;
+
+/// Above this size a write handle spills its buffer to a temp file so a large
+/// file copy cannot exhaust process memory.
+const WRITE_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
+/// Monotonic suffix for spool temp-file names.
+static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Periodic directory refresh: when the OS has an active directory watch
 // (Explorer window open), WinFsp calls our notifier every REFRESH_INTERVAL_MS
@@ -147,6 +153,11 @@ pub struct OssFileContext {
     budget_units: AtomicUsize,
     /// RAII permits for every reservation made by this handle.
     budget_permits: Mutex<Vec<DirtyPermit>>,
+    /// When a write buffer grows beyond [`WRITE_SPOOL_THRESHOLD`], it is
+    /// spilled to this temp file and subsequent writes append there.
+    spool_path: Mutex<Option<PathBuf>>,
+    /// Logical size of the spooled file (total bytes written so far).
+    spool_size: AtomicU64,
 }
 
 impl OssFileContext {
@@ -291,6 +302,33 @@ impl OssMountContext {
             .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         context.budget_permits.lock().unwrap().push(permit);
         context.budget_units.store(new_units, Ordering::Release);
+        Ok(())
+    }
+
+    /// Upload the handle's dirty content, streaming from the spool file when
+    /// one was created so large files are never held whole in memory.
+    async fn upload_dirty(&self, ctx: &OssFileContext) -> winfsp::Result<()> {
+        if !ctx.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let spool = ctx.spool_path.lock().unwrap().clone();
+        if let Some(path) = spool {
+            self.fs
+                .write_from_file(&ctx.path, &path)
+                .await
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            let _ = std::fs::remove_file(&path);
+            ctx.spool_path.lock().unwrap().take();
+            ctx.spool_size.store(0, Ordering::Release);
+            return Ok(());
+        }
+        let data = ctx.write_buf.lock().unwrap().clone();
+        if let Some(data) = data {
+            self.fs
+                .write(&ctx.path, &data)
+                .await
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        }
         Ok(())
     }
 
@@ -621,6 +659,8 @@ impl FileSystemContext for OssMountContext {
             dir_buffer: DirBuffer::new(),
             budget_units: AtomicUsize::new(0),
             budget_permits: Mutex::new(Vec::new()),
+            spool_path: Mutex::new(None),
+            spool_size: AtomicU64::new(0),
         })
     }
 
@@ -663,6 +703,8 @@ impl FileSystemContext for OssMountContext {
             dir_buffer: DirBuffer::new(),
             budget_units: AtomicUsize::new(0),
             budget_permits: Mutex::new(Vec::new()),
+            spool_path: Mutex::new(None),
+            spool_size: AtomicU64::new(0),
         })
     }
 
@@ -689,18 +731,10 @@ impl FileSystemContext for OssMountContext {
             }
             return;
         }
-        if context.dirty.load(Ordering::Acquire) {
-            let data = context.write_buf.lock().unwrap().clone();
-            if let Some(data) = data {
-                let path = context.path.clone();
-                let fs = Arc::clone(&self.fs);
-                if let Err(e) = self.block_on({
-                    let path = path.clone();
-                    async move { fs.write(&path, &data).await }
-                }) {
-                    warn!(path = log_path(&path), error = ?e, "ossfs cleanup flush failed");
-                }
-            }
+        if context.dirty.load(Ordering::Acquire)
+            && let Err(e) = self.block_on(self.upload_dirty(context))
+        {
+            warn!(path = log_path(&context.path), error = ?e, "ossfs cleanup flush failed");
         }
     }
 
@@ -712,19 +746,7 @@ impl FileSystemContext for OssMountContext {
         _file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let Some(ctx) = context else { return Ok(()) };
-        if ctx.dirty.load(Ordering::Acquire) {
-            let data = ctx.write_buf.lock().unwrap().clone();
-            if let Some(data) = data {
-                let path = ctx.path.clone();
-                let fs = Arc::clone(&self.fs);
-                self.block_on({
-                    let path = path.clone();
-                    async move { fs.write(&path, &data).await }
-                })
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-            }
-        }
-        Ok(())
+        self.block_on(self.upload_dirty(ctx))
     }
 
     fn get_file_info(
@@ -732,6 +754,19 @@ impl FileSystemContext for OssMountContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if context.spool_path.lock().unwrap().is_some() {
+            let size = context.spool_size.load(Ordering::Acquire);
+            *file_info = file_info_from(
+                &DirEntry {
+                    name: context.path.clone(),
+                    is_dir: context.is_dir,
+                    size,
+                    mtime_secs: 0,
+                },
+                context.index(),
+            );
+            return Ok(());
+        }
         if let Some(buf) = context.write_buf.lock().unwrap().as_ref()
             && context.loaded.load(Ordering::Acquire)
         {
@@ -765,6 +800,10 @@ impl FileSystemContext for OssMountContext {
     ) -> winfsp::Result<()> {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
+        }
+        if let Some(path) = context.spool_path.lock().unwrap().take() {
+            let _ = std::fs::remove_file(&path);
+            context.spool_size.store(0, Ordering::Release);
         }
         if let Some(buf) = context.write_buf.lock().unwrap().as_mut() {
             buf.clear();
@@ -811,7 +850,9 @@ impl FileSystemContext for OssMountContext {
         // Object storage has no settable timestamps; nothing to do. Prefer
         // the in-memory size for a loaded write handle (matches get_file_info
         // and the FUSE adapter's effective_attr).
-        let buf_size = {
+        let buf_size = if context.spool_path.lock().unwrap().is_some() {
+            Some(context.spool_size.load(Ordering::Acquire))
+        } else {
             let guard = context.write_buf.lock().unwrap();
             match guard.as_ref() {
                 Some(buf) if context.loaded.load(Ordering::Acquire) => Some(buf.len() as u64),
@@ -860,6 +901,26 @@ impl FileSystemContext for OssMountContext {
     ) -> winfsp::Result<()> {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
+        }
+        // A spooled handle is materialized back to memory for truncation
+        // (rare); truncate-to-zero just discards the spool file.
+        if context.spool_path.lock().unwrap().is_some() {
+            let path = context.spool_path.lock().unwrap().clone().unwrap();
+            if new_size == 0 {
+                context.spool_path.lock().unwrap().take();
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            } else {
+                let read_path = path.clone();
+                let data = self
+                    .block_on(async move { tokio::fs::read(read_path).await })
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                context.spool_path.lock().unwrap().take();
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+                *context.write_buf.lock().unwrap() = Some(data);
+                context.loaded.store(true, Ordering::Release);
+            }
         }
         // Truncate-to-zero needs no original bytes: the empty buffer is
         // authoritative, so no S3 fetch (covers the save-as/rewrite flow on
@@ -916,6 +977,21 @@ impl AsyncFileSystemContext for OssMountContext {
     ) -> winfsp::Result<u32> {
         if buffer.is_empty() {
             return Ok(0);
+        }
+        {
+            let spool = context.spool_path.lock().unwrap().clone();
+            if let Some(path) = spool {
+                let mut file = tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                let n = tokio::io::AsyncReadExt::read(&mut file, buffer)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                return Ok(n as u32);
+            }
         }
         {
             let guard = context.write_buf.lock().unwrap();
@@ -985,22 +1061,74 @@ impl AsyncFileSystemContext for OssMountContext {
                 context.loaded.store(true, Ordering::Release);
             }
         }
-        let new_size = {
-            let guard = context.write_buf.lock().unwrap();
-            let Some(buf) = guard.as_ref() else {
-                return Err(FspError::from(IoError::from_raw_os_error(
-                    WIN32_ACCESS_DENIED,
-                )));
+        let cur_size = {
+            if context.spool_path.lock().unwrap().is_some() {
+                context.spool_size.load(Ordering::Acquire)
+            } else {
+                context
+                    .write_buf
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0)
+            }
+        };
+        let effective = if write_to_eof { cur_size } else { offset };
+        let new_size = (effective as usize).saturating_add(buffer.len());
+        self.reserve_dirty(context, new_size).await?;
+        {
+            // Spill to disk first if this write pushes the buffer over the
+            // threshold. The spool lock is only held synchronously, never
+            // across an await.
+            let should_spill = {
+                let spooled = context.spool_path.lock().unwrap().is_some();
+                !spooled && new_size > WRITE_SPOOL_THRESHOLD
             };
-            let effective = if write_to_eof {
-                buf.len() as u64
+            if should_spill {
+                let existing = context.write_buf.lock().unwrap().clone();
+                let buf_len = existing.as_ref().map(|b| b.len()).unwrap_or(0);
+                let path = std::env::temp_dir().join(format!(
+                    "ossfs-spool-{}-{}.tmp",
+                    std::process::id(),
+                    SPOOL_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                let mut file = tokio::fs::File::create(&path)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                if let Some(existing) = existing {
+                    tokio::io::AsyncWriteExt::write_all(&mut file, &existing)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
+                *context.spool_path.lock().unwrap() = Some(path);
+                context.spool_size.store(buf_len as u64, Ordering::Release);
+            }
+        }
+        let spool_path = context.spool_path.lock().unwrap().clone();
+        if let Some(path) = spool_path {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            let start = if write_to_eof {
+                context.spool_size.load(Ordering::Acquire)
             } else {
                 offset
             };
-            (effective as usize).saturating_add(buffer.len())
-        };
-        self.reserve_dirty(context, new_size).await?;
-        {
+            tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start))
+                .await
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, buffer)
+                .await
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            let end = start + buffer.len() as u64;
+            let cur = context.spool_size.load(Ordering::Acquire);
+            if end > cur {
+                context.spool_size.store(end, Ordering::Release);
+            }
+        } else {
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
