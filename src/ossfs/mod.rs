@@ -1109,6 +1109,148 @@ impl Metrics {
     }
 }
 
+/// A streaming multipart upload handle. Bytes are fed via [`StreamingUpload::write`]
+/// and uploaded as [`MULTIPART_PART_SIZE`] parts in the background (bounded by
+/// `part_sem`), so upload overlaps with the local write and the process never
+/// holds the whole object in memory.
+pub struct StreamingUpload {
+    client: Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    next_part: i32,
+    parts: Vec<(i32, String)>,
+    pending: Vec<u8>,
+    hasher: Crc64Ecma,
+    verify_crc64: bool,
+    content_md5: bool,
+    part_sem: Arc<Semaphore>,
+    limiter: Arc<Semaphore>,
+    tasks: tokio::task::JoinSet<anyhow::Result<(i32, String)>>,
+    metrics: Arc<Metrics>,
+}
+
+impl StreamingUpload {
+    /// Feed `data` into the upload. Buffers until a full part is ready, then
+    /// uploads it in the background.
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.hasher.update(data);
+        self.pending.extend_from_slice(data);
+        while self.pending.len() >= MULTIPART_PART_SIZE as usize {
+            let chunk: Vec<u8> = self.pending.drain(..MULTIPART_PART_SIZE as usize).collect();
+            self.upload_part(chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn upload_part(&mut self, chunk: Vec<u8>) -> Result<()> {
+        let part_no = self.next_part;
+        self.next_part += 1;
+        let slot = self
+            .part_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("multipart concurrency closed"))?;
+        let md5 = self.content_md5.then(|| content_md5(&chunk));
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+        let limiter = Arc::clone(&self.limiter);
+        self.tasks.spawn(async move {
+            let _permit = limiter
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
+            let mut part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_no)
+                .body(ByteStream::from(chunk));
+            if let Some(md5) = md5 {
+                part = part.content_md5(md5);
+            }
+            let resp = part.send().await.context("s3 upload part")?;
+            let etag = resp.e_tag().unwrap_or_default().to_string();
+            drop(slot);
+            Ok((part_no, etag))
+        });
+        Ok(())
+    }
+
+    /// Flush the final partial part, await all parts, and complete the upload.
+    pub async fn finish(mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            let chunk = std::mem::take(&mut self.pending);
+            self.upload_part(chunk).await?;
+        }
+        let mut upload_error = None;
+        while let Some(joined) = self.tasks.join_next().await {
+            match joined {
+                Ok(Ok((part_no, etag))) => self.parts.push((part_no, etag)),
+                Ok(Err(e)) => upload_error = Some(e),
+                Err(e) => upload_error = Some(anyhow::anyhow!("multipart task panicked: {e}")),
+            }
+        }
+        if let Some(e) = upload_error {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(&self.upload_id)
+                .send()
+                .await;
+            return Err(e);
+        }
+        self.parts.sort_by_key(|p| p.0);
+        let expected_crc = self.verify_crc64.then(|| self.hasher.finalize());
+        let crc_slot = Arc::new(Mutex::new(None));
+        let mut complete = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(
+                        self.parts
+                            .into_iter()
+                            .map(|(n, etag)| {
+                                CompletedPart::builder().part_number(n).e_tag(etag).build()
+                            })
+                            .collect(),
+                    ))
+                    .build(),
+            )
+            .customize();
+        if expected_crc.is_some() {
+            complete = complete.interceptor(Crc64ResponseCapture {
+                slot: Arc::clone(&crc_slot),
+            });
+        }
+        if let Err(e) = complete.send().await {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(&self.upload_id)
+                .send()
+                .await;
+            return Err(e).context("s3 complete multipart upload");
+        }
+        if let Some(expected) = expected_crc {
+            check_crc64_response(crc_slot, expected, &self.metrics)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct ObjectFs {
     client: Client,
     bucket: String,
@@ -2392,6 +2534,54 @@ impl ObjectFs {
             check_crc64_response(crc_slot, expected, &self.metrics)?;
         }
         Ok(())
+    }
+
+    /// Begin a streaming multipart upload for `path`. Bytes are fed via
+    /// [`StreamingUpload::write`] and uploaded as parts in the background, so
+    /// upload overlaps with the local write. Call [`StreamingUpload::finish`]
+    /// on close.
+    pub async fn begin_streaming_upload(&self, path: &str) -> Result<StreamingUpload> {
+        let key = self.key_for(path);
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key);
+        if let Some(sc) = &self.storage_class {
+            create = create.storage_class(sc.clone());
+        }
+        let create = create
+            .send()
+            .await
+            .inspect_err(|_| {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                self.metrics
+                    .s3_multipart_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            })
+            .context("s3 create multipart upload")?;
+        let upload_id = create
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
+            .to_string();
+        Ok(StreamingUpload {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key,
+            upload_id,
+            next_part: 1,
+            parts: Vec::new(),
+            pending: Vec::new(),
+            hasher: Crc64Ecma::new(),
+            verify_crc64: self.verify_crc64,
+            content_md5: self.content_md5,
+            part_sem: Arc::new(Semaphore::new(self.multipart_concurrency.max(1))),
+            limiter: Arc::clone(&self.limiter),
+            tasks: tokio::task::JoinSet::new(),
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 
     /// Create an empty directory marker object.
@@ -4253,6 +4443,57 @@ mod s3_mock_tests {
         assert_eq!(recorded[0].method, "PUT");
         assert!(!recorded[0].target.to_lowercase().contains("uploads"));
         assert_eq!(recorded[0].body, data);
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_reassembles() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        let mut up = fs
+            .begin_streaming_upload("/large.bin")
+            .await
+            .expect("begin");
+        let data: Vec<u8> = (0..20 * 1024 * 1024usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        up.write(&data).await.expect("write");
+        up.finish().await.expect("finish");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let lc = |t: &str| t.to_lowercase();
+        let creates = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploads")
+                    && !lc(&r.target).contains("uploadid")
+            })
+            .count();
+        assert_eq!(creates, 1, "exactly one initiate-multipart");
+
+        let mut parts: Vec<(i32, Vec<u8>)> = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && lc(&r.target).contains("partnumber"))
+            .map(|r| {
+                let query = r.target.split('?').nth(1).unwrap_or("");
+                let part_no = query
+                    .split('&')
+                    .find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        k.eq_ignore_ascii_case("partnumber")
+                            .then(|| v.parse::<i32>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                (part_no, r.body.clone())
+            })
+            .collect();
+        parts.sort_by_key(|(n, _)| *n);
+        let reassembled: Vec<u8> = parts.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(
+            reassembled, data,
+            "streaming parts must reassemble in order"
+        );
     }
 
     #[tokio::test]
