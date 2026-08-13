@@ -26,9 +26,8 @@ use tracing_subscriber::EnvFilter;
 
 use ossfs::{ObjectFs, OssConfig};
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: ossmount [mount] [--config PATH] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
+fn usage_text() -> String {
+    "usage: ossmount [mount] [--config PATH] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
                  [--prefix PREFIX] [--force-path-style] [--refresh-secs N]\n\
                  [--read-only] [--uid N] [--gid N] [--dir-mode M] [--file-mode M]\n\
                  [--allow-other] [--umask M]\n\
@@ -51,8 +50,18 @@ fn usage() -> ! {
          --config PATH:  JSON config file; keys are long option names (CLI\n\
                           args override file values). access_key_id /\n\
                           secret_access_key keys set the AWS env creds."
-    );
+        .to_string()
+}
+
+fn usage() -> ! {
+    eprint!("{}", usage_text());
     std::process::exit(2);
+}
+
+/// Print usage to stdout and exit 0 (used by `--help` / `-h`).
+fn usage_ok() -> ! {
+    print!("{}", usage_text());
+    std::process::exit(0);
 }
 
 /// Parse a POSIX permission mode: accepts octal (`755` / `0o755`) or
@@ -277,6 +286,7 @@ fn parse_args() -> (
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--help" | "-h" => usage_ok(),
             "--version" => {
                 println!(
                     "{} {} ({} {} dirty={} build={})",
