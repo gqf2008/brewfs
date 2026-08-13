@@ -100,6 +100,9 @@ pub struct OssConfig {
     /// CRC64-ECMA-182 checksum is computed locally on every object / multipart
     /// write and compared to the value OSS reports back after the upload.
     pub verify_crc64: bool,
+    /// Set the `Content-MD5` header on single PUT and each multipart part
+    /// (mirrors aliyun/ossfs `enable_content_md5`).
+    pub content_md5: bool,
     /// Storage class applied to newly written objects (mirrors aliyun/ossfs
     /// `storage_class`). Common values: `Standard`, `IA`, `Archive` (OSS) or
     /// `STANDARD` / `STANDARD_IA` / `GLACIER` (S3). `None` keeps the bucket
@@ -266,6 +269,16 @@ fn check_crc64_response(
         }
         None => anyhow::bail!("x-oss-hash-crc64ecma header missing from upload response"),
     }
+}
+
+/// Base64-encoded MD5 of `data`, for the S3 `Content-MD5` header
+/// (aliyun/ossfs `enable_content_md5`).
+fn content_md5(data: &[u8]) -> String {
+    use base64::Engine as _;
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
 
 impl OssConfig {
@@ -1059,6 +1072,8 @@ pub struct ObjectFs {
     verify_crc64: bool,
     /// Storage class for newly written objects (see [OssConfig::storage_class]).
     storage_class: Option<StorageClass>,
+    /// Set Content-MD5 on uploads (see [OssConfig::content_md5]).
+    content_md5: bool,
     /// Multipart upload part size in bytes.
     multipart_part_size: usize,
     /// Concurrent in-flight part uploads within a single multipart write.
@@ -1153,6 +1168,7 @@ impl ObjectFs {
             ignore_fsync,
             verify_crc64: config.verify_crc64,
             storage_class: config.storage_class.map(|s| StorageClass::from(s.as_str())),
+            content_md5: config.content_md5,
             multipart_part_size: config
                 .multipart_size
                 .unwrap_or(MULTIPART_PART_SIZE as usize)
@@ -1888,6 +1904,9 @@ impl ObjectFs {
         if let Some(sc) = &self.storage_class {
             put = put.storage_class(sc.clone());
         }
+        if self.content_md5 {
+            put = put.content_md5(content_md5(data));
+        }
         let mut put = put.customize();
         if expected_crc.is_some() {
             put = put.interceptor(Crc64ResponseCapture {
@@ -1954,6 +1973,7 @@ impl ObjectFs {
                 .await
                 .map_err(|_| anyhow::anyhow!("multipart upload concurrency closed"))?;
             let chunk = data[offset..end].to_vec();
+            let part_md5 = self.content_md5.then(|| content_md5(&chunk));
             let part_no = part_number;
             let upload_id = upload_id.clone();
             let key = key.clone();
@@ -1966,16 +1986,17 @@ impl ObjectFs {
                     .acquire_owned()
                     .await
                     .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
-                let resp = client
+                let mut part = client
                     .upload_part()
                     .bucket(&bucket)
                     .key(&key)
                     .upload_id(&upload_id)
                     .part_number(part_no)
-                    .body(ByteStream::from(chunk))
-                    .send()
-                    .await
-                    .context("s3 upload part")?;
+                    .body(ByteStream::from(chunk));
+                if let Some(md5) = part_md5 {
+                    part = part.content_md5(md5);
+                }
+                let resp = part.send().await.context("s3 upload part")?;
                 let etag = resp.e_tag().unwrap_or_default().to_string();
                 drop(slot);
                 Ok::<(i32, String), anyhow::Error>((part_no, etag))
@@ -2440,6 +2461,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2480,6 +2502,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2531,6 +2554,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2577,6 +2601,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2628,6 +2653,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2846,6 +2872,7 @@ mod tests {
             max_dirty_bytes: None,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_size: None,
             multipart_concurrency: None,
             disk_cache_reserve_diskfree: 0,
@@ -2903,6 +2930,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -2963,6 +2991,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3017,6 +3046,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3070,6 +3100,7 @@ mod tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3126,6 +3157,7 @@ mod s3_mock_tests {
         target: String,
         body: Vec<u8>,
         storage_class: Option<String>,
+        content_md5: Option<String>,
     }
 
     struct MockS3 {
@@ -3208,6 +3240,7 @@ mod s3_mock_tests {
         let head = String::from_utf8_lossy(&buf[..header_end.unwrap()]);
         let mut range_header: Option<String> = None;
         let mut storage_class_header: Option<String> = None;
+        let mut content_md5_header: Option<String> = None;
         for line in head.lines() {
             let lower = line.to_ascii_lowercase();
             if let Some(v) = lower.strip_prefix("range:") {
@@ -3218,6 +3251,9 @@ mod s3_mock_tests {
             }
             if lower.strip_prefix("x-amz-storage-class:").is_some() {
                 storage_class_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
+            }
+            if lower.strip_prefix("content-md5:").is_some() {
+                content_md5_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
             }
         }
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
@@ -3259,6 +3295,7 @@ mod s3_mock_tests {
             target: target.clone(),
             body,
             storage_class: storage_class_header.clone(),
+            content_md5: content_md5_header.clone(),
         });
 
         tokio::time::sleep(mock.delay).await;
@@ -3448,6 +3485,7 @@ mod s3_mock_tests {
             ignore_fsync: true,
             verify_crc64: false,
             storage_class: None,
+            content_md5: false,
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
@@ -3589,6 +3627,24 @@ mod s3_mock_tests {
             recorded[0].storage_class.as_deref(),
             Some("Standard"),
             "PUT must carry the requested x-amz-storage-class header"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_small_object_sets_content_md5() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.content_md5 = true;
+
+        let data = vec![0x5Au8; 1024];
+        fs.write("/small-md5.bin", &data).await.expect("write");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].content_md5.as_deref(),
+            Some(content_md5(&data).as_str()),
+            "single PUT must carry the base64 Content-MD5 header"
         );
     }
 
