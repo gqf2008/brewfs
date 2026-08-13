@@ -735,6 +735,7 @@ pub struct Metrics {
     read_cache_misses: AtomicU64,
     disk_cache_hits: AtomicU64,
     disk_cache_misses: AtomicU64,
+    prefetch_started: AtomicU64,
     crc64_mismatches: AtomicU64,
 }
 
@@ -758,6 +759,8 @@ pub struct MetricsSnapshot {
     pub read_cache_misses: u64,
     pub disk_cache_hits: u64,
     pub disk_cache_misses: u64,
+    pub prefetch_started: u64,
+    pub prefetch_inflight: usize,
     pub crc64_mismatches: u64,
 }
 
@@ -781,6 +784,8 @@ impl Metrics {
             read_cache_misses: self.read_cache_misses.load(Ordering::Relaxed),
             disk_cache_hits: self.disk_cache_hits.load(Ordering::Relaxed),
             disk_cache_misses: self.disk_cache_misses.load(Ordering::Relaxed),
+            prefetch_started: self.prefetch_started.load(Ordering::Relaxed),
+            prefetch_inflight: 0,
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
         }
     }
@@ -926,7 +931,9 @@ impl ObjectFs {
     /// Shared dirty-buffer budget for the adapters, when configured.
     /// Snapshot of monotonic operation counters (for an admin/metrics endpoint).
     pub fn metrics(&self) -> MetricsSnapshot {
-        self.metrics.snapshot()
+        let mut snapshot = self.metrics.snapshot();
+        snapshot.prefetch_inflight = self.prefetch_inflight.lock().unwrap().len();
+        snapshot
     }
 
     pub fn dirty_budget(&self) -> Option<DirtyBudget> {
@@ -1363,6 +1370,9 @@ impl ObjectFs {
         }
 
         if prefetch_next && !eof && self.disk_cache_prefetch_blocks > 0 {
+            self.metrics
+                .prefetch_started
+                .fetch_add(1, Ordering::Relaxed);
             let cache = Arc::clone(cache);
             let client = self.client.clone();
             let bucket = self.bucket.clone();

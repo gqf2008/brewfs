@@ -326,6 +326,8 @@ async fn main() -> anyhow::Result<()> {
                     read_cache_misses = m.read_cache_misses,
                     disk_cache_hits = m.disk_cache_hits,
                     disk_cache_misses = m.disk_cache_misses,
+                    prefetch_started = m.prefetch_started,
+                    prefetch_inflight = m.prefetch_inflight,
                     crc64_mismatches = m.crc64_mismatches,
                     upload_bytes_total = m.upload_bytes_total,
                     download_bytes_total = m.download_bytes_total,
