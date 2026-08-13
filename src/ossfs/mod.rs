@@ -32,7 +32,7 @@ use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
 };
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -417,16 +417,33 @@ impl DiskCache {
         let max_bytes =
             max_bytes.div_ceil(DISK_CACHE_BUDGET_UNIT) as u64 * DISK_CACHE_BUDGET_UNIT as u64;
         std::fs::create_dir_all(&dir).context("create disk cache dir")?;
+        let block_size = Self::load_or_init_block_size(&dir, block_size)?;
         let cache = Self {
             dir,
             max_bytes,
-            block_size: (block_size.max(1)) as u64,
+            block_size,
             used: AtomicU64::new(0),
             order: Mutex::new(VecDeque::new()),
         };
         cache.load_order();
         cache.rescan_used();
         Ok(cache)
+    }
+
+    fn load_or_init_block_size(dir: &Path, requested: usize) -> Result<u64> {
+        let meta = dir.join("cache.meta");
+        if let Ok(raw) = std::fs::read_to_string(&meta) {
+            if let Some(v) = raw
+                .lines()
+                .next()
+                .and_then(|l| l.strip_prefix("block_size="))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                return Ok(v.max(1));
+            }
+        }
+        std::fs::write(&meta, format!("block_size={}\n", requested.max(1)))?;
+        Ok(requested.max(1) as u64)
     }
 
     fn order_path(&self) -> PathBuf {
@@ -2179,6 +2196,19 @@ mod tests {
         );
         assert!(cache.path_for("k", 2).exists(), "C must survive");
         assert!(!cache.path_for("k", 1).exists(), "B must be evicted as LRU");
+    }
+
+    #[test]
+    fn disk_cache_block_size_persists_in_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 2 * 1024 * 1024)
+                .expect("cache");
+            assert_eq!(cache.block_size, 2 * 1024 * 1024);
+        }
+        let cache = DiskCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 1 * 1024 * 1024)
+            .expect("reopen");
+        assert_eq!(cache.block_size, 2 * 1024 * 1024);
     }
 
     #[tokio::test]
