@@ -556,6 +556,14 @@ mod tests {
     }
 
     #[test]
+    fn profile_import_falls_back_to_default_drive_when_mount_point_missing() {
+        let json = r#"{"bucket":"b","endpoint":"https://e","access_key_id":"ak","secret_access_key":"sk"}"#;
+        let p = Profile::from_ossmount_config(json).expect("import");
+        assert_eq!(p.drive, default_drive());
+        assert_eq!(p.s3_bucket, "b");
+    }
+
+    #[test]
     fn profile_json_roundtrip_preserves_mode_and_prefix() {
         let p = Profile {
             mode: "oss".into(),
