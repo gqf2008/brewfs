@@ -134,6 +134,10 @@ pub struct OssConfig {
     pub disk_cache_verify_etag: bool,
     /// ETag re-check TTL in seconds (default 10).
     pub disk_cache_etag_ttl_secs: u64,
+    /// Negative-stat cache TTL in seconds (default 5).
+    pub negative_cache_ttl_secs: u64,
+    /// Maximum negative-stat cache entries (default 4096).
+    pub negative_cache_max_entries: usize,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -885,6 +889,8 @@ pub struct ObjectFs {
     etag_checked: Mutex<HashMap<String, Instant>>,
     /// TTL for cached ETag checks.
     etag_ttl: Duration,
+    negative_ttl: Duration,
+    negative_max_entries: usize,
 
     /// Prefetch dedup skips and failures are tracked inside [`Metrics`].
     /// path -> end offset of its previous read (sequential-read hint).
@@ -973,6 +979,8 @@ impl ObjectFs {
             disk_cache_verify_etag: config.disk_cache_verify_etag,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: Duration::from_secs(config.disk_cache_etag_ttl_secs.max(1)),
+            negative_ttl: Duration::from_secs(config.negative_cache_ttl_secs.max(1)),
+            negative_max_entries: config.negative_cache_max_entries.max(1),
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync,
             verify_crc64: config.verify_crc64,
@@ -1191,7 +1199,7 @@ impl ObjectFs {
     fn negative_hit(&self, path: &str) -> bool {
         matches!(
             self.negative.lock().unwrap().get(path),
-            Some(at) if at.elapsed() < NEGATIVE_CACHE_TTL
+            Some(at) if at.elapsed() < self.negative_ttl
         )
     }
 
@@ -1199,15 +1207,12 @@ impl ObjectFs {
     /// positive cache).
     fn negative_insert(&self, path: &str) {
         let mut cache = self.negative.lock().unwrap();
-        if cache.len() >= MAX_NEGATIVE_ENTRIES {
+        if cache.len() >= self.negative_max_entries {
             cache.clear();
         }
         cache.insert(path.to_string(), Instant::now());
     }
 
-    /// Insert a stat result into the cache, clearing the whole cache when
-    /// over the bound so memory stays bounded. Kept separate from `stat` so
-    /// the bound logic is unit-testable without S3.
     fn cache_insert(&self, path: &str, entry: DirEntry) {
         let mut cache = self.stats.lock().unwrap();
         if cache.len() >= MAX_STAT_ENTRIES {
@@ -2221,6 +2226,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2254,6 +2261,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2298,6 +2307,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2337,6 +2348,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2381,6 +2394,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2549,6 +2564,8 @@ mod tests {
             disk_cache_prefetch_concurrency: 4,
             disk_cache_verify_etag: false,
             disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
             total_mem_limit: None,
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
@@ -2583,6 +2600,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2636,6 +2655,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2683,6 +2704,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -2729,6 +2752,8 @@ mod tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
@@ -3092,6 +3117,8 @@ mod s3_mock_tests {
             disk_cache_verify_etag: false,
             etag_checked: Mutex::new(HashMap::new()),
             etag_ttl: ETAG_CHECK_TTL,
+            negative_ttl: NEGATIVE_CACHE_TTL,
+            negative_max_entries: MAX_NEGATIVE_ENTRIES,
             read_seq: Mutex::new(HashMap::new()),
             ignore_fsync: true,
             verify_crc64: false,
