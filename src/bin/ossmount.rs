@@ -269,7 +269,15 @@ fn parse_args() -> (
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--version" => {
-                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                println!(
+                    "{} {} ({} {} dirty={} build={})",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                    env!("OSSFS_GIT_COMMIT_SHORT"),
+                    env!("OSSFS_GIT_BRANCH"),
+                    env!("OSSFS_GIT_DIRTY"),
+                    env!("OSSFS_BUILD_TIMESTAMP"),
+                );
                 std::process::exit(0);
             }
             "--bucket" => bucket = iter.next().unwrap_or_else(|| usage()),
