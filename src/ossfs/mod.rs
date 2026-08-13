@@ -419,8 +419,41 @@ impl DiskCache {
             used: AtomicU64::new(0),
             order: Mutex::new(VecDeque::new()),
         };
+        cache.load_order();
         cache.rescan_used();
         Ok(cache)
+    }
+
+    fn order_path(&self) -> PathBuf {
+        self.dir.join("lru.order")
+    }
+
+    fn load_order(&self) {
+        let Ok(raw) = std::fs::read_to_string(self.order_path()) else {
+            return;
+        };
+        let mut order = self.order.lock().unwrap();
+        for line in raw.lines() {
+            let Some((block, hex)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(block) = block.parse::<u64>() else {
+                continue;
+            };
+            let Some(key) = hex_decode(hex) else {
+                continue;
+            };
+            order.push_back((key, block));
+        }
+    }
+
+    fn save_order(&self) {
+        let order = self.order.lock().unwrap();
+        let mut out = String::new();
+        for (key, block) in order.iter() {
+            out.push_str(&format!("{block} {}\n", hex_encode(key)));
+        }
+        let _ = std::fs::write(self.order_path(), out);
     }
 
     fn path_for(&self, key: &str, block: u64) -> PathBuf {
@@ -458,6 +491,7 @@ impl DiskCache {
         if self.used.load(Ordering::Relaxed) > self.max_bytes {
             self.evict();
         }
+        self.save_order();
         Ok(())
     }
 
@@ -537,6 +571,7 @@ impl DiskCache {
 
     fn invalidate(&self, key: &str) {
         self.order.lock().unwrap().retain(|(k, _)| k != key);
+        self.save_order();
         let prefix = format!("{}-", fnv1a64(key));
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
@@ -561,11 +596,40 @@ impl DiskCache {
             }
         }
         self.order.lock().unwrap().clear();
+        self.save_order();
         self.used.store(0, Ordering::Relaxed);
     }
 }
 
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        self.save_order();
+    }
+}
+
 /// FNV-1a 64-bit hash used for disk-cache block file names.
+fn hex_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Option<String> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    String::from_utf8(out).ok()
+}
+
 fn fnv1a64(s: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for b in s.as_bytes() {
@@ -1991,6 +2055,30 @@ mod tests {
             .expect("write C triggers evict");
 
         assert!(cache.path_for("k", 0).exists(), "A must survive");
+        assert!(cache.path_for("k", 2).exists(), "C must survive");
+        assert!(!cache.path_for("k", 1).exists(), "B must be evicted as LRU");
+    }
+
+    #[test]
+    fn disk_cache_lru_order_persists_across_remount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let two_mib = vec![0xB5u8; 2 * 1024 * 1024];
+
+        {
+            let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("cache");
+            cache.write_block("k", 0, &two_mib).expect("write A");
+            cache.write_block("k", 1, &two_mib).expect("write B");
+            cache.read_block("k", 0); // touch A
+        }
+
+        let cache = DiskCache::new(dir.path().to_path_buf(), 5 * 1024 * 1024).expect("reopen");
+        cache
+            .write_block("k", 2, &two_mib)
+            .expect("write C triggers evict");
+        assert!(
+            cache.path_for("k", 0).exists(),
+            "A must survive across remount"
+        );
         assert!(cache.path_for("k", 2).exists(), "C must survive");
         assert!(!cache.path_for("k", 1).exists(), "B must be evicted as LRU");
     }
