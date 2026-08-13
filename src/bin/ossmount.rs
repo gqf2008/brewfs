@@ -32,7 +32,7 @@ fn usage() -> ! {
                  [--max-dirty-bytes N] [--credential-process CMD]\n\
                  [--disk-cache-dir PATH] [--disk-cache-max-bytes N]\n\
                  [--metrics-listen ADDR]\n\
-                 [--total-mem-limit N] [--read-cache-max-bytes N]\n\
+                 [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -75,6 +75,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
     let mut credential_process: Option<String> = None;
     let mut disk_cache_dir: Option<PathBuf> = None;
     let mut total_mem_limit: Option<usize> = None;
+    let mut total_mem_read_ratio: f64 = 0.5;
     let mut read_cache_max_bytes: Option<usize> = None;
     let mut disk_cache_max_bytes: usize = 0;
     let mut metrics_listen: Option<String> = None;
@@ -167,6 +168,13 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
                     .unwrap_or_else(|| usage());
                 total_mem_limit = if v == 0 { None } else { Some(v) };
             }
+            "--total-mem-read-ratio" => {
+                total_mem_read_ratio = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|r| *r > 0.0 && *r < 1.0)
+                    .unwrap_or_else(|| usage());
+            }
             "--read-cache-max-bytes" => {
                 let v: usize = iter
                     .next()
@@ -214,6 +222,7 @@ fn parse_args() -> (OssConfig, PathBuf, u64, Option<String>) {
             disk_cache_dir,
             disk_cache_max_bytes,
             total_mem_limit,
+            total_mem_read_ratio,
             read_cache_max_bytes,
             verify_crc64,
         },

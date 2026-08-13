@@ -112,6 +112,10 @@ pub struct OssConfig {
     /// 2:1:1 split (read cache : upload : dirty). Mirrors aliyun/ossfs
     /// `total_mem_limit`. `Some(0)` disables the override.
     pub total_mem_limit: Option<usize>,
+    /// Fraction of [`Self::total_mem_limit`] reserved for the in-memory read
+    /// cache (aliyun/ossfs `rw_ratio` semantics). Valid range `(0, 1)`.
+    /// The remaining memory is split equally between upload and dirty buffers.
+    pub total_mem_read_ratio: f64,
     /// Upper bound on the in-memory read-ahead cache in bytes. `None`
     /// uses the default [`READ_CACHE_MAX_BYTES`].
     pub read_cache_max_bytes: Option<usize>,
@@ -294,17 +298,23 @@ const DISK_CACHE_BUDGET_UNIT: usize = 1 << 20;
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
 /// Returns `None` when the budget is disabled. Values above what a single
 /// acquire call can represent are clamped.
-/// Derive effective memory budgets. When `total_mem_limit` is set it wins and
-/// splits 2:1:1 (read cache : upload bytes : dirty bytes); otherwise the
-/// individual options (and the default read-cache cap) are preserved.
+/// Derive effective memory budgets. When `total_mem_limit` is set it wins: the
+/// read cache takes `total_mem_read_ratio`, and the rest splits equally between
+/// upload bytes and dirty bytes. Otherwise the individual options win.
 fn effective_memory_budgets(
     total_mem_limit: Option<usize>,
+    total_mem_read_ratio: f64,
     max_upload_bytes: Option<usize>,
     max_dirty_bytes: Option<usize>,
     read_cache_max_bytes: Option<usize>,
 ) -> (Option<usize>, Option<usize>, usize) {
     match total_mem_limit {
-        Some(total) if total > 0 => (Some(total / 4), Some(total / 4), total / 2),
+        Some(total) if total > 0 => {
+            let ratio = total_mem_read_ratio.clamp(0.01, 0.99);
+            let read = ((total as f64) * ratio) as usize;
+            let rest = total.saturating_sub(read);
+            (Some(rest / 2), Some(rest / 2), read)
+        }
         _ => (
             max_upload_bytes,
             max_dirty_bytes,
@@ -312,7 +322,6 @@ fn effective_memory_budgets(
         ),
     }
 }
-
 fn upload_budget_units(max_bytes: Option<usize>) -> Option<usize> {
     let bytes = max_bytes?;
     if bytes == 0 {
@@ -633,6 +642,7 @@ impl ObjectFs {
         let client = Client::from_conf(builder.build());
         let (max_upload_bytes, max_dirty_bytes, read_cache_max_bytes) = effective_memory_budgets(
             config.total_mem_limit,
+            config.total_mem_read_ratio,
             config.max_upload_bytes,
             config.max_dirty_bytes,
             config.read_cache_max_bytes,
@@ -1904,7 +1914,7 @@ mod tests {
     #[test]
     fn total_mem_limit_derives_budgets() {
         assert_eq!(
-            effective_memory_budgets(Some(64 * 1024 * 1024), None, None, None),
+            effective_memory_budgets(Some(64 * 1024 * 1024), 0.5, None, None, None),
             (
                 Some(16 * 1024 * 1024),
                 Some(16 * 1024 * 1024),
@@ -1912,11 +1922,11 @@ mod tests {
             )
         );
         assert_eq!(
-            effective_memory_budgets(None, Some(5), Some(7), Some(9)),
+            effective_memory_budgets(None, 0.5, Some(5), Some(7), Some(9)),
             (Some(5), Some(7), 9)
         );
         assert_eq!(
-            effective_memory_budgets(None, None, None, None),
+            effective_memory_budgets(None, 0.5, None, None, None),
             (None, None, READ_CACHE_MAX_BYTES)
         );
     }
@@ -1955,6 +1965,7 @@ mod tests {
             disk_cache_dir: None,
             disk_cache_max_bytes: 0,
             total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
             credential_process: None,
         }
