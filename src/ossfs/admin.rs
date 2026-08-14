@@ -6,6 +6,7 @@
 //! endpoint is meant for local observability only.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,22 +14,49 @@ use tokio::net::TcpListener;
 
 use super::{MetricsSnapshot, ObjectFs};
 
-/// Serve `GET /metrics` on `addr` until the process exits. The returned future
-/// never completes normally; bind/accept errors are returned to the caller.
+/// How long a metrics connection may sit without sending a request before it
+/// is dropped. Bounds the per-connection task count: an idle client (open
+/// socket, no bytes) otherwise pins a task forever (#60).
+const METRICS_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff after an `accept` error so a persistent error (EMFILE, a broken
+/// listener) cannot busy-loop the accept task (#60).
+const METRICS_ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Serve `GET /metrics` on `addr` until the process exits. Bind errors are
+/// returned to the caller; transient `accept` errors are logged and retried
+/// so a single bad accept cannot take the metrics endpoint down forever.
 pub async fn serve_metrics(addr: &str, fs: Arc<ObjectFs>) -> Result<()> {
+    serve_metrics_with_read_timeout(addr, fs, METRICS_READ_TIMEOUT).await
+}
+
+/// [`serve_metrics`] with an explicit read timeout (test seam).
+pub async fn serve_metrics_with_read_timeout(
+    addr: &str,
+    fs: Arc<ObjectFs>,
+    read_timeout: Duration,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind metrics listener {addr}"))?;
 
     loop {
-        let (mut stream, _peer) = listener
-            .accept()
-            .await
-            .context("accept metrics connection")?;
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // One failed accept (EMFILE, connection aborted during accept,
+                // ...) must not terminate the endpoint permanently.
+                tracing::warn!(error = %e, "metrics accept failed; retrying");
+                tokio::time::sleep(METRICS_ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let fs = Arc::clone(&fs);
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            let Ok(n) = stream.read(&mut buf).await else {
+            // Drop connections that connect but never send a request: the
+            // task (and its buffers) is bounded by the read timeout.
+            let read = tokio::time::timeout(read_timeout, stream.read(&mut buf)).await;
+            let Ok(Ok(n)) = read else {
                 return;
             };
             let request = String::from_utf8_lossy(&buf[..n]);
@@ -136,8 +164,66 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_prometheus;
-    use crate::ossfs::MetricsSnapshot;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::ossfs::{MockS3, test_fs};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Connect with retries until the freshly spawned service has bound its
+    /// listener.
+    async fn connect_with_retry(addr: &str) -> TcpStream {
+        for _ in 0..100 {
+            if let Ok(stream) = TcpStream::connect(addr).await {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("metrics service did not come up");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_dropped_and_service_survives() {
+        // Regression (#60): an idle connection pinned a per-connection task
+        // forever, and any single accept error killed the endpoint.
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = Arc::new(test_fs(port, 8));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let addr = format!("127.0.0.1:{}", addr.port());
+        let service_addr = addr.clone();
+        let service = tokio::spawn(async move {
+            serve_metrics_with_read_timeout(&service_addr, fs, Duration::from_millis(200)).await
+        });
+
+        // An idle connection must be dropped by the read timeout.
+        let mut idle = connect_with_retry(&addr).await;
+        let mut scratch = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut scratch)).await;
+        match closed {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("expected the idle connection to be closed, read {n} bytes"),
+            Err(_) => panic!("idle connection was not dropped within the timeout"),
+        }
+
+        // The endpoint still serves a real request afterwards.
+        let mut client = connect_with_retry(&addr).await;
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf))
+            .await
+            .expect("read response")
+            .expect("read response");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(text.contains("ossfs_reads_total"), "got: {text}");
+        service.abort();
+    }
 
     #[test]
     fn formats_prometheus_lines() {
