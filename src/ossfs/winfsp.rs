@@ -34,6 +34,7 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const WIN32_FILE_NOT_FOUND: i32 = 2;
 const WIN32_ACCESS_DENIED: i32 = 5;
 const WIN32_INVALID_PARAMETER: i32 = 87;
+const WIN32_ALREADY_EXISTS: i32 = 183;
 
 /// Above this size a write handle spills its buffer to a temp file so a large
 /// file copy cannot exhaust process memory.
@@ -134,7 +135,11 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// Per-open-file state. Writes are buffered whole-file; reads go straight to
 /// the object store unless the file is open for write.
 pub struct OssFileContext {
-    path: String,
+    /// POSIX path. `Mutex` so the `rename` callback (which only receives an
+    /// immutable context) can retarget an open handle to its new path;
+    /// otherwise a dirty handle would flush to the deleted old key and
+    /// resurrect the object (#46).
+    path: Mutex<String>,
     is_dir: bool,
     /// Whole-file write buffer; `Some` when the handle was opened for write.
     /// Content is loaded **lazily**: `loaded` stays false until the first
@@ -169,9 +174,14 @@ pub struct OssFileContext {
 impl OssFileContext {
     fn index(&self) -> u64 {
         // Stable-ish per-path index derived from the string.
-        self.path.as_bytes().iter().fold(0x9E37_79B9u64, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(*b as u64)
-        })
+        self.path
+            .lock()
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .fold(0x9E37_79B9u64, |acc, b| {
+                acc.wrapping_mul(31).wrapping_add(*b as u64)
+            })
     }
 }
 
@@ -344,7 +354,7 @@ impl OssMountContext {
         let spool = ctx.spool_path.lock().unwrap().clone();
         if let Some(path) = spool {
             self.fs
-                .write_from_file(&ctx.path, &path)
+                .write_from_file(&*ctx.path.lock().unwrap(), &path)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             let _ = std::fs::remove_file(&path);
@@ -360,7 +370,7 @@ impl OssMountContext {
         let data = ctx.write_buf.lock().unwrap().clone();
         if let Some(data) = data {
             self.fs
-                .write(&ctx.path, &data)
+                .write(&*ctx.path.lock().unwrap(), &data)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         }
@@ -663,7 +673,7 @@ impl FileSystemContext for OssMountContext {
         };
         *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
         Ok(OssFileContext {
-            path: posix,
+            path: Mutex::new(posix),
             is_dir,
             write_buf: Mutex::new(write_buf),
             loaded: AtomicBool::new(false),
@@ -710,7 +720,7 @@ impl FileSystemContext for OssMountContext {
         let write_buf = if is_dir { None } else { Some(Vec::new()) };
         *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
         Ok(OssFileContext {
-            path: posix,
+            path: Mutex::new(posix),
             is_dir,
             write_buf: Mutex::new(write_buf),
             loaded: AtomicBool::new(true),
@@ -731,7 +741,7 @@ impl FileSystemContext for OssMountContext {
         let delete_requested = context.delete_on_close.load(Ordering::Acquire)
             || winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
         if delete_requested {
-            let path = context.path.clone();
+            let path = context.path.lock().unwrap().clone();
             let is_dir = context.is_dir;
             let fs = Arc::clone(&self.fs);
             let result = self.block_on({
@@ -753,7 +763,7 @@ impl FileSystemContext for OssMountContext {
         if context.dirty.load(Ordering::Acquire)
             && let Err(e) = self.block_on(self.upload_dirty(context))
         {
-            warn!(path = log_path(&context.path), error = ?e, "ossfs cleanup flush failed");
+            warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
         }
     }
 
@@ -777,7 +787,7 @@ impl FileSystemContext for OssMountContext {
         if logical_size > 0 {
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: context.is_dir,
                     size: logical_size,
                     mtime_secs: 0,
@@ -790,7 +800,7 @@ impl FileSystemContext for OssMountContext {
             let size = context.spool_size.load(Ordering::Acquire);
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: context.is_dir,
                     size,
                     mtime_secs: 0,
@@ -804,7 +814,7 @@ impl FileSystemContext for OssMountContext {
         {
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: context.is_dir,
                     size: buf.len() as u64,
                     mtime_secs: 0,
@@ -814,7 +824,7 @@ impl FileSystemContext for OssMountContext {
             return Ok(());
         }
         let entry = self
-            .block_on(self.fs.stat(&context.path))
+            .block_on(self.fs.stat(&*context.path.lock().unwrap()))
             .map_err(|e| FspError::from(IoError::other(e.to_string())))?
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
         *file_info = file_info_from(&entry, context.index());
@@ -845,7 +855,7 @@ impl FileSystemContext for OssMountContext {
         context.loaded.store(true, Ordering::Release);
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
-            name: context.path.clone(),
+            name: context.path.lock().unwrap().clone(),
             is_dir: false,
             size: 0,
             mtime_secs: 0,
@@ -856,7 +866,7 @@ impl FileSystemContext for OssMountContext {
 
     fn rename(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         replace_if_exists: bool,
@@ -864,9 +874,18 @@ impl FileSystemContext for OssMountContext {
         let old = win_path_to_posix(file_name);
         let new = win_path_to_posix(new_file_name);
         let fs = Arc::clone(&self.fs);
-        self.block_on(async move { fs.rename(&old, &new).await })
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        let _ = replace_if_exists;
+        self.block_on(async move { fs.rename(&old, &new, replace_if_exists).await })
+            .map_err(|e| {
+                let io = IoError::other(e.to_string());
+                if e.to_string().contains("target already exists") {
+                    FspError::from(IoError::from_raw_os_error(WIN32_ALREADY_EXISTS))
+                } else {
+                    FspError::from(io)
+                }
+            })?;
+        // Retarget this handle to the new path so a later flush writes the
+        // new key instead of resurrecting the deleted old object (#46).
+        *context.path.lock().unwrap() = new;
         Ok(())
     }
 
@@ -896,16 +915,16 @@ impl FileSystemContext for OssMountContext {
         };
         let entry = if let Some(size) = buf_size {
             DirEntry {
-                name: context.path.clone(),
+                name: context.path.lock().unwrap().clone(),
                 is_dir: context.is_dir,
                 size,
                 mtime_secs: 0,
             }
         } else {
-            self.block_on(self.fs.stat(&context.path))
+            self.block_on(self.fs.stat(&*context.path.lock().unwrap()))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?
                 .unwrap_or(DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: context.is_dir,
                     size: 0,
                     mtime_secs: 0,
@@ -958,7 +977,7 @@ impl FileSystemContext for OssMountContext {
         }
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
-            name: context.path.clone(),
+            name: context.path.lock().unwrap().clone(),
             is_dir: false,
             size: new_size,
             mtime_secs: 0,
@@ -1020,7 +1039,7 @@ impl AsyncFileSystemContext for OssMountContext {
         }
         match self
             .fs
-            .read_range(&context.path, offset, buffer.len())
+            .read_range(&*context.path.lock().unwrap(), offset, buffer.len())
             .await
         {
             Ok(data) => {
@@ -1031,7 +1050,7 @@ impl AsyncFileSystemContext for OssMountContext {
             Err(e) => {
                 eprintln!(
                     "ossfs read_range err path={} offset={} len={}: {e:?}",
-                    context.path,
+                    *context.path.lock().unwrap(),
                     offset,
                     buffer.len()
                 );
@@ -1073,7 +1092,7 @@ impl AsyncFileSystemContext for OssMountContext {
                 }
                 context.dirty.store(true, Ordering::Release);
                 let entry = DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: false,
                     size: context.logical_size.load(Ordering::Acquire),
                     mtime_secs: 0,
@@ -1093,7 +1112,7 @@ impl AsyncFileSystemContext for OssMountContext {
             if self.dirty_budget.is_some() {
                 let remote_size = self
                     .fs
-                    .stat(&context.path)
+                    .stat(&*context.path.lock().unwrap())
                     .await
                     .ok()
                     .flatten()
@@ -1103,7 +1122,7 @@ impl AsyncFileSystemContext for OssMountContext {
             }
             let data = self
                 .fs
-                .read_range(&context.path, 0, usize::MAX)
+                .read_range(&*context.path.lock().unwrap(), 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             // The object may have grown since stat; top up the reservation.
@@ -1139,7 +1158,7 @@ impl AsyncFileSystemContext for OssMountContext {
             let existing = context.write_buf.lock().unwrap().clone();
             let mut up = self
                 .fs
-                .begin_streaming_upload(&context.path)
+                .begin_streaming_upload(&*context.path.lock().unwrap())
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             if let Some(existing) = &existing
@@ -1162,7 +1181,7 @@ impl AsyncFileSystemContext for OssMountContext {
             context.logical_size.store(sz, Ordering::Release);
             context.dirty.store(true, Ordering::Release);
             let entry = DirEntry {
-                name: context.path.clone(),
+                name: context.path.lock().unwrap().clone(),
                 is_dir: false,
                 size: new_size as u64,
                 mtime_secs: 0,
@@ -1191,7 +1210,7 @@ impl AsyncFileSystemContext for OssMountContext {
         }
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
-            name: context.path.clone(),
+            name: context.path.lock().unwrap().clone(),
             is_dir: false,
             size: new_size as u64,
             mtime_secs: 0,
@@ -1207,16 +1226,23 @@ impl AsyncFileSystemContext for OssMountContext {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let entries = self.fs.list(&context.path).await.map_err(|e| {
-            eprintln!("ossmount: 列目录失败 {}: {e:?}", context.path);
-            FspError::from(IoError::other(e.to_string()))
-        })?;
+        let entries = self
+            .fs
+            .list(&*context.path.lock().unwrap())
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "ossmount: 列目录失败 {}: {e:?}",
+                    *context.path.lock().unwrap()
+                );
+                FspError::from(IoError::other(e.to_string()))
+            })?;
 
         // Remember this directory and its listing so the periodic
         // change-notification pass can diff it and refresh open views.
-        self.record_browsed(&context.path, &entries);
+        self.record_browsed(&*context.path.lock().unwrap(), &entries);
 
-        let is_root = context.path == "/";
+        let is_root = *context.path.lock().unwrap() == "/";
         let pat = pattern.map(|p| p.to_string_lossy());
 
         // Resume from the marker entry if present. Entries are streamed
@@ -1244,11 +1270,11 @@ impl AsyncFileSystemContext for OssMountContext {
         let mut dots: Vec<(String, DirEntry)> = Vec::new();
         if !is_root && start == 0 {
             if matches(".")
-                && let Ok(Some(dot)) = self.fs.stat(&context.path).await
+                && let Ok(Some(dot)) = self.fs.stat(&*context.path.lock().unwrap()).await
             {
                 dots.push((".".to_string(), dot));
             }
-            let parent = parent_posix(&context.path);
+            let parent = parent_posix(&*context.path.lock().unwrap());
             if matches("..")
                 && let Ok(Some(dotdot)) = self.fs.stat(&parent).await
             {
@@ -1478,7 +1504,7 @@ mod tests {
     /// same approach as the existing `w()` helper).
     fn test_file_with(path: &str, loaded: bool) -> &'static OssFileContext {
         Box::leak(Box::new(OssFileContext {
-            path: path.to_string(),
+            path: Mutex::new(path.to_string()),
             is_dir: false,
             write_buf: Mutex::new(Some(Vec::new())),
             loaded: AtomicBool::new(loaded),
@@ -1628,6 +1654,21 @@ mod tests {
             mock.get_count.load(Ordering::SeqCst),
             0,
             "oversized lazy-load must not download the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_retargets_handle_path() {
+        // #46: after a rename the open handle must flush to the new key —
+        // otherwise a dirty handle resurrects the deleted old object.
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/a");
+        ctx.rename(&file, w("\\a"), w("\\b"), true).expect("rename");
+        assert_eq!(
+            *file.path.lock().unwrap(),
+            "/b",
+            "handle must be retargeted to the new path"
         );
     }
 }

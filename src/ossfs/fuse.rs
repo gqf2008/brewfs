@@ -110,6 +110,10 @@ struct OpenFile {
     /// into the stream, so that PUT would upload an empty object over the
     /// previous content.
     stream_failed: Arc<AtomicBool>,
+    /// Set when the backing object was unlinked/removed while this handle was
+    /// open. POSIX keeps the handle usable but the bytes must be discarded on
+    /// close — flushing would resurrect the deleted object (#46).
+    unlinked: bool,
     /// Current logical file size (set by setattr/truncate and write).
     logical_size: u64,
 }
@@ -277,6 +281,11 @@ impl OssFs {
     /// Flush a dirty open file to the object store. A streaming handle
     /// completes its multipart upload; a small handle uploads its buffer.
     fn flush_open(&self, open: &OpenFile) -> anyhow::Result<()> {
+        if open.unlinked {
+            // The object was unlinked while this handle was open; POSIX
+            // discards the bytes on close — never resurrect it (#46).
+            return Ok(());
+        }
         if !open.dirty {
             return Ok(());
         }
@@ -654,6 +663,14 @@ impl Filesystem for OssFs {
             reply.error(Errno::EIO);
             return;
         }
+        // Mark handles on the deleted path so their close cannot resurrect
+        // the object (POSIX: unlinked open files discard their bytes) (#46).
+        let mut files = self.files.lock().unwrap();
+        for open in files.values_mut() {
+            if open.path == path {
+                open.unlinked = true;
+            }
+        }
         reply.ok();
     }
 
@@ -685,7 +702,7 @@ impl Filesystem for OssFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (Some(parent_path), Some(newparent_path)) =
@@ -700,11 +717,39 @@ impl Filesystem for OssFs {
         };
         let old = join_path(&parent_path, name);
         let new = join_path(&newparent_path, newname);
-        if let Err(e) = self.block_on(self.fs.rename(&old, &new)) {
+        // RENAME_NOREPLACE only exists on Linux (renameat2); macOS rename
+        // always replaces the target.
+        let replace_if_exists = {
+            #[cfg(target_os = "linux")]
+            {
+                !flags.contains(RenameFlags::RENAME_NOREPLACE)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        };
+        if let Err(e) = self.block_on(self.fs.rename(&old, &new, replace_if_exists)) {
             warn!(old = %old, new = %new, error = ?e, "ossfs rename failed");
-            reply.error(Errno::EIO);
+            reply.error(if e.to_string().contains("target already exists") {
+                Errno::EEXIST
+            } else {
+                Errno::EIO
+            });
             return;
         }
+        // Retarget open handles so a later flush writes the new key instead
+        // of resurrecting the deleted old object (#46).
+        let prefix = format!("{old}/");
+        let mut files = self.files.lock().unwrap();
+        for open in files.values_mut() {
+            if open.path == old {
+                open.path = new.clone();
+            } else if let Some(suffix) = open.path.strip_prefix(&prefix) {
+                open.path = format!("{new}/{suffix}");
+            }
+        }
+        drop(files);
         // The kernel re-looks-up the new name; keep the map consistent for the
         // moved path in case it is referenced by its old inode until forget.
         self.register_inode(&new);
@@ -752,6 +797,7 @@ impl Filesystem for OssFs {
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
+                unlinked: false,
                 logical_size: 0,
             },
         );
@@ -835,6 +881,7 @@ impl Filesystem for OssFs {
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
+                unlinked: false,
                 logical_size: 0,
             },
         );
