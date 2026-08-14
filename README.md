@@ -77,9 +77,8 @@ ossmount mount --bucket my-bucket \
 ```
 
 Or use `ossfs-tray`: *Add config* → fill in name / drive / bucket / endpoint /
-
-Run `ossmount --version` to print the version, git commit, branch, dirty flag, and build timestamp.
-region / access key → *Save* → *Mount*.
+region / access key → *Save* → *Mount*. Run `ossmount --version` to print the
+version, git commit, branch, dirty flag, and build timestamp.
 
 ## Configuration
 

@@ -42,5 +42,23 @@ metadata database (s3fs-style layout).
   page-cache data, and the tiny-overlap direct-I/O profile has a
   split-write/page-cache coherency race. Full direct I/O is not a substitute
   (mmap returns `ENODEV`).
-- FIFO, socket, char/block device inodes and `rdev` are persisted as object
-  markers; the adapters map them back on readdir/stat.
+- Special file types are **not supported**. The FUSE adapter only produces
+  `Directory` / `RegularFile` attributes (`rdev` is always 0) and `mknod`
+  rejects non-regular modes with `EPERM`; `DirEntry` carries no type or
+  `rdev` field. FIFOs, sockets, and char/block devices cannot be created or
+  represented. (Whether to persist them as object markers like the WinFsp
+  side is an open decision — see the tracking issue.)
+- Symlinks (`symlink`/`readlink`), hard links (`link`), extended attributes
+  (`setxattr`/`getxattr`/`listxattr`/`removexattr`), `lseek` (`SEEK_DATA` /
+  `SEEK_HOLE`) and `fallocate` are not implemented; the vendored fuser
+  defaults answer `ENOSYS` for all of them (e.g. `ln -s` fails with `ENOSYS`,
+  not `EPERM`/`ENOTSUP`).
+- POSIX file locks (`setlk`/`getlk`) are not implemented and answer `ENOSYS`;
+  `flush` ignores `lock_owner`. Local `flock`/`fcntl` locking still works
+  inside one machine via the kernel's page-cache-level locking; there is no
+  cross-machine lock coordination.
+- `rmdir` recursively deletes the whole prefix under the directory (matching
+  the WinFsp adapter's cleanup semantics) instead of failing with
+  `ENOTEMPTY` on a non-empty directory — this is what makes `rm -rf` and
+  Finder deletion work, but plain `rmdir` on a non-empty directory also
+  succeeds.
