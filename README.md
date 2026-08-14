@@ -174,6 +174,7 @@ attributes without extra stat round trips.
 - `list-rate-limit`: number, calls/sec (`0` = unlimited)
 - `storage-class` / `credential-process`: string
 - `connect-timeout` / `readwrite-timeout`: number (`0` = default `10` / `600`); `retries`: number (`0` = SDK default)
+- Request timeouts cannot be disabled — a request that may hang forever can wedge the write path (frozen copies, silent upload loss)
 
 - Caches: `stat-cache-ttl` (`3`), `stat-cache-max-entries` (`4096`), `negative-cache-ttl` (`5`), `negative-cache-max-entries` (`4096`), `read-cache-max-bytes` (`67108864`), `total-mem-limit` (`0`), `total-mem-read-ratio` (`0.5`)
 - Disk cache: `disk-cache-dir`, `disk-cache-max-bytes`, `disk-cache-block-size`, `disk-cache-prefetch-blocks`, `disk-cache-prefetch-concurrency`, `disk-cache-etag-ttl`, `disk-cache-reserve-diskfree`, `disk-cache-free-space-ratio`

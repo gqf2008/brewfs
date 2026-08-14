@@ -390,12 +390,13 @@ const MAX_CONCURRENT_S3_REQUESTS: usize = 32;
 /// silently-stalled connection parks its limiter permit (and multipart part
 /// slot) forever, wedging the mount's write path.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Default request read timeout. The smithy "read timeout" bounds the whole
-/// request/response-head exchange — including sending the request body — so
-/// it must tolerate an 8 MiB multipart part over a slow uplink: 600 s keeps
-/// the minimum effective per-request upload rate at ~14 KB/s while
-/// guaranteeing a stalled request errors out (and the SDK retries) instead
-/// of hanging the mount forever.
+/// Default request read timeout. The smithy "read timeout" bounds sending the
+/// request (including its body) plus waiting for the **response headers** —
+/// it does NOT bound streaming the response body, so large downloads are
+/// never cut off mid-stream. The default must tolerate an 8 MiB multipart
+/// part over a slow uplink: 600 s keeps the minimum effective per-request
+/// upload rate at ~14 KB/s while guaranteeing a stalled request errors out
+/// (and the SDK retries) instead of hanging the mount forever.
 const DEFAULT_READWRITE_TIMEOUT_SECS: u64 = 600;
 /// Above this size, `write` uploads via S3 multipart (bounded-concurrency
 /// parts) instead of a single PUT. A single PUT is capped at 5 GiB by OSS/S3

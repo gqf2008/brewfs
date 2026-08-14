@@ -159,6 +159,7 @@ FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无�
 - `list-rate-limit`：数字，次/秒（`0` = 不限）
 - `storage-class` / `credential-process`：字符串
 - `connect-timeout` / `readwrite-timeout`：数字（`0` = 默认值 `10` / `600`）；`retries`：数字（`0` = SDK 默认）
+- 请求超时**不可禁用**——允许永久挂起的请求会冻结写入路径（复制冻结、上传静默丢失）
 
 - 缓存：`stat-cache-ttl`（`3`）、`stat-cache-max-entries`（`4096`）、`negative-cache-ttl`（`5`）、`negative-cache-max-entries`（`4096`）、`read-cache-max-bytes`（`67108864`）、`total-mem-limit`（`0`）、`total-mem-read-ratio`（`0.5`）
 - 磁盘缓存：`disk-cache-dir`、`disk-cache-max-bytes`、`disk-cache-block-size`、`disk-cache-prefetch-blocks`、`disk-cache-prefetch-concurrency`、`disk-cache-etag-ttl`、`disk-cache-reserve-diskfree`、`disk-cache-free-space-ratio`
