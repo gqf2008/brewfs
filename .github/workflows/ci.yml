@@ -73,17 +73,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check workspace
-        run: cargo check --workspace
+      # The FUSE adapter needs pkg-config + a fuse library (macFUSE/FUSE-T
+      # headers) that CI runners do not have; on macOS check/test the
+      # metadata-store core (ossfs without the fuse feature) and the tray
+      # app, which does not depend on the ossfs library crate.
+      - name: Check workspace (no FUSE adapter)
+        run: cargo check -p ossfs --no-default-features
 
-      - name: Build workspace
-        run: cargo build --workspace
+      - name: Test core (no FUSE adapter)
+        run: cargo test -p ossfs --no-default-features --lib --bins -- --test-threads=1
 
-      - name: Test workspace
-        run: cargo test --workspace --lib --bins --tests -- --test-threads=1
+      - name: Test tray app
+        run: cargo test -p ossfs-tray
 
-      - name: Clippy
-        run: cargo clippy --workspace
+      - name: Clippy (no FUSE adapter + tray)
+        run: cargo clippy -p ossfs --no-default-features -p ossfs-tray --lib --bins
 
   windows:
     name: Windows (WinFsp)
