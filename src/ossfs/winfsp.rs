@@ -157,6 +157,11 @@ pub struct OssFileContext {
     spool_size: AtomicU64,
     /// Streaming multipart upload for large files (write-while-upload).
     stream: tokio::sync::Mutex<Option<StreamingUpload>>,
+    /// Set when a streaming multipart completion failed. `upload_dirty` then
+    /// refuses to fall back to the whole-buffer PUT: the buffer was emptied
+    /// into the stream, so that PUT would upload an empty object over the
+    /// previous content.
+    stream_failed: AtomicBool,
     /// Logical size reported while a streaming upload is in flight.
     logical_size: AtomicU64,
 }
@@ -317,10 +322,19 @@ impl OssMountContext {
         if !ctx.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
+        if ctx.stream_failed.load(Ordering::Acquire) {
+            return Err(FspError::from(IoError::other(
+                "streaming upload previously failed; refusing to overwrite the object with partial data",
+            )));
+        }
         if let Some(up) = ctx.stream.lock().await.take() {
-            up.finish()
-                .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            if let Err(e) = up.finish().await {
+                // The buffer was emptied into the stream, so a later retry
+                // through the buffer path would PUT an empty object over the
+                // previous content; remember that and refuse.
+                ctx.stream_failed.store(true, Ordering::Release);
+                return Err(FspError::from(IoError::other(e.to_string())));
+            }
             ctx.logical_size.store(0, Ordering::Release);
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
@@ -661,6 +675,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
             logical_size: AtomicU64::new(0),
         })
     }
@@ -707,6 +722,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
             logical_size: AtomicU64::new(0),
         })
     }
@@ -1071,23 +1087,29 @@ impl AsyncFileSystemContext for OssMountContext {
         // dirty-buffer budget from the stat'd size BEFORE downloading: the
         // download itself allocates the whole object, so a post-hoc reserve
         // cannot stop an oversized object from exhausting process memory.
+        // Only meaningful when the mount has a budget configured (without one
+        // the stat would be dead work).
         if !context.loaded.load(Ordering::Acquire) {
-            let remote_size = self
-                .fs
-                .stat(&context.path)
-                .await
-                .ok()
-                .flatten()
-                .map(|e| e.size as usize)
-                .unwrap_or(0);
-            self.reserve_dirty(context, remote_size).await?;
+            if self.dirty_budget.is_some() {
+                let remote_size = self
+                    .fs
+                    .stat(&context.path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| e.size as usize)
+                    .unwrap_or(0);
+                self.reserve_dirty(context, remote_size).await?;
+            }
             let data = self
                 .fs
                 .read_range(&context.path, 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             // The object may have grown since stat; top up the reservation.
-            self.reserve_dirty(context, data.len()).await?;
+            if self.dirty_budget.is_some() {
+                self.reserve_dirty(context, data.len()).await?;
+            }
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
@@ -1468,6 +1490,7 @@ mod tests {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
             logical_size: AtomicU64::new(0),
         }))
     }

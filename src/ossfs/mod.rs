@@ -532,11 +532,21 @@ impl DirtyBudget {
         self.max_units
     }
 
+    /// Number of whole-unit permits for `bytes`, erroring when the amount
+    /// exceeds the budget's total capacity.
+    pub(crate) fn units_for(&self, bytes: usize) -> Result<usize> {
+        let units = bytes.div_ceil(self.unit);
+        if units > self.max_units {
+            anyhow::bail!("{bytes} bytes exceeds max-dirty-bytes budget");
+        }
+        Ok(units)
+    }
+
     /// Acquire `units` MiB permits. Returns an RAII permit that releases them
     /// on drop. `units == 0` returns an empty permit.
     pub async fn acquire_units(&self, units: usize) -> Result<DirtyPermit> {
         if units == 0 {
-            return Ok(DirtyPermit { _permit: None });
+            return Ok(DirtyPermit::noop());
         }
         let permit = self
             .sem
@@ -548,12 +558,38 @@ impl DirtyBudget {
             _permit: Some(permit),
         })
     }
+
+    /// Like [`Self::acquire_units`] but fails immediately when fewer than
+    /// `units` permits are available instead of waiting. Callers on
+    /// single-threaded dispatch loops (e.g. FUSE truncate) must use this: a
+    /// blocking acquire would park the only thread that can ever release the
+    /// permits (handle close), deadlocking the whole mount.
+    pub(crate) async fn try_acquire_units(&self, units: usize) -> Option<DirtyPermit> {
+        if units == 0 {
+            return Some(DirtyPermit::noop());
+        }
+        self.sem
+            .clone()
+            .try_acquire_many_owned(units as u32)
+            .ok()
+            .map(|permit| DirtyPermit {
+                _permit: Some(permit),
+            })
+    }
 }
 
 /// RAII permit returned by [`DirtyBudget::acquire_units`]. Dropping it
 /// releases the reserved MiB permits back to the budget.
 pub struct DirtyPermit {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl DirtyPermit {
+    /// An empty permit that holds no budget units (used when the mount has
+    /// no budget configured or `units == 0`).
+    pub(crate) fn noop() -> Self {
+        Self { _permit: None }
+    }
 }
 
 /// Token-bucket rate limiter for directory enumerations. Bounds how
