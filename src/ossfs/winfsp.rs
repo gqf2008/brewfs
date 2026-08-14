@@ -1443,6 +1443,14 @@ mod tests {
     use crate::ossfs::{MockS3, test_fs_with_budget};
     use std::time::Duration;
 
+    /// NUL-terminated U16CStr for callback tests (leaked, tests only).
+    fn w(s: &str) -> &'static U16CStr {
+        let mut units: Vec<u16> = s.encode_utf16().collect();
+        units.push(0);
+        let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
+        U16CStr::from_slice(leaked).unwrap()
+    }
+
     fn entry(name: &str) -> DirEntry {
         DirEntry {
             name: name.to_string(),
