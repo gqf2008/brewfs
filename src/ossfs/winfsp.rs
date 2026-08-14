@@ -1155,6 +1155,13 @@ impl AsyncFileSystemContext for OssMountContext {
                 // partial overwrite of a larger object would be truncated to
                 // the write's end on flush (data loss).
                 let logical = context.logical_size.load(Ordering::Acquire);
+                if logical > 0 {
+                    // Reserve BEFORE materializing a pending extension: a
+                    // SetEndOfFile(50 GB) followed by a 1-byte write would
+                    // otherwise allocate the 50 GB zero-filled seed ahead of
+                    // any budget check (review 2).
+                    self.reserve_dirty(context, logical as usize).await?;
+                }
                 let mut seeded = data;
                 if logical > 0 {
                     seeded.resize(logical as usize, 0);
