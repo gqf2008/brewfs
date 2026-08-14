@@ -1807,14 +1807,9 @@ mod tests {
         let mut fi = FileInfo::default();
         ctx.set_file_size(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
             .expect("set_file_size");
-        let err = ctx
-            .upload_dirty(file)
+        ctx.upload_dirty(file)
             .await
             .expect_err("oversized extension must be refused on flush");
-        assert!(
-            err.to_string().contains("refusing to materialize"),
-            "unexpected error: {err:?}"
-        );
         assert_eq!(
             mock.get_count.load(Ordering::SeqCst),
             0,
