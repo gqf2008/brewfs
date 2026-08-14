@@ -1141,6 +1141,15 @@ impl AsyncFileSystemContext for OssMountContext {
             if self.dirty_budget.is_some() {
                 self.reserve_dirty(context, data.len()).await?;
             }
+            // Reserve BEFORE materializing a pending SetEndOfFile extension:
+            // a 50 GB preallocation followed by a 1-byte write would
+            // otherwise allocate the zero-filled seed ahead of any budget
+            // check (review 2). Must run before taking the buffer lock.
+            let pending_logical = context.logical_size.load(Ordering::Acquire);
+            if pending_logical > 0 {
+                self.reserve_dirty(context, pending_logical as usize)
+                    .await?;
+            }
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
@@ -1154,23 +1163,15 @@ impl AsyncFileSystemContext for OssMountContext {
                 // the logical size when there is none pending. Without this, a
                 // partial overwrite of a larger object would be truncated to
                 // the write's end on flush (data loss).
-                let logical = context.logical_size.load(Ordering::Acquire);
-                if logical > 0 {
-                    // Reserve BEFORE materializing a pending extension: a
-                    // SetEndOfFile(50 GB) followed by a 1-byte write would
-                    // otherwise allocate the 50 GB zero-filled seed ahead of
-                    // any budget check (review 2).
-                    self.reserve_dirty(context, logical as usize).await?;
-                }
                 let mut seeded = data;
-                if logical > 0 {
-                    seeded.resize(logical as usize, 0);
+                if pending_logical > 0 {
+                    seeded.resize(pending_logical as usize, 0);
                 }
                 *buf = seeded;
                 let len = buf.len() as u64;
                 context
                     .logical_size
-                    .store(len.max(logical), Ordering::Release);
+                    .store(len.max(pending_logical), Ordering::Release);
                 context.loaded.store(true, Ordering::Release);
             }
         }
