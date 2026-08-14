@@ -358,7 +358,49 @@ impl OssMountContext {
             return Ok(());
         }
         let data = ctx.write_buf.lock().unwrap().clone();
-        if let Some(data) = data {
+        if let Some(mut data) = data {
+            // #48: SetEndOfFile/preallocation on a lazily-loaded write handle
+            // records only `logical_size`; uploading the still-empty buffer
+            // would PUT an empty object over the existing content. Fetch the
+            // original object and materialize the logical size (zero-fill
+            // extensions, truncate shrinks) before uploading.
+            let logical = ctx.logical_size.load(Ordering::Acquire) as usize;
+            if logical != data.len() {
+                // Review 3 P1: on a budget-less (default) mount a
+                // SetEndOfFile(50 GB) with no writes would otherwise allocate
+                // 50 GB of zero-fill here and OOM the process. Refuse
+                // extensions past the in-memory threshold and keep the remote
+                // object intact; truncations are safe (no allocation).
+                if logical > data.len() && logical > WRITE_SPOOL_THRESHOLD {
+                    return Err(FspError::from(IoError::other(format!(
+                        "refusing to materialize a {logical}-byte extension past the {} MiB in-memory threshold",
+                        WRITE_SPOOL_THRESHOLD / (1024 * 1024)
+                    ))));
+                }
+                // Gate the flush-time read-modify-write against the dirty
+                // budget BEFORE downloading (same as write_async's lazy
+                // load), and refuse absurd SetEndOfFile preallocations
+                // instead of materializing them (#48 review).
+                if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
+                    let remote_size = self
+                        .fs
+                        .stat(&ctx.path)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.size as usize)
+                        .unwrap_or(0);
+                    self.reserve_dirty(ctx, remote_size).await?;
+                    data = self
+                        .fs
+                        .read_range(&ctx.path, 0, usize::MAX)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    self.reserve_dirty(ctx, data.len()).await?;
+                }
+                self.reserve_dirty(ctx, logical).await?;
+                data.resize(logical, 0);
+            }
             self.fs
                 .write(&ctx.path, &data)
                 .await
@@ -1110,6 +1152,15 @@ impl AsyncFileSystemContext for OssMountContext {
             if self.dirty_budget.is_some() {
                 self.reserve_dirty(context, data.len()).await?;
             }
+            // Reserve BEFORE materializing a pending SetEndOfFile extension:
+            // a 50 GB preallocation followed by a 1-byte write would
+            // otherwise allocate the zero-filled seed ahead of any budget
+            // check (review 2). Must run before taking the buffer lock.
+            let pending_logical = context.logical_size.load(Ordering::Acquire);
+            if pending_logical > 0 {
+                self.reserve_dirty(context, pending_logical as usize)
+                    .await?;
+            }
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
@@ -1117,7 +1168,21 @@ impl AsyncFileSystemContext for OssMountContext {
                 )));
             };
             if !context.loaded.load(Ordering::Acquire) {
-                *buf = data;
+                // Seeding must keep `logical_size` authoritative (#48 review):
+                // a pending SetEndOfFile truncate/extend (recorded without
+                // loading) is materialized here, and the seeded length becomes
+                // the logical size when there is none pending. Without this, a
+                // partial overwrite of a larger object would be truncated to
+                // the write's end on flush (data loss).
+                let mut seeded = data;
+                if pending_logical > 0 {
+                    seeded.resize(pending_logical as usize, 0);
+                }
+                *buf = seeded;
+                let len = buf.len() as u64;
+                context
+                    .logical_size
+                    .store(len.max(pending_logical), Ordering::Release);
                 context.loaded.store(true, Ordering::Release);
             }
         }
@@ -1189,6 +1254,11 @@ impl AsyncFileSystemContext for OssMountContext {
             }
             buf[start..start + buffer.len()].copy_from_slice(buffer);
         }
+        // Keep `logical_size` authoritative for the small-buffer path too:
+        // upload_dirty materializes it on flush (#48/#49), so a write that
+        // only grows the buffer must be reflected here.
+        let end = (new_size as u64).max(context.logical_size.load(Ordering::Acquire));
+        context.logical_size.store(end, Ordering::Release);
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
             name: context.path.clone(),
@@ -1628,6 +1698,122 @@ mod tests {
             mock.get_count.load(Ordering::SeqCst),
             0,
             "oversized lazy-load must not download the object"
+        );
+    }
+
+    /// The single whole-object PUT body recorded by the mock, if any.
+    fn last_put_body(mock: &MockS3) -> Option<Vec<u8>> {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .last()
+            .map(|r| r.body.clone())
+    }
+
+    #[tokio::test]
+    async fn set_file_size_expand_on_unloaded_handle_preserves_content() {
+        // #48: SetEndOfFile(N) on an unloaded write handle records only the
+        // logical size; flushing must fetch the original object and
+        // zero-extend it — not PUT an empty object over the existing content.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, 10, false, &mut fi)
+            .expect("set_file_size");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        let mut expected = b"hello".to_vec();
+        expected.resize(10, 0);
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(expected.as_slice()),
+            "flush must fetch the original object and zero-extend it"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            1,
+            "exactly one GET for the original content"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_zero_on_unloaded_handle_still_truncates() {
+        // #48: SetEndOfFile(0) is a genuine truncate-to-zero — the empty PUT
+        // must keep working (set_file_size(0) marks the buffer loaded, so the
+        // new fetch guard must not interfere).
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, 0, false, &mut fi)
+            .expect("set_file_size(0)");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&[][..]),
+            "truncate-to-zero must still upload an empty object"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "truncate-to-zero needs no GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_overwrite_preserves_tail() {
+        // Review regression: opening an existing object for write and
+        // overwriting only its head must NOT truncate the object to the
+        // write's end — the lazy-load seed must keep logical_size at the full
+        // original length.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"0123456789ABCDEFGHIJ".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false); // unloaded write handle
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, b"XXXXX", 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&b"XXXXX56789ABCDEFGHIJ"[..]),
+            "partial overwrite must preserve the unmodified tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_beyond_threshold_fails_without_materializing() {
+        // Review 3 P1: on the default (budget-less) mount, a SetEndOfFile
+        // past WRITE_SPOOL_THRESHOLD must fail on flush instead of
+        // allocating the zero-fill extension and OOM-ing the process; the
+        // remote object stays intact.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None)); // no budget
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
+            .expect("set_file_size");
+        ctx.upload_dirty(file)
+            .await
+            .expect_err("oversized extension must be refused on flush");
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "no GET for a refused extension"
         );
     }
 }
