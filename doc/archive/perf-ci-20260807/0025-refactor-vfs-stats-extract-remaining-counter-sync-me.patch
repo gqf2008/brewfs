@@ -1,0 +1,260 @@
+From 419e036eb3345b6f4d8517d75bd20628ebde2ebd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 10:13:05 +0800
+Subject: [PATCH 25/29] refactor(vfs/stats): extract remaining counter-sync
+ methods into stats_sync
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partial #12 (gqf2008/brewfs)
+
+Seventh slice: move sync_cache_counters, sync_buffer_bytes,
+sync_object_store_metrics, sync_read_strategy_metrics and
+sync_meta_client_metrics (~97 lines) into src/vfs/stats_sync.rs. Pure
+code motion — no behavior change; stats tests pass. stats.rs 2898 ->
+1344 lines.
+---
+ src/vfs/mod.rs        |   1 +
+ src/vfs/stats.rs      |  98 --------------------------------------
+ src/vfs/stats_sync.rs | 107 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+), 98 deletions(-)
+ create mode 100644 src/vfs/stats_sync.rs
+
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index ced0dbb..5fd8814 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -25,6 +25,7 @@ pub mod sdk;
+ pub mod stats;
+ pub(crate) mod stats_render;
+ pub(crate) mod stats_snapshot;
++pub(crate) mod stats_sync;
+ pub(crate) mod stats_timer;
+ pub(crate) mod stats_writeback;
+ pub(crate) use inode::Inode;
+diff --git a/src/vfs/stats.rs b/src/vfs/stats.rs
+index 390778b..c63b857 100644
+--- a/src/vfs/stats.rs
++++ b/src/vfs/stats.rs
+@@ -883,104 +883,6 @@ impl FsStats {
+         }
+     }
+ 
+-    pub fn sync_cache_counters(&self, hits: u64, misses: u64) {
+-        self.cache_hits.store(hits, ORD);
+-        self.cache_misses.store(misses, ORD);
+-    }
+-
+-    pub fn sync_buffer_bytes(&self, dirty_bytes: u64, read_bytes: u64) {
+-        self.buf_dirty_bytes.store(dirty_bytes, ORD);
+-        self.buf_read_bytes.store(read_bytes, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_object_store_metrics(
+-        &self,
+-        get_ops: u64,
+-        get_bytes: u64,
+-        get_lat_us: u64,
+-        put_ops: u64,
+-        put_bytes: u64,
+-        put_lat_us: u64,
+-        put_prepare_lat_us: u64,
+-        put_cache_lat_us: u64,
+-        del_ops: u64,
+-    ) {
+-        self.s3_get_ops.store(get_ops, ORD);
+-        self.s3_get_bytes.store(get_bytes, ORD);
+-        self.s3_get_lat_us.store(get_lat_us, ORD);
+-        self.s3_put_ops.store(put_ops, ORD);
+-        self.s3_put_bytes.store(put_bytes, ORD);
+-        self.s3_put_lat_us.store(put_lat_us, ORD);
+-        self.s3_put_prepare_lat_us.store(put_prepare_lat_us, ORD);
+-        self.s3_put_cache_lat_us.store(put_cache_lat_us, ORD);
+-        self.s3_del_ops.store(del_ops, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_read_strategy_metrics(
+-        &self,
+-        block_cache_hits: u64,
+-        page_cache_hits: u64,
+-        page_cache_misses: u64,
+-        range_gets: u64,
+-        full_gets: u64,
+-        piggyback_full: u64,
+-        background_prefetches: u64,
+-        background_prefetch_dropped: u64,
+-    ) {
+-        self.read_block_cache_hits.store(block_cache_hits, ORD);
+-        self.read_page_cache_hits.store(page_cache_hits, ORD);
+-        self.read_page_cache_misses.store(page_cache_misses, ORD);
+-        self.read_range_gets.store(range_gets, ORD);
+-        self.read_full_gets.store(full_gets, ORD);
+-        self.read_piggyback_full.store(piggyback_full, ORD);
+-        self.read_background_prefetches
+-            .store(background_prefetches, ORD);
+-        self.read_background_prefetch_dropped
+-            .store(background_prefetch_dropped, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_meta_client_metrics(
+-        &self,
+-        stat_cache_hit: u64,
+-        stat_cache_miss: u64,
+-        stat_fresh_store_hit: u64,
+-        lookup_cache_hit: u64,
+-        lookup_cache_miss: u64,
+-        get_slices_cache_hit: u64,
+-        get_slices_cache_miss: u64,
+-        open_fresh_stat: u64,
+-        open_file_cache_hit: u64,
+-        open_file_cache_miss: u64,
+-        lookup_attr_fused_hit: u64,
+-        lookup_attr_fused_miss: u64,
+-        lookup_attr_fused_error: u64,
+-    ) {
+-        self.meta_stat_cache_hit.store(stat_cache_hit, ORD);
+-        self.meta_stat_cache_miss.store(stat_cache_miss, ORD);
+-        self.meta_stat_fresh_store_hit
+-            .store(stat_fresh_store_hit, ORD);
+-        self.meta_lookup_cache_hit.store(lookup_cache_hit, ORD);
+-        self.meta_lookup_cache_miss.store(lookup_cache_miss, ORD);
+-        self.meta_get_slices_cache_hit
+-            .store(get_slices_cache_hit, ORD);
+-        self.meta_get_slices_cache_miss
+-            .store(get_slices_cache_miss, ORD);
+-        self.meta_open_fresh_stat.store(open_fresh_stat, ORD);
+-        self.meta_open_file_cache_hit
+-            .store(open_file_cache_hit, ORD);
+-        self.meta_open_file_cache_miss
+-            .store(open_file_cache_miss, ORD);
+-        self.meta_lookup_attr_fused_hit
+-            .store(lookup_attr_fused_hit, ORD);
+-        self.meta_lookup_attr_fused_miss
+-            .store(lookup_attr_fused_miss, ORD);
+-        self.meta_lookup_attr_fused_error
+-            .store(lookup_attr_fused_error, ORD);
+-    }
+-
+     /// Render all counters in Prometheus text format (one metric per line).
+     /// Format: `metric_name value\n`
+     pub fn render(&self) -> String {
+diff --git a/src/vfs/stats_sync.rs b/src/vfs/stats_sync.rs
+new file mode 100644
+index 0000000..ce51604
+--- /dev/null
++++ b/src/vfs/stats_sync.rs
+@@ -0,0 +1,107 @@
++//! Counter-sync helpers for `FsStats`.
++//!
++//! Split out of `stats.rs` (part of the writer/stats decomposition): these
++//! methods copy subsystem counters into atomics. Pure code motion — no
++//! behavior changes.
++
++use crate::vfs::stats::{FsStats, ORD};
++
++impl FsStats {
++    pub fn sync_cache_counters(&self, hits: u64, misses: u64) {
++        self.cache_hits.store(hits, ORD);
++        self.cache_misses.store(misses, ORD);
++    }
++
++    pub fn sync_buffer_bytes(&self, dirty_bytes: u64, read_bytes: u64) {
++        self.buf_dirty_bytes.store(dirty_bytes, ORD);
++        self.buf_read_bytes.store(read_bytes, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_object_store_metrics(
++        &self,
++        get_ops: u64,
++        get_bytes: u64,
++        get_lat_us: u64,
++        put_ops: u64,
++        put_bytes: u64,
++        put_lat_us: u64,
++        put_prepare_lat_us: u64,
++        put_cache_lat_us: u64,
++        del_ops: u64,
++    ) {
++        self.s3_get_ops.store(get_ops, ORD);
++        self.s3_get_bytes.store(get_bytes, ORD);
++        self.s3_get_lat_us.store(get_lat_us, ORD);
++        self.s3_put_ops.store(put_ops, ORD);
++        self.s3_put_bytes.store(put_bytes, ORD);
++        self.s3_put_lat_us.store(put_lat_us, ORD);
++        self.s3_put_prepare_lat_us.store(put_prepare_lat_us, ORD);
++        self.s3_put_cache_lat_us.store(put_cache_lat_us, ORD);
++        self.s3_del_ops.store(del_ops, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_read_strategy_metrics(
++        &self,
++        block_cache_hits: u64,
++        page_cache_hits: u64,
++        page_cache_misses: u64,
++        range_gets: u64,
++        full_gets: u64,
++        piggyback_full: u64,
++        background_prefetches: u64,
++        background_prefetch_dropped: u64,
++    ) {
++        self.read_block_cache_hits.store(block_cache_hits, ORD);
++        self.read_page_cache_hits.store(page_cache_hits, ORD);
++        self.read_page_cache_misses.store(page_cache_misses, ORD);
++        self.read_range_gets.store(range_gets, ORD);
++        self.read_full_gets.store(full_gets, ORD);
++        self.read_piggyback_full.store(piggyback_full, ORD);
++        self.read_background_prefetches
++            .store(background_prefetches, ORD);
++        self.read_background_prefetch_dropped
++            .store(background_prefetch_dropped, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_meta_client_metrics(
++        &self,
++        stat_cache_hit: u64,
++        stat_cache_miss: u64,
++        stat_fresh_store_hit: u64,
++        lookup_cache_hit: u64,
++        lookup_cache_miss: u64,
++        get_slices_cache_hit: u64,
++        get_slices_cache_miss: u64,
++        open_fresh_stat: u64,
++        open_file_cache_hit: u64,
++        open_file_cache_miss: u64,
++        lookup_attr_fused_hit: u64,
++        lookup_attr_fused_miss: u64,
++        lookup_attr_fused_error: u64,
++    ) {
++        self.meta_stat_cache_hit.store(stat_cache_hit, ORD);
++        self.meta_stat_cache_miss.store(stat_cache_miss, ORD);
++        self.meta_stat_fresh_store_hit
++            .store(stat_fresh_store_hit, ORD);
++        self.meta_lookup_cache_hit.store(lookup_cache_hit, ORD);
++        self.meta_lookup_cache_miss.store(lookup_cache_miss, ORD);
++        self.meta_get_slices_cache_hit
++            .store(get_slices_cache_hit, ORD);
++        self.meta_get_slices_cache_miss
++            .store(get_slices_cache_miss, ORD);
++        self.meta_open_fresh_stat.store(open_fresh_stat, ORD);
++        self.meta_open_file_cache_hit
++            .store(open_file_cache_hit, ORD);
++        self.meta_open_file_cache_miss
++            .store(open_file_cache_miss, ORD);
++        self.meta_lookup_attr_fused_hit
++            .store(lookup_attr_fused_hit, ORD);
++        self.meta_lookup_attr_fused_miss
++            .store(lookup_attr_fused_miss, ORD);
++        self.meta_lookup_attr_fused_error
++            .store(lookup_attr_fused_error, ORD);
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1657 @@
+From 33c67844c695c73a45cab59ac22fa6990bc72dfd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 10:03:10 +0800
+Subject: [PATCH 24/29] refactor(vfs/stats): extract .stats renderer into
+ stats_render
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partial #12 (gqf2008/brewfs)
+
+Sixth slice: move the ~800-line Prometheus-style render() into
+src/vfs/stats_render.rs as a pure function over FsStats (self -> stats,
+ORD reused). stats.rs now delegates with a one-liner. Pure code motion —
+no behavior change; stats tests pass.
+---
+ src/vfs/mod.rs          |   1 +
+ src/vfs/stats.rs        | 797 +--------------------------------------
+ src/vfs/stats_render.rs | 806 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 808 insertions(+), 796 deletions(-)
+ create mode 100644 src/vfs/stats_render.rs
+
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index 9171cbe..ced0dbb 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -23,6 +23,7 @@ pub mod memory;
+ pub(crate) mod meta_ops;
+ pub mod sdk;
+ pub mod stats;
++pub(crate) mod stats_render;
+ pub(crate) mod stats_snapshot;
+ pub(crate) mod stats_timer;
+ pub(crate) mod stats_writeback;
+diff --git a/src/vfs/stats.rs b/src/vfs/stats.rs
+index 9112a18..390778b 100644
+--- a/src/vfs/stats.rs
++++ b/src/vfs/stats.rs
+@@ -984,802 +984,7 @@ impl FsStats {
+     /// Render all counters in Prometheus text format (one metric per line).
+     /// Format: `metric_name value\n`
+     pub fn render(&self) -> String {
+-        let snapshot = self.snapshot();
+-        let mut out = String::with_capacity(4096);
+-
+-        // System
+-        out.push_str(&format!(
+-            "brewfs_uptime_seconds {}\n",
+-            snapshot.uptime_seconds
+-        ));
+-
+-        // FUSE
+-        out.push_str(&format!(
+-            "brewfs_fuse_read_ops_total {}\n",
+-            self.fuse_read_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_read_bytes_total {}\n",
+-            self.fuse_read_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_read_lat_us_total {}\n",
+-            self.fuse_read_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_write_ops_total {}\n",
+-            self.fuse_write_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_write_bytes_total {}\n",
+-            self.fuse_write_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_write_lat_us_total {}\n",
+-            self.fuse_write_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_lookup_ops_total {}\n",
+-            self.fuse_lookup_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_lookup_lat_us_total {}\n",
+-            self.fuse_lookup_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_getattr_ops_total {}\n",
+-            self.fuse_getattr_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_getattr_lat_us_total {}\n",
+-            self.fuse_getattr_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_open_ops_total {}\n",
+-            self.fuse_open_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_create_ops_total {}\n",
+-            self.fuse_create_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_unlink_ops_total {}\n",
+-            self.fuse_unlink_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_readdir_ops_total {}\n",
+-            self.fuse_readdir_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_flush_ops_total {}\n",
+-            self.fuse_flush_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_flush_lat_us_total {}\n",
+-            self.fuse_flush_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_read_avg_lat_us {:.6}\n",
+-            snapshot.avg_fuse_read_lat_us()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_write_avg_lat_us {:.6}\n",
+-            snapshot.avg_fuse_write_lat_us()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_fuse_flush_avg_lat_us {:.6}\n",
+-            snapshot.avg_fuse_flush_lat_us()
+-        ));
+-
+-        // Meta
+-        out.push_str(&format!(
+-            "brewfs_meta_ops_total {}\n",
+-            self.meta_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lat_us_total {}\n",
+-            self.meta_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_txn_ops_total {}\n",
+-            self.meta_txn_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_txn_lat_us_total {}\n",
+-            self.meta_txn_lat_us.load(ORD)
+-        ));
+-
+-        // VFS diagnostic timing
+-        out.push_str(&format!(
+-            "brewfs_vfs_create_total_ops_total {}\n",
+-            self.vfs_create_total_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_create_total_lat_us_total {}\n",
+-            self.vfs_create_total_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_create_meta_ops_total {}\n",
+-            self.vfs_create_meta_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_create_meta_lat_us_total {}\n",
+-            self.vfs_create_meta_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_total_ops_total {}\n",
+-            self.vfs_unlink_total_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_total_lat_us_total {}\n",
+-            self.vfs_unlink_total_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_lookup_ops_total {}\n",
+-            self.vfs_unlink_lookup_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_lookup_lat_us_total {}\n",
+-            self.vfs_unlink_lookup_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_stat_ops_total {}\n",
+-            self.vfs_unlink_stat_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_stat_lat_us_total {}\n",
+-            self.vfs_unlink_stat_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_meta_ops_total {}\n",
+-            self.vfs_unlink_meta_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_meta_lat_us_total {}\n",
+-            self.vfs_unlink_meta_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_recent_ops_total {}\n",
+-            self.vfs_unlink_recent_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_unlink_recent_lat_us_total {}\n",
+-            self.vfs_unlink_recent_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_setattr_recent_remove_ops_total {}\n",
+-            self.vfs_setattr_recent_remove_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_setattr_recent_remove_lat_us_total {}\n",
+-            self.vfs_setattr_recent_remove_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_setattr_recent_get_mut_ops_total {}\n",
+-            self.vfs_setattr_recent_get_mut_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_setattr_recent_get_mut_lat_us_total {}\n",
+-            self.vfs_setattr_recent_get_mut_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_dirty_probe_ops_total {}\n",
+-            self.vfs_read_dirty_probe_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_dirty_probe_lat_us_total {}\n",
+-            self.vfs_read_dirty_probe_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_handle_ops_total {}\n",
+-            self.vfs_read_handle_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_handle_lat_us_total {}\n",
+-            self.vfs_read_handle_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_overlay_ops_total {}\n",
+-            self.vfs_read_overlay_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_vfs_read_overlay_lat_us_total {}\n",
+-            self.vfs_read_overlay_lat_us.load(ORD)
+-        ));
+-
+-        // Object storage
+-        out.push_str(&format!(
+-            "brewfs_s3_get_ops_total {}\n",
+-            self.s3_get_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_get_bytes_total {}\n",
+-            self.s3_get_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_get_lat_us_total {}\n",
+-            self.s3_get_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_ops_total {}\n",
+-            self.s3_put_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_bytes_total {}\n",
+-            self.s3_put_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_lat_us_total {}\n",
+-            self.s3_put_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_prepare_lat_us_total {}\n",
+-            self.s3_put_prepare_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_cache_lat_us_total {}\n",
+-            self.s3_put_cache_lat_us.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_del_ops_total {}\n",
+-            self.s3_del_ops.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_get_avg_lat_us {:.6}\n",
+-            snapshot.avg_s3_get_lat_us()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_avg_lat_us {:.6}\n",
+-            snapshot.avg_s3_put_lat_us()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_prepare_avg_lat_us {:.6}\n",
+-            snapshot.avg_s3_put_prepare_lat_us()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_s3_put_cache_avg_lat_us {:.6}\n",
+-            snapshot.avg_s3_put_cache_lat_us()
+-        ));
+-
+-        // Buffer/cache
+-        out.push_str(&format!(
+-            "brewfs_buffer_dirty_bytes {}\n",
+-            self.buf_dirty_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_buffer_read_bytes {}\n",
+-            self.buf_read_bytes.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_dirty_bytes {}\n",
+-            snapshot.buf_dirty_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_dirty_bytes {}\n",
+-            snapshot.writeback_live_dirty_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_slices {}\n",
+-            snapshot.writeback_live_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_normal_only_bytes {}\n",
+-            snapshot.writeback_live_normal_only_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_normal_only_slices {}\n",
+-            snapshot.writeback_live_normal_only_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_cached_only_bytes {}\n",
+-            snapshot.writeback_live_cached_only_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_cached_only_slices {}\n",
+-            snapshot.writeback_live_cached_only_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_mixed_origin_bytes {}\n",
+-            snapshot.writeback_live_mixed_origin_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_mixed_origin_slices {}\n",
+-            snapshot.writeback_live_mixed_origin_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_unknown_origin_bytes {}\n",
+-            snapshot.writeback_live_unknown_origin_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_live_unknown_origin_slices {}\n",
+-            snapshot.writeback_live_unknown_origin_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_recent_pending_upload_bytes {}\n",
+-            snapshot.writeback_recent_pending_upload_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_recent_pending_upload_slices {}\n",
+-            snapshot.writeback_recent_pending_upload_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_recent_uploaded_bytes {}\n",
+-            snapshot.writeback_recent_uploaded_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_recent_uploaded_slices {}\n",
+-            snapshot.writeback_recent_uploaded_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_backpressure_soft_sleep_ops {}\n",
+-            snapshot.writeback_backpressure_soft_sleep_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_backpressure_soft_sleep_us {}\n",
+-            snapshot.writeback_backpressure_soft_sleep_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_backpressure_hard_wait_ops {}\n",
+-            snapshot.writeback_backpressure_hard_wait_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_backpressure_hard_wait_us {}\n",
+-            snapshot.writeback_backpressure_hard_wait_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_soft_sleep_ops {}\n",
+-            snapshot.writeback_buffer_soft_sleep_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_soft_sleep_us {}\n",
+-            snapshot.writeback_buffer_soft_sleep_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_moderate_sleep_ops {}\n",
+-            snapshot.writeback_buffer_moderate_sleep_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_moderate_sleep_us {}\n",
+-            snapshot.writeback_buffer_moderate_sleep_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_hard_sleep_ops {}\n",
+-            snapshot.writeback_buffer_hard_sleep_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_buffer_hard_sleep_us {}\n",
+-            snapshot.writeback_buffer_hard_sleep_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_stage_inflight_bytes {}\n",
+-            snapshot.writeback_stage_inflight_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_remote_upload_inflight_bytes {}\n",
+-            snapshot.writeback_remote_upload_inflight_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_stage_ops_total {}\n",
+-            snapshot.writeback_stage_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_stage_bytes_total {}\n",
+-            snapshot.writeback_stage_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_stage_lat_us_total {}\n",
+-            snapshot.writeback_stage_lat_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_stage_failures_total {}\n",
+-            snapshot.writeback_stage_failures
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_before_stage_ops_total {}\n",
+-            snapshot.writeback_commit_before_stage_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_size_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_size_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_size_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_size_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_max_unflushed_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_max_unflushed_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_max_unflushed_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_max_unflushed_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_explicit_flush_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_explicit_flush_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_explicit_flush_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_explicit_flush_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_auto_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_auto_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_auto_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_auto_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_commit_age_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_commit_age_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_commit_age_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_commit_age_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_unknown_reason_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_unknown_reason_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_unknown_reason_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_unknown_reason_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_normal_only_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_normal_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_normal_only_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_normal_only_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_cached_only_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_cached_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_cached_only_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_cached_only_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_mixed_origin_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_mixed_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_mixed_origin_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_mixed_origin_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_unknown_origin_ops_total {}\n",
+-            snapshot.writeback_commit_wait_upload_unknown_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_upload_unknown_origin_us_total {}\n",
+-            snapshot.writeback_commit_wait_upload_unknown_origin_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_retry_ops_total {}\n",
+-            snapshot.writeback_commit_wait_retry_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_commit_wait_retry_us_total {}\n",
+-            snapshot.writeback_commit_wait_retry_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_wait_ops_total {}\n",
+-            snapshot.writeback_flush_wait_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_wait_us_total {}\n",
+-            snapshot.writeback_flush_wait_us
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_wait_slices_total {}\n",
+-            snapshot.writeback_flush_wait_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_ops_total {}\n",
+-            snapshot.writeback_flush_fragmentation_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_slices_total {}\n",
+-            snapshot.writeback_flush_fragmentation_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_bytes_total {}\n",
+-            snapshot.writeback_flush_fragmentation_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_cached_sub_block_slices_total {}\n",
+-            snapshot.writeback_flush_fragmentation_cached_sub_block_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_cached_sub_block_bytes_total {}\n",
+-            snapshot.writeback_flush_fragmentation_cached_sub_block_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_full_block_slices_total {}\n",
+-            snapshot.writeback_flush_fragmentation_full_block_slices
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_flush_fragmentation_full_block_bytes_total {}\n",
+-            snapshot.writeback_flush_fragmentation_full_block_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_slice_create_ops_total {}\n",
+-            snapshot.writeback_slice_create_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_slice_reuse_ops_total {}\n",
+-            snapshot.writeback_slice_reuse_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_slice_reject_older_unique_ops_total {}\n",
+-            snapshot.writeback_slice_reject_older_unique_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_slice_reject_dispatched_prefix_ops_total {}\n",
+-            snapshot.writeback_slice_reject_dispatched_prefix_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_size_ops_total {}\n",
+-            snapshot.writeback_freeze_size_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_size_bytes_total {}\n",
+-            snapshot.writeback_freeze_size_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_max_unflushed_ops_total {}\n",
+-            snapshot.writeback_freeze_max_unflushed_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_max_unflushed_bytes_total {}\n",
+-            snapshot.writeback_freeze_max_unflushed_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_explicit_flush_ops_total {}\n",
+-            snapshot.writeback_freeze_explicit_flush_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_explicit_flush_bytes_total {}\n",
+-            snapshot.writeback_freeze_explicit_flush_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_auto_ops_total {}\n",
+-            snapshot.writeback_freeze_auto_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_auto_bytes_total {}\n",
+-            snapshot.writeback_freeze_auto_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_commit_age_ops_total {}\n",
+-            snapshot.writeback_freeze_commit_age_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_freeze_commit_age_bytes_total {}\n",
+-            snapshot.writeback_freeze_commit_age_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_batch_ops_total {}\n",
+-            snapshot.writeback_upload_batch_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_batch_bytes_total {}\n",
+-            snapshot.writeback_upload_batch_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_batch_blocks_total {}\n",
+-            snapshot.writeback_upload_batch_blocks
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_batch_single_block_ops_total {}\n",
+-            snapshot.writeback_upload_batch_single_block_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_batch_multi_block_ops_total {}\n",
+-            snapshot.writeback_upload_batch_multi_block_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_size_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_size_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_max_unflushed_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_max_unflushed_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_explicit_flush_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_explicit_flush_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_normal_only_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_normal_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_cached_only_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_cached_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_mixed_origin_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_mixed_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_unknown_origin_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_unknown_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_age_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_age_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_idle_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_idle_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_pressure_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_pressure_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_too_many_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_too_many_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_buffer_high_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_buffer_high_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_flush_duration_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_flush_duration_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_unknown_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_unknown_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_normal_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_cached_only_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_mixed_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_auto_unknown_origin_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_writeback_upload_partial_tail_commit_age_ops_total {}\n",
+-            snapshot.writeback_upload_partial_tail_commit_age_ops
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_reader_buffer_bytes {}\n",
+-            snapshot.buf_read_bytes
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_cache_hits_total {}\n",
+-            self.cache_hits.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_cache_misses_total {}\n",
+-            self.cache_misses.load(ORD)
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_cache_requests_total {}\n",
+-            snapshot.cache_requests()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_cache_hit_ratio {:.6}\n",
+-            snapshot.cache_hit_ratio()
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_block_cache_hits_total {}\n",
+-            snapshot.read_block_cache_hits
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_page_cache_hits_total {}\n",
+-            snapshot.read_page_cache_hits
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_page_cache_misses_total {}\n",
+-            snapshot.read_page_cache_misses
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_range_gets_total {}\n",
+-            snapshot.read_range_gets
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_full_gets_total {}\n",
+-            snapshot.read_full_gets
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_piggyback_full_total {}\n",
+-            snapshot.read_piggyback_full
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_background_prefetch_total {}\n",
+-            snapshot.read_background_prefetches
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_read_background_prefetch_dropped_total {}\n",
+-            snapshot.read_background_prefetch_dropped
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_stat_cache_hit_total {}\n",
+-            snapshot.meta_stat_cache_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_stat_cache_miss_total {}\n",
+-            snapshot.meta_stat_cache_miss
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_stat_fresh_store_hit_total {}\n",
+-            snapshot.meta_stat_fresh_store_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lookup_cache_hit_total {}\n",
+-            snapshot.meta_lookup_cache_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lookup_cache_miss_total {}\n",
+-            snapshot.meta_lookup_cache_miss
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_get_slices_cache_hit_total {}\n",
+-            snapshot.meta_get_slices_cache_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_get_slices_cache_miss_total {}\n",
+-            snapshot.meta_get_slices_cache_miss
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_open_fresh_stat_total {}\n",
+-            snapshot.meta_open_fresh_stat
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_open_file_cache_hit_total {}\n",
+-            snapshot.meta_open_file_cache_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_open_file_cache_miss_total {}\n",
+-            snapshot.meta_open_file_cache_miss
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lookup_attr_fused_hit_total {}\n",
+-            snapshot.meta_lookup_attr_fused_hit
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lookup_attr_fused_miss_total {}\n",
+-            snapshot.meta_lookup_attr_fused_miss
+-        ));
+-        out.push_str(&format!(
+-            "brewfs_meta_lookup_attr_fused_error_total {}\n",
+-            snapshot.meta_lookup_attr_fused_error
+-        ));
+-
+-        out
++        crate::vfs::stats_render::render(self)
+     }
+ 
+     pub fn record_duration(ops_counter: &AtomicU64, lat_counter: &AtomicU64, duration: Duration) {
+diff --git a/src/vfs/stats_render.rs b/src/vfs/stats_render.rs
+new file mode 100644
+index 0000000..21fc6ae
+--- /dev/null
++++ b/src/vfs/stats_render.rs
+@@ -0,0 +1,806 @@
++//! Prometheus-style text rendering for `FsStats`.
++//!
++//! Split out of `stats.rs` (part of the writer/stats decomposition): the
++//! `.stats` virtual-file renderer is a pure formatting function over the live
++//! counters. No behavior changes.
++
++use crate::vfs::stats::{FsStats, ORD};
++
++pub(crate) fn render(stats: &FsStats) -> String {
++    let snapshot = stats.snapshot();
++    let mut out = String::with_capacity(4096);
++
++    // System
++    out.push_str(&format!(
++        "brewfs_uptime_seconds {}\n",
++        snapshot.uptime_seconds
++    ));
++
++    // FUSE
++    out.push_str(&format!(
++        "brewfs_fuse_read_ops_total {}\n",
++        stats.fuse_read_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_read_bytes_total {}\n",
++        stats.fuse_read_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_read_lat_us_total {}\n",
++        stats.fuse_read_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_write_ops_total {}\n",
++        stats.fuse_write_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_write_bytes_total {}\n",
++        stats.fuse_write_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_write_lat_us_total {}\n",
++        stats.fuse_write_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_lookup_ops_total {}\n",
++        stats.fuse_lookup_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_lookup_lat_us_total {}\n",
++        stats.fuse_lookup_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_getattr_ops_total {}\n",
++        stats.fuse_getattr_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_getattr_lat_us_total {}\n",
++        stats.fuse_getattr_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_open_ops_total {}\n",
++        stats.fuse_open_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_create_ops_total {}\n",
++        stats.fuse_create_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_unlink_ops_total {}\n",
++        stats.fuse_unlink_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_readdir_ops_total {}\n",
++        stats.fuse_readdir_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_flush_ops_total {}\n",
++        stats.fuse_flush_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_flush_lat_us_total {}\n",
++        stats.fuse_flush_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_read_avg_lat_us {:.6}\n",
++        snapshot.avg_fuse_read_lat_us()
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_write_avg_lat_us {:.6}\n",
++        snapshot.avg_fuse_write_lat_us()
++    ));
++    out.push_str(&format!(
++        "brewfs_fuse_flush_avg_lat_us {:.6}\n",
++        snapshot.avg_fuse_flush_lat_us()
++    ));
++
++    // Meta
++    out.push_str(&format!(
++        "brewfs_meta_ops_total {}\n",
++        stats.meta_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lat_us_total {}\n",
++        stats.meta_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_txn_ops_total {}\n",
++        stats.meta_txn_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_txn_lat_us_total {}\n",
++        stats.meta_txn_lat_us.load(ORD)
++    ));
++
++    // VFS diagnostic timing
++    out.push_str(&format!(
++        "brewfs_vfs_create_total_ops_total {}\n",
++        stats.vfs_create_total_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_create_total_lat_us_total {}\n",
++        stats.vfs_create_total_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_create_meta_ops_total {}\n",
++        stats.vfs_create_meta_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_create_meta_lat_us_total {}\n",
++        stats.vfs_create_meta_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_total_ops_total {}\n",
++        stats.vfs_unlink_total_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_total_lat_us_total {}\n",
++        stats.vfs_unlink_total_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_lookup_ops_total {}\n",
++        stats.vfs_unlink_lookup_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_lookup_lat_us_total {}\n",
++        stats.vfs_unlink_lookup_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_stat_ops_total {}\n",
++        stats.vfs_unlink_stat_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_stat_lat_us_total {}\n",
++        stats.vfs_unlink_stat_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_meta_ops_total {}\n",
++        stats.vfs_unlink_meta_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_meta_lat_us_total {}\n",
++        stats.vfs_unlink_meta_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_recent_ops_total {}\n",
++        stats.vfs_unlink_recent_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_unlink_recent_lat_us_total {}\n",
++        stats.vfs_unlink_recent_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_setattr_recent_remove_ops_total {}\n",
++        stats.vfs_setattr_recent_remove_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_setattr_recent_remove_lat_us_total {}\n",
++        stats.vfs_setattr_recent_remove_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_setattr_recent_get_mut_ops_total {}\n",
++        stats.vfs_setattr_recent_get_mut_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_setattr_recent_get_mut_lat_us_total {}\n",
++        stats.vfs_setattr_recent_get_mut_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_dirty_probe_ops_total {}\n",
++        stats.vfs_read_dirty_probe_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_dirty_probe_lat_us_total {}\n",
++        stats.vfs_read_dirty_probe_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_handle_ops_total {}\n",
++        stats.vfs_read_handle_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_handle_lat_us_total {}\n",
++        stats.vfs_read_handle_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_overlay_ops_total {}\n",
++        stats.vfs_read_overlay_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_vfs_read_overlay_lat_us_total {}\n",
++        stats.vfs_read_overlay_lat_us.load(ORD)
++    ));
++
++    // Object storage
++    out.push_str(&format!(
++        "brewfs_s3_get_ops_total {}\n",
++        stats.s3_get_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_get_bytes_total {}\n",
++        stats.s3_get_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_get_lat_us_total {}\n",
++        stats.s3_get_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_ops_total {}\n",
++        stats.s3_put_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_bytes_total {}\n",
++        stats.s3_put_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_lat_us_total {}\n",
++        stats.s3_put_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_prepare_lat_us_total {}\n",
++        stats.s3_put_prepare_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_cache_lat_us_total {}\n",
++        stats.s3_put_cache_lat_us.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_del_ops_total {}\n",
++        stats.s3_del_ops.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_get_avg_lat_us {:.6}\n",
++        snapshot.avg_s3_get_lat_us()
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_avg_lat_us {:.6}\n",
++        snapshot.avg_s3_put_lat_us()
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_prepare_avg_lat_us {:.6}\n",
++        snapshot.avg_s3_put_prepare_lat_us()
++    ));
++    out.push_str(&format!(
++        "brewfs_s3_put_cache_avg_lat_us {:.6}\n",
++        snapshot.avg_s3_put_cache_lat_us()
++    ));
++
++    // Buffer/cache
++    out.push_str(&format!(
++        "brewfs_buffer_dirty_bytes {}\n",
++        stats.buf_dirty_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_buffer_read_bytes {}\n",
++        stats.buf_read_bytes.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_dirty_bytes {}\n",
++        snapshot.buf_dirty_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_dirty_bytes {}\n",
++        snapshot.writeback_live_dirty_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_slices {}\n",
++        snapshot.writeback_live_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_normal_only_bytes {}\n",
++        snapshot.writeback_live_normal_only_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_normal_only_slices {}\n",
++        snapshot.writeback_live_normal_only_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_cached_only_bytes {}\n",
++        snapshot.writeback_live_cached_only_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_cached_only_slices {}\n",
++        snapshot.writeback_live_cached_only_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_mixed_origin_bytes {}\n",
++        snapshot.writeback_live_mixed_origin_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_mixed_origin_slices {}\n",
++        snapshot.writeback_live_mixed_origin_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_unknown_origin_bytes {}\n",
++        snapshot.writeback_live_unknown_origin_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_live_unknown_origin_slices {}\n",
++        snapshot.writeback_live_unknown_origin_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_recent_pending_upload_bytes {}\n",
++        snapshot.writeback_recent_pending_upload_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_recent_pending_upload_slices {}\n",
++        snapshot.writeback_recent_pending_upload_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_recent_uploaded_bytes {}\n",
++        snapshot.writeback_recent_uploaded_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_recent_uploaded_slices {}\n",
++        snapshot.writeback_recent_uploaded_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_backpressure_soft_sleep_ops {}\n",
++        snapshot.writeback_backpressure_soft_sleep_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_backpressure_soft_sleep_us {}\n",
++        snapshot.writeback_backpressure_soft_sleep_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_backpressure_hard_wait_ops {}\n",
++        snapshot.writeback_backpressure_hard_wait_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_backpressure_hard_wait_us {}\n",
++        snapshot.writeback_backpressure_hard_wait_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_soft_sleep_ops {}\n",
++        snapshot.writeback_buffer_soft_sleep_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_soft_sleep_us {}\n",
++        snapshot.writeback_buffer_soft_sleep_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_moderate_sleep_ops {}\n",
++        snapshot.writeback_buffer_moderate_sleep_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_moderate_sleep_us {}\n",
++        snapshot.writeback_buffer_moderate_sleep_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_hard_sleep_ops {}\n",
++        snapshot.writeback_buffer_hard_sleep_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_buffer_hard_sleep_us {}\n",
++        snapshot.writeback_buffer_hard_sleep_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_stage_inflight_bytes {}\n",
++        snapshot.writeback_stage_inflight_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_remote_upload_inflight_bytes {}\n",
++        snapshot.writeback_remote_upload_inflight_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_stage_ops_total {}\n",
++        snapshot.writeback_stage_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_stage_bytes_total {}\n",
++        snapshot.writeback_stage_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_stage_lat_us_total {}\n",
++        snapshot.writeback_stage_lat_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_stage_failures_total {}\n",
++        snapshot.writeback_stage_failures
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_before_stage_ops_total {}\n",
++        snapshot.writeback_commit_before_stage_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_size_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_size_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_size_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_size_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_max_unflushed_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_max_unflushed_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_max_unflushed_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_max_unflushed_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_explicit_flush_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_explicit_flush_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_explicit_flush_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_explicit_flush_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_auto_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_auto_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_auto_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_auto_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_commit_age_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_commit_age_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_commit_age_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_commit_age_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_unknown_reason_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_unknown_reason_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_unknown_reason_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_unknown_reason_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_normal_only_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_normal_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_normal_only_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_normal_only_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_cached_only_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_cached_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_cached_only_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_cached_only_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_mixed_origin_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_mixed_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_mixed_origin_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_mixed_origin_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_unknown_origin_ops_total {}\n",
++        snapshot.writeback_commit_wait_upload_unknown_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_upload_unknown_origin_us_total {}\n",
++        snapshot.writeback_commit_wait_upload_unknown_origin_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_retry_ops_total {}\n",
++        snapshot.writeback_commit_wait_retry_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_commit_wait_retry_us_total {}\n",
++        snapshot.writeback_commit_wait_retry_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_wait_ops_total {}\n",
++        snapshot.writeback_flush_wait_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_wait_us_total {}\n",
++        snapshot.writeback_flush_wait_us
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_wait_slices_total {}\n",
++        snapshot.writeback_flush_wait_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_ops_total {}\n",
++        snapshot.writeback_flush_fragmentation_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_slices_total {}\n",
++        snapshot.writeback_flush_fragmentation_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_bytes_total {}\n",
++        snapshot.writeback_flush_fragmentation_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_cached_sub_block_slices_total {}\n",
++        snapshot.writeback_flush_fragmentation_cached_sub_block_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_cached_sub_block_bytes_total {}\n",
++        snapshot.writeback_flush_fragmentation_cached_sub_block_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_full_block_slices_total {}\n",
++        snapshot.writeback_flush_fragmentation_full_block_slices
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_flush_fragmentation_full_block_bytes_total {}\n",
++        snapshot.writeback_flush_fragmentation_full_block_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_slice_create_ops_total {}\n",
++        snapshot.writeback_slice_create_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_slice_reuse_ops_total {}\n",
++        snapshot.writeback_slice_reuse_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_slice_reject_older_unique_ops_total {}\n",
++        snapshot.writeback_slice_reject_older_unique_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_slice_reject_dispatched_prefix_ops_total {}\n",
++        snapshot.writeback_slice_reject_dispatched_prefix_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_size_ops_total {}\n",
++        snapshot.writeback_freeze_size_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_size_bytes_total {}\n",
++        snapshot.writeback_freeze_size_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_max_unflushed_ops_total {}\n",
++        snapshot.writeback_freeze_max_unflushed_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_max_unflushed_bytes_total {}\n",
++        snapshot.writeback_freeze_max_unflushed_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_explicit_flush_ops_total {}\n",
++        snapshot.writeback_freeze_explicit_flush_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_explicit_flush_bytes_total {}\n",
++        snapshot.writeback_freeze_explicit_flush_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_auto_ops_total {}\n",
++        snapshot.writeback_freeze_auto_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_auto_bytes_total {}\n",
++        snapshot.writeback_freeze_auto_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_commit_age_ops_total {}\n",
++        snapshot.writeback_freeze_commit_age_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_freeze_commit_age_bytes_total {}\n",
++        snapshot.writeback_freeze_commit_age_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_batch_ops_total {}\n",
++        snapshot.writeback_upload_batch_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_batch_bytes_total {}\n",
++        snapshot.writeback_upload_batch_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_batch_blocks_total {}\n",
++        snapshot.writeback_upload_batch_blocks
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_batch_single_block_ops_total {}\n",
++        snapshot.writeback_upload_batch_single_block_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_batch_multi_block_ops_total {}\n",
++        snapshot.writeback_upload_batch_multi_block_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_size_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_size_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_max_unflushed_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_max_unflushed_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_explicit_flush_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_explicit_flush_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_normal_only_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_normal_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_cached_only_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_cached_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_mixed_origin_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_mixed_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_unknown_origin_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_unknown_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_age_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_age_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_idle_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_idle_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_pressure_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_pressure_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_too_many_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_too_many_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_buffer_high_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_buffer_high_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_flush_duration_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_flush_duration_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_unknown_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_unknown_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_normal_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_cached_only_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_mixed_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_auto_unknown_origin_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_writeback_upload_partial_tail_commit_age_ops_total {}\n",
++        snapshot.writeback_upload_partial_tail_commit_age_ops
++    ));
++    out.push_str(&format!(
++        "brewfs_reader_buffer_bytes {}\n",
++        snapshot.buf_read_bytes
++    ));
++    out.push_str(&format!(
++        "brewfs_cache_hits_total {}\n",
++        stats.cache_hits.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_cache_misses_total {}\n",
++        stats.cache_misses.load(ORD)
++    ));
++    out.push_str(&format!(
++        "brewfs_cache_requests_total {}\n",
++        snapshot.cache_requests()
++    ));
++    out.push_str(&format!(
++        "brewfs_cache_hit_ratio {:.6}\n",
++        snapshot.cache_hit_ratio()
++    ));
++    out.push_str(&format!(
++        "brewfs_read_block_cache_hits_total {}\n",
++        snapshot.read_block_cache_hits
++    ));
++    out.push_str(&format!(
++        "brewfs_read_page_cache_hits_total {}\n",
++        snapshot.read_page_cache_hits
++    ));
++    out.push_str(&format!(
++        "brewfs_read_page_cache_misses_total {}\n",
++        snapshot.read_page_cache_misses
++    ));
++    out.push_str(&format!(
++        "brewfs_read_range_gets_total {}\n",
++        snapshot.read_range_gets
++    ));
++    out.push_str(&format!(
++        "brewfs_read_full_gets_total {}\n",
++        snapshot.read_full_gets
++    ));
++    out.push_str(&format!(
++        "brewfs_read_piggyback_full_total {}\n",
++        snapshot.read_piggyback_full
++    ));
++    out.push_str(&format!(
++        "brewfs_read_background_prefetch_total {}\n",
++        snapshot.read_background_prefetches
++    ));
++    out.push_str(&format!(
++        "brewfs_read_background_prefetch_dropped_total {}\n",
++        snapshot.read_background_prefetch_dropped
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_stat_cache_hit_total {}\n",
++        snapshot.meta_stat_cache_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_stat_cache_miss_total {}\n",
++        snapshot.meta_stat_cache_miss
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_stat_fresh_store_hit_total {}\n",
++        snapshot.meta_stat_fresh_store_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lookup_cache_hit_total {}\n",
++        snapshot.meta_lookup_cache_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lookup_cache_miss_total {}\n",
++        snapshot.meta_lookup_cache_miss
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_get_slices_cache_hit_total {}\n",
++        snapshot.meta_get_slices_cache_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_get_slices_cache_miss_total {}\n",
++        snapshot.meta_get_slices_cache_miss
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_open_fresh_stat_total {}\n",
++        snapshot.meta_open_fresh_stat
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_open_file_cache_hit_total {}\n",
++        snapshot.meta_open_file_cache_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_open_file_cache_miss_total {}\n",
++        snapshot.meta_open_file_cache_miss
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lookup_attr_fused_hit_total {}\n",
++        snapshot.meta_lookup_attr_fused_hit
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lookup_attr_fused_miss_total {}\n",
++        snapshot.meta_lookup_attr_fused_miss
++    ));
++    out.push_str(&format!(
++        "brewfs_meta_lookup_attr_fused_error_total {}\n",
++        snapshot.meta_lookup_attr_fused_error
++    ));
++
++    out
++}
+-- 
+2.50.1 (Apple Git-155)
+

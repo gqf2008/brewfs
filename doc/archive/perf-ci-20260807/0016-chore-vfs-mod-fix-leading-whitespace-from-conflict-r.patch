@@ -1,0 +1,32 @@
+From d7b7e84df2ef2a627caaac389ff52c115b64d856 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 09:21:26 +0800
+Subject: [PATCH 16/29] chore(vfs/mod): fix leading whitespace from conflict
+ resolution
+
+---
+ src/vfs/mod.rs | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index 9b68866..63d56b2 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -21,10 +21,10 @@ pub(crate) mod inode;
+ pub(crate) mod io;
+ pub mod memory;
+ pub(crate) mod meta_ops;
+- pub mod sdk;
+- pub mod stats;
+- pub(crate) mod stats_timer;
+- pub(crate) use inode::Inode;
++pub mod sdk;
++pub mod stats;
++pub(crate) mod stats_timer;
++pub(crate) use inode::Inode;
+ 
+ const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,261 @@
+From 187c0177ab3728541b05e662b05e2a0f5f41c94f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 22:36:56 +0800
+Subject: [PATCH 04/29] perf(fuse): readdirplus batch-fetches child attrs
+ instead of serial stat
+
+Closes #15 (gqf2008/brewfs)
+
+readdirplus issued one stat_ino per entry (N cache lookups / backend
+round-trips), dominating latency on large directories.
+
+- MetaLayer::batch_stat default (sequential stat) + MetaClient override
+  that serves cache hits from memory and batches cold misses through
+  store.batch_stat (Redis MGET).
+- VFS::stat_inos: batched attr fetch with close-to-open size overlay and
+  per-inode fallback on error.
+- readdirplus uses one stat_inos call for all child entries.
+- Tests: SQLite client returns attrs in input order (missing -> None);
+  Redis client batches 4 cold misses into one MGET and serves a fully
+  warm batch with zero Redis traffic.
+---
+ src/fuse/mod.rs                |  8 ++++-
+ src/meta/client/mod.rs         | 65 ++++++++++++++++++++++++++++++++++
+ src/meta/layer.rs              | 13 +++++++
+ src/meta/stores/redis/tests.rs | 52 +++++++++++++++++++++++++++
+ src/vfs/fs/mod.rs              | 29 +++++++++++++++
+ 5 files changed, 166 insertions(+), 1 deletion(-)
+
+diff --git a/src/fuse/mod.rs b/src/fuse/mod.rs
+index 8b6f233..f3a5040 100644
+--- a/src/fuse/mod.rs
++++ b/src/fuse/mod.rs
+@@ -1283,8 +1283,14 @@ where
+             }
+         };
+ 
++        // Batch-fetch child attributes in one request (Redis MGET / DB IN)
++        // instead of issuing one stat per entry, which dominates readdirplus
++        // latency for large directories.
++        let child_inos: Vec<i64> = entries.iter().map(|e| e.ino).collect();
++        let child_attrs = self.stat_inos(&child_inos).await;
++
+         for (i, e) in entries.iter().enumerate() {
+-            let Some(cattr) = self.stat_ino(e.ino).await else {
++            let Some(cattr) = child_attrs.get(i).and_then(Clone::clone) else {
+                 continue;
+             };
+             let fattr = vfs_to_fuse_attr(&cattr, &req, self.blocks_for_attr(&cattr));
+diff --git a/src/meta/client/mod.rs b/src/meta/client/mod.rs
+index 410aa1d..4cbdd84 100644
+--- a/src/meta/client/mod.rs
++++ b/src/meta/client/mod.rs
+@@ -2147,6 +2147,45 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
+         self.cached_stat(ino).await
+     }
+ 
++    #[tracing::instrument(level = "trace", skip(self, inodes), fields(count = inodes.len()))]
++    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
++        let mut results: Vec<Option<FileAttr>> = Vec::with_capacity(inodes.len());
++        let mut misses: Vec<i64> = Vec::new();
++        let mut miss_indexes: Vec<usize> = Vec::new();
++
++        for (idx, &raw_ino) in inodes.iter().enumerate() {
++            let inode = self.check_root(raw_ino);
++            if let Some(attr) = self.inode_cache.get_attr(inode).await {
++                results.push(Some(attr));
++            } else {
++                results.push(None);
++                misses.push(inode);
++                miss_indexes.push(idx);
++            }
++        }
++
++        if !misses.is_empty() {
++            let attrs = self
++                .store
++                .batch_stat(&misses)
++                .instrument(tracing::trace_span!(
++                    "batch_stat.store",
++                    count = misses.len()
++                ))
++                .await?;
++            for (idx, attr) in miss_indexes.iter().zip(attrs.iter()) {
++                results[*idx] = attr.clone();
++            }
++            for (ino, attr) in misses.iter().zip(attrs.into_iter()) {
++                if let Some(attr) = attr {
++                    self.inode_cache.insert_node(*ino, attr, None).await;
++                }
++            }
++        }
++
++        Ok(results)
++    }
++
+     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
+         let inode = self.check_root(ino);
+@@ -3541,6 +3580,32 @@ mod tests {
+         assert_eq!(metrics.get_slices_cache_hit, 1);
+     }
+ 
++    #[tokio::test]
++    async fn test_meta_client_batch_stat_returns_attrs_in_order() {
++        let client = create_test_client().await;
++
++        let ino1 = client
++            .create_file(1, "batch_stat_1.txt".to_string())
++            .await
++            .unwrap();
++        let ino2 = client
++            .create_file(1, "batch_stat_2.txt".to_string())
++            .await
++            .unwrap();
++
++        // Missing inode must map to None while preserving input order.
++        let attrs = client.batch_stat(&[ino2, 999999, ino1]).await.unwrap();
++        assert_eq!(attrs.len(), 3);
++        assert!(attrs[0].as_ref().is_some_and(|a| a.ino == ino2));
++        assert!(attrs[1].is_none());
++        assert!(attrs[2].as_ref().is_some_and(|a| a.ino == ino1));
++
++        // Repeated call with warm cache returns the same order.
++        let attrs = client.batch_stat(&[ino1, ino2]).await.unwrap();
++        assert_eq!(attrs.len(), 2);
++        assert!(attrs.iter().all(|a| a.is_some()));
++    }
++
+     #[tokio::test]
+     async fn test_meta_client_cache_metrics_track_stat_and_lookup() {
+         let client = create_test_client().await;
+diff --git a/src/meta/layer.rs b/src/meta/layer.rs
+index c385faf..fdfa0ba 100644
+--- a/src/meta/layer.rs
++++ b/src/meta/layer.rs
+@@ -45,6 +45,19 @@ pub trait MetaLayer: Send + Sync {
+     // ---------- Core path operations ----------
+     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
+ 
++    /// Batch query attributes for multiple inodes. Returns attributes in the
++    /// same order as the input, with `None` for inodes that do not exist.
++    /// The default implementation falls back to sequential `stat`; layered
++    /// clients with caches and backends with native batch support should
++    /// override this (Redis `MGET`, database `IN`).
++    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
++        let mut out = Vec::with_capacity(inodes.len());
++        for &ino in inodes {
++            out.push(self.stat(ino).await?);
++        }
++        Ok(out)
++    }
++
+     /// Do `stat` but bypass the inode cache.
+     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
+ 
+diff --git a/src/meta/stores/redis/tests.rs b/src/meta/stores/redis/tests.rs
+index 48f4618..c0c7b13 100644
+--- a/src/meta/stores/redis/tests.rs
++++ b/src/meta/stores/redis/tests.rs
+@@ -2468,6 +2468,58 @@ async fn test_meta_client_new_directory_negative_lookup_stays_local() {
+     );
+ }
+ 
++#[serial]
++#[tokio::test]
++#[ignore]
++async fn test_meta_client_batch_stat_batches_misses_with_mget() {
++    let store = Arc::new(new_test_store().await);
++    let root = store.root_ino();
++    let client = MetaClient::new(
++        store.clone(),
++        CacheCapacity {
++            inode: 100,
++            path: 100,
++        },
++        CacheTtl::for_redis(),
++    );
++
++    let mut inos = Vec::new();
++    for idx in 0..4 {
++        // Create via the store directly so the MetaClient inode cache stays
++        // cold; then invalidate the store node cache so the batch actually
++        // reaches Redis instead of being served from the store cache.
++        let ino = store
++            .create_file(root, format!("batch_stat_{idx}.txt"))
++            .await
++            .unwrap();
++        inos.push(ino);
++        store.node_cache.invalidate(&ino).await;
++    }
++
++    reset_redis_commandstats(&store).await;
++    let attrs = client.batch_stat(&inos).await.unwrap();
++    assert_eq!(attrs.len(), 4);
++    assert!(
++        attrs.iter().all(|a| a.is_some()),
++        "all created inodes should resolve"
++    );
++    assert_eq!(
++        redis_command_calls(&store, "mget").await,
++        1,
++        "client batch_stat should fetch all cold misses with one Redis MGET"
++    );
++
++    // Warm cache: the second batch must not touch Redis.
++    reset_redis_commandstats(&store).await;
++    let attrs2 = client.batch_stat(&inos).await.unwrap();
++    assert!(attrs2.iter().all(|a| a.is_some()));
++    assert_eq!(
++        redis_command_calls(&store, "mget").await,
++        0,
++        "fully cached batch_stat should be served from memory"
++    );
++}
++
+ #[serial]
+ #[tokio::test]
+ #[ignore]
+diff --git a/src/vfs/fs/mod.rs b/src/vfs/fs/mod.rs
+index ca04635..d551195 100644
+--- a/src/vfs/fs/mod.rs
++++ b/src/vfs/fs/mod.rs
+@@ -1552,6 +1552,35 @@ where
+         Some(attr)
+     }
+ 
++    /// Batch attribute lookup for multiple inodes (readdirplus fast path).
++    /// Uses the meta layer's batched fetch (Redis MGET / DB IN when the
++    /// backend supports it) and applies the same close-to-open size overlay
++    /// as [`Self::stat_ino`]. Falls back to per-inode `stat_ino` on error so
++    /// readdirplus stays best-effort.
++    #[tracing::instrument(level = "trace", skip(self, inos), fields(count = inos.len()))]
++    pub(crate) async fn stat_inos(&self, inos: &[i64]) -> Vec<Option<FileAttr>> {
++        match self.meta_layer().batch_stat(inos).await {
++            Ok(mut attrs) => {
++                for (attr, &ino) in attrs.iter_mut().zip(inos.iter()) {
++                    if let Some(attr) = attr
++                        && let Some(size) = self.inode_size_cached(ino)
++                    {
++                        attr.size = size;
++                    }
++                }
++                attrs
++            }
++            Err(err) => {
++                tracing::warn!(count = inos.len(), error = ?err, "batch_stat failed; falling back to per-inode stat_ino");
++                let mut attrs = Vec::with_capacity(inos.len());
++                for &ino in inos {
++                    attrs.push(self.stat_ino(ino).await);
++                }
++                attrs
++            }
++        }
++    }
++
+     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
+         if let Some(inode) = self.state.inodes.get(&attr.ino)
+             && let Some(blocks) = inode.allocated_blocks_512()
+-- 
+2.50.1 (Apple Git-155)
+

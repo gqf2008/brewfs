@@ -1,0 +1,35 @@
+From 4031318170d3d733d3f07cd13aa8eb2c75f5e9a3 Mon Sep 17 00:00:00 2001
+From: codex <codex@local>
+Date: Fri, 7 Aug 2026 13:06:06 +0800
+Subject: [PATCH 29/29] ci: run full 10-tool writeback matrix in perf-check
+
+---
+ .github/workflows/perf-check.yml | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/perf-check.yml b/.github/workflows/perf-check.yml
+index d183b96..b287ad0 100644
+--- a/.github/workflows/perf-check.yml
++++ b/.github/workflows/perf-check.yml
+@@ -26,15 +26,16 @@ jobs:
+       - name: Install Rust
+         uses: dtolnay/rust-toolchain@stable
+ 
+-      - name: Run focused writeback throughput profile
++      - name: Run full writeback throughput matrix
+         env:
+           PERF_LOG_TO_CONSOLE: "false"
+           PERF_FIO_SIZE: "512m"
+           PERF_FIO_RUNTIME: "20"
++          PERF_FIO_BIGREAD_REPEATS: "1"
+         run: |
+           bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+             --writeback-throughput-profile \
+-            --tools "fio-seqwrite fio-randwrite fio-randrw"
++            --tools "fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio-bigread fio-bigwrite metaperf dirstress dirperf"
+ 
+       - name: Upload perf artifacts
+         if: always()
+-- 
+2.50.1 (Apple Git-155)
+

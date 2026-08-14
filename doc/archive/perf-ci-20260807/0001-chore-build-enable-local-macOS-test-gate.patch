@@ -1,0 +1,85 @@
+From 9d5ecbf08f317448633d7f98f1b3576e02b0206b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 21:38:07 +0800
+Subject: [PATCH 01/29] chore(build): enable local macOS test gate
+
+qlean is only used by QEMU/KVM integration tests that CI never compiles
+(`--lib --bins`), but it unconditionally pulls kvm-ioctls which does not
+compile on macOS arm64. Gate it to linux/x86_64 so `cargo test --lib
+--bins` (the repo's required local CI gate) can run on macOS.
+
+Also fix test-only portability: libc::makedev and S_IFIFO/S_IFCHR use
+different integer widths on darwin, so cast them explicitly.
+---
+ Cargo.toml       |  2 +-
+ src/fuse/mod.rs  |  4 ++--
+ src/utils/num.rs | 12 ++++++++++--
+ 3 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 6afaa3a..1bc926b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -327,7 +327,7 @@ serial_test = { workspace = true }
+ tracing-chrome = { workspace = true }
+ tower = { workspace = true, features = ["util"] }
+ 
+-[target.'cfg(unix)'.dev-dependencies]
++[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+ qlean = { workspace = true }
+ pprof = { workspace = true }
+ 
+diff --git a/src/fuse/mod.rs b/src/fuse/mod.rs
+index 6eca3c0..8b6f233 100644
+--- a/src/fuse/mod.rs
++++ b/src/fuse/mod.rs
+@@ -3761,7 +3761,7 @@ mod fuse_init_tests {
+             Request::default(),
+             1,
+             OsStr::new("pipe"),
+-            libc::S_IFIFO | 0o644,
++            (libc::S_IFIFO as u32) | 0o644,
+             0,
+         )
+         .await
+@@ -3784,7 +3784,7 @@ mod fuse_init_tests {
+             Request::default(),
+             1,
+             OsStr::new("tty"),
+-            libc::S_IFCHR | 0o600,
++            (libc::S_IFCHR as u32) | 0o600,
+             0x0103,
+         )
+         .await
+diff --git a/src/utils/num.rs b/src/utils/num.rs
+index 7f42787..56ca2d5 100644
+--- a/src/utils/num.rs
++++ b/src/utils/num.rs
+@@ -28,14 +28,22 @@ impl NumCastExt for u64 {
+ 
+ /// Portable `makedev(major, minor)`.
+ ///
+-/// Uses `libc::makedev` on Unix; on Windows (where libc does not export it)
++/// Uses `libc::makedev` on Unix (with a macOS-specific cast: darwin's libc
++/// exposes it as `i32 -> i32`); on Windows (where libc does not export it)
+ /// falls back to the Linux glibc encoding, which is sufficient for the
+ /// special-node round-trip tests.
+ #[cfg(test)]
+ pub(crate) fn makedev(major: u32, minor: u32) -> u64 {
+     #[cfg(unix)]
+     {
+-        libc::makedev(major, minor)
++        #[cfg(target_os = "macos")]
++        {
++            libc::makedev(major as i32, minor as i32) as u64
++        }
++        #[cfg(not(target_os = "macos"))]
++        {
++            libc::makedev(major, minor)
++        }
+     }
+     #[cfg(not(unix))]
+     {
+-- 
+2.50.1 (Apple Git-155)
+

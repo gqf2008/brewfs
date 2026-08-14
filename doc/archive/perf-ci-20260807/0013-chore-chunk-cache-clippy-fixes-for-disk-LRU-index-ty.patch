@@ -1,0 +1,52 @@
+From d12887c162a073bfaada5b5d806300029686f5f4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 23:44:23 +0800
+Subject: [PATCH 13/29] chore(chunk/cache): clippy fixes for disk LRU index
+ (type alias, collapsible if)
+
+---
+ src/chunk/cache.rs | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/src/chunk/cache.rs b/src/chunk/cache.rs
+index 3b71258..c51ebd0 100644
+--- a/src/chunk/cache.rs
++++ b/src/chunk/cache.rs
+@@ -355,13 +355,13 @@ struct DiskStorage {
+     /// Lazy min-heap of `(last_access, key)` used to pick eviction victims
+     /// without scanning the cache directory. Entries may be stale (key
+     /// re-accessed or removed); `evict_lru` validates lazily.
+-    eviction_queue: Arc<
+-        std::sync::Mutex<
+-            std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>,
+-        >,
+-    >,
++    eviction_queue: Arc<EvictionQueue>,
+ }
+ 
++/// Lazy min-heap of `(last_access, key)` used for disk-cache LRU eviction.
++type EvictionQueue =
++    std::sync::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>>;
++
+ impl DiskStorage {
+     pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
+         Self::new_with_integrity(base_dir, max_bytes, CacheIntegrityMode::Full).await
+@@ -1005,10 +1005,11 @@ impl DiskStorage {
+         while let Ok(Some(entry)) = entries.next_entry().await {
+             let name = entry.file_name();
+             let name = name.to_string_lossy();
+-            if name.starts_with(&tmp_prefix) && name.ends_with(".tmp") {
+-                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+-                    trace!(key, path = %entry.path().display(), error = ?e, "failed to remove leftover tmp cache file");
+-                }
++            if name.starts_with(&tmp_prefix)
++                && name.ends_with(".tmp")
++                && let Err(e) = tokio::fs::remove_file(entry.path()).await
++            {
++                trace!(key, path = %entry.path().display(), error = ?e, "failed to remove leftover tmp cache file");
+             }
+         }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

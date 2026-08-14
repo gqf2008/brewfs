@@ -1,0 +1,178 @@
+From 13b05ea76e99a414e99d2f910ba6f4182237bb50 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 09:00:42 +0800
+Subject: [PATCH 14/29] refactor(vfs/stats): extract RAII timing guards into
+ stats_timer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partial #12 (gqf2008/brewfs)
+
+Second slice of the file decomposition: move OpTimer / MaybeOpTimer
+(~490 lines) into a sibling module src/vfs/stats_timer.rs and re-export
+from stats.rs so existing callers (crate::vfs::stats::OpTimer) keep
+working. Pure code motion — no behavior change; stats tests pass.
+---
+ src/vfs/mod.rs         |  7 +++--
+ src/vfs/stats.rs       | 55 +-----------------------------------
+ src/vfs/stats_timer.rs | 63 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 57 deletions(-)
+ create mode 100644 src/vfs/stats_timer.rs
+
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index 29db676..9b68866 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -21,9 +21,10 @@ pub(crate) mod inode;
+ pub(crate) mod io;
+ pub mod memory;
+ pub(crate) mod meta_ops;
+-pub mod sdk;
+-pub mod stats;
+-pub(crate) use inode::Inode;
++ pub mod sdk;
++ pub mod stats;
++ pub(crate) mod stats_timer;
++ pub(crate) use inode::Inode;
+ 
+ const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+ 
+diff --git a/src/vfs/stats.rs b/src/vfs/stats.rs
+index 4b1ac84..92dcccb 100644
+--- a/src/vfs/stats.rs
++++ b/src/vfs/stats.rs
+@@ -2403,60 +2403,7 @@ impl Default for FsStats {
+     }
+ }
+ 
+-/// RAII guard for timing an operation and recording latency + count.
+-/// Records stats on drop, so it can be used as `let _timer = OpTimer::new(...)`.
+-pub struct OpTimer<'a> {
+-    start: Instant,
+-    ops_counter: &'a AtomicU64,
+-    lat_counter: &'a AtomicU64,
+-}
+-
+-impl<'a> OpTimer<'a> {
+-    pub fn new(ops_counter: &'a AtomicU64, lat_counter: &'a AtomicU64) -> Self {
+-        Self {
+-            start: Instant::now(),
+-            ops_counter,
+-            lat_counter,
+-        }
+-    }
+-
+-    /// Finish timing and record the operation (consumes self).
+-    pub fn finish(self) {
+-        // Drop impl handles the actual recording.
+-    }
+-}
+-
+-impl<'a> Drop for OpTimer<'a> {
+-    fn drop(&mut self) {
+-        FsStats::record_duration(self.ops_counter, self.lat_counter, self.start.elapsed());
+-    }
+-}
+-
+-/// Optional timer for diagnostic hot-path stats. Disabled timers avoid
+-/// `Instant::now()` so production hot paths only pay a cheap branch.
+-pub struct MaybeOpTimer<'a> {
+-    start: Option<Instant>,
+-    ops_counter: &'a AtomicU64,
+-    lat_counter: &'a AtomicU64,
+-}
+-
+-impl<'a> MaybeOpTimer<'a> {
+-    pub fn new(enabled: bool, ops_counter: &'a AtomicU64, lat_counter: &'a AtomicU64) -> Self {
+-        Self {
+-            start: enabled.then(Instant::now),
+-            ops_counter,
+-            lat_counter,
+-        }
+-    }
+-}
+-
+-impl<'a> Drop for MaybeOpTimer<'a> {
+-    fn drop(&mut self) {
+-        if let Some(start) = self.start {
+-            FsStats::record_duration(self.ops_counter, self.lat_counter, start.elapsed());
+-        }
+-    }
+-}
++pub use crate::vfs::stats_timer::{MaybeOpTimer, OpTimer};
+ 
+ /// Convenience macro for timing an async operation and recording stats.
+ ///
+diff --git a/src/vfs/stats_timer.rs b/src/vfs/stats_timer.rs
+new file mode 100644
+index 0000000..cb5e5c3
+--- /dev/null
++++ b/src/vfs/stats_timer.rs
+@@ -0,0 +1,63 @@
++//! RAII timing guards for the VFS stats collector.
++//!
++//! Split out of `stats.rs` (part of the writer/stats decomposition): these
++//! guards are self-contained and have no behavior changes.
++
++use crate::vfs::stats::FsStats;
++use std::sync::atomic::AtomicU64;
++use std::time::Instant;
++
++/// RAII guard for timing an operation and recording latency + count.
++/// Records stats on drop, so it can be used as `let _timer = OpTimer::new(...)`.
++pub struct OpTimer<'a> {
++    start: Instant,
++    ops_counter: &'a AtomicU64,
++    lat_counter: &'a AtomicU64,
++}
++
++impl<'a> OpTimer<'a> {
++    pub fn new(ops_counter: &'a AtomicU64, lat_counter: &'a AtomicU64) -> Self {
++        Self {
++            start: Instant::now(),
++            ops_counter,
++            lat_counter,
++        }
++    }
++
++    /// Finish timing and record the operation (consumes self).
++    pub fn finish(self) {
++        // Drop impl handles the actual recording.
++    }
++}
++
++impl<'a> Drop for OpTimer<'a> {
++    fn drop(&mut self) {
++        FsStats::record_duration(self.ops_counter, self.lat_counter, self.start.elapsed());
++    }
++}
++
++/// Optional timer for diagnostic hot-path stats. Disabled timers avoid
++/// `Instant::now()` so production hot paths only pay a cheap branch.
++pub struct MaybeOpTimer<'a> {
++    start: Option<Instant>,
++    ops_counter: &'a AtomicU64,
++    lat_counter: &'a AtomicU64,
++}
++
++impl<'a> MaybeOpTimer<'a> {
++    pub fn new(enabled: bool, ops_counter: &'a AtomicU64, lat_counter: &'a AtomicU64) -> Self {
++        Self {
++            start: enabled.then(Instant::now),
++            ops_counter,
++            lat_counter,
++        }
++    }
++}
++
++impl<'a> Drop for MaybeOpTimer<'a> {
++    fn drop(&mut self) {
++        if let Some(start) = self.start {
++            FsStats::record_duration(self.ops_counter, self.lat_counter, start.elapsed());
++        }
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

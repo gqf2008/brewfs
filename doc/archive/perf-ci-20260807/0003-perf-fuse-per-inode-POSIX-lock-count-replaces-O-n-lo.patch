@@ -1,0 +1,169 @@
+From 54d738c64fa304cffcbf44c599930ab08f81f502 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 22:02:14 +0800
+Subject: [PATCH 03/29] perf(fuse): per-inode POSIX lock count replaces O(n)
+ lock scan on read path
+
+Closes #27
+
+Every read on an inode that ever held a POSIX lock did an unconditional
+1ms sleep plus a full iteration of posix_lock_owners (O(total locked
+files)). The lock-scan was only used to answer "does THIS inode hold
+locks?".
+
+- VfsState gains posix_lock_inode_counts (DashMap<i64, usize>), kept in
+  lockstep with posix_lock_owners insert/remove points (duplicate
+  registrations do not inflate the count).
+- has_posix_locks_for_inode is now an O(1) per-inode lookup; unlocked
+  files never sleep and never trigger a global scan.
+- Test: count tracks multiple owners, deduplicates registrations, goes
+  back to false after the last owner is taken, and never goes negative.
+---
+ src/vfs/fs/mod.rs   | 48 ++++++++++++++++++++++++++++++++++++++-------
+ src/vfs/fs/tests.rs | 37 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 78 insertions(+), 7 deletions(-)
+
+diff --git a/src/vfs/fs/mod.rs b/src/vfs/fs/mod.rs
+index 6aa8af1..ca04635 100644
+--- a/src/vfs/fs/mod.rs
++++ b/src/vfs/fs/mod.rs
+@@ -314,6 +314,10 @@ where
+     statfs_cache: StdMutex<Option<StatFsCache>>,
+     fallocate_statfs_cache: StdMutex<Option<FallocateStatFsCache>>,
+     posix_lock_owners: DashMap<(i64, i64), ()>,
++    /// Per-inode count of registered POSIX lock owners. Lets the read path
++    /// check "does this inode hold locks" in O(1) instead of scanning the
++    /// whole `posix_lock_owners` map (which grows with every locked file).
++    posix_lock_inode_counts: DashMap<i64, usize>,
+     fuse_lock_owners_by_handle: DashMap<(i64, u64, i64), ()>,
+     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
+     memory_budget: Option<MemoryBudget>,
+@@ -534,6 +538,7 @@ where
+             statfs_cache: StdMutex::new(None),
+             fallocate_statfs_cache: StdMutex::new(None),
+             posix_lock_owners: DashMap::new(),
++            posix_lock_inode_counts: DashMap::new(),
+             fuse_lock_owners_by_handle: DashMap::new(),
+             stats: Arc::new(crate::vfs::stats::FsStats::new()),
+             memory_budget,
+@@ -4148,7 +4153,13 @@ where
+         lock_type: FileLockType,
+     ) {
+         if lock_type != FileLockType::UnLock {
+-            self.state.posix_lock_owners.insert((inode, owner), ());
++            match self.state.posix_lock_owners.entry((inode, owner)) {
++                Entry::Vacant(entry) => {
++                    entry.insert(());
++                    *self.state.posix_lock_inode_counts.entry(inode).or_insert(0) += 1;
++                }
++                Entry::Occupied(_) => {}
++            }
+         }
+     }
+ 
+@@ -4196,7 +4207,14 @@ where
+         let mut owners = Vec::with_capacity(keys.len());
+         for key in keys {
+             if self.state.fuse_lock_owners_by_handle.remove(&key).is_some() {
+-                self.state.posix_lock_owners.remove(&(inode, key.2));
++                if self
++                    .state
++                    .posix_lock_owners
++                    .remove(&(inode, key.2))
++                    .is_some()
++                {
++                    Self::decrement_posix_lock_count(&self.state, inode);
++                }
+                 owners.push(key.2);
+             }
+         }
+@@ -4208,17 +4226,33 @@ where
+     }
+ 
+     pub(crate) fn take_posix_lock_owner(&self, inode: i64, owner: i64) -> bool {
+-        self.state
++        let removed = self
++            .state
+             .posix_lock_owners
+             .remove(&(inode, owner))
+-            .is_some()
++            .is_some();
++        if removed {
++            Self::decrement_posix_lock_count(&self.state, inode);
++        }
++        removed
+     }
+ 
+     pub(crate) fn has_posix_locks_for_inode(&self, inode: i64) -> bool {
+         self.state
+-            .posix_lock_owners
+-            .iter()
+-            .any(|entry| entry.key().0 == inode)
++            .posix_lock_inode_counts
++            .get(&inode)
++            .is_some_and(|count| *count > 0)
++    }
++
++    fn decrement_posix_lock_count(state: &VfsState<S, M>, inode: i64) {
++        if let Entry::Occupied(mut entry) = state.posix_lock_inode_counts.entry(inode) {
++            let count = *entry.get();
++            if count <= 1 {
++                entry.remove();
++            } else {
++                *entry.get_mut() = count - 1;
++            }
++        }
+     }
+ 
+     /// Set xattr for a given inode.
+diff --git a/src/vfs/fs/tests.rs b/src/vfs/fs/tests.rs
+index 1d5dcb2..9e29d4e 100644
+--- a/src/vfs/fs/tests.rs
++++ b/src/vfs/fs/tests.rs
+@@ -3378,6 +3378,43 @@ mod truncate_flush_tests {
+         assert!(!fs.has_fuse_lock_owners());
+     }
+ 
++    #[tokio::test]
++    async fn test_posix_lock_owner_count_tracks_per_inode_locks() {
++        let fs = new_vfs().await;
++        let ino = 42;
++        let other_ino = 43;
++
++        assert!(!fs.has_posix_locks_for_inode(ino));
++        assert!(!fs.has_posix_locks_for_inode(other_ino));
++
++        // First registration creates the per-inode count.
++        fs.remember_posix_lock_owner(ino, 11, FileLockType::Write);
++        assert!(fs.has_posix_locks_for_inode(ino));
++
++        // Duplicate registration for the same (inode, owner) must not inflate
++        // the count, otherwise the inode would be considered locked forever.
++        fs.remember_posix_lock_owner(ino, 11, FileLockType::Write);
++        fs.remember_posix_lock_owner(ino, 11, FileLockType::Read);
++        assert!(fs.has_posix_locks_for_inode(ino));
++
++        // A second distinct owner keeps the inode locked after the first is
++        // taken; unlocking the last owner clears the fast path.
++        fs.remember_posix_lock_owner(ino, 12, FileLockType::Read);
++        assert!(fs.take_posix_lock_owner(ino, 11));
++        assert!(fs.has_posix_locks_for_inode(ino));
++        assert!(fs.take_posix_lock_owner(ino, 12));
++        assert!(!fs.has_posix_locks_for_inode(ino));
++
++        // Unlocking an unknown owner is a no-op and must not go negative.
++        assert!(!fs.take_posix_lock_owner(ino, 99));
++        assert!(!fs.has_posix_locks_for_inode(ino));
++
++        // Locks on one inode never affect another inode.
++        fs.remember_posix_lock_owner(other_ino, 13, FileLockType::Write);
++        assert!(!fs.has_posix_locks_for_inode(ino));
++        assert!(fs.has_posix_locks_for_inode(other_ino));
++    }
++
+     /// Write a large amount of data, then immediately truncate to zero
+     /// before any background flush can complete.  This is the worst case
+     /// for the flush_required path — lots of dirty data to upload.
+-- 
+2.50.1 (Apple Git-155)
+

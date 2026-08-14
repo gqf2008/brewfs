@@ -1,0 +1,219 @@
+From 34c2d19c43fd8833ca6f62a9d049cac4f532877d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 23:18:25 +0800
+Subject: [PATCH 08/29] chore: remove dead code and misleading TODO
+ placeholders
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes #13 (gqf2008/brewfs) — non-meta scope
+
+- ObjectBlockStore: delete unused sync constructors (new /
+  new_with_config / new_with_configs) that used block_on + unwrap in
+  async contexts (potential panic); async new_async /
+  new_with_configs_async remain. Delete unused cache_block helper and
+  the now-unused futures::executor::block_on import.
+- daemon/worker.rs: remove empty start_upload_workers stub (upload
+  concurrency lives in the writer's upload tasks).
+- fuse/adapter.rs: remove empty register_callbacks placeholder module.
+- vfs/mod.rs / cadapter/mod.rs: remove stale module-level TODO lines.
+- Deferred to the meta-service redesign (kept intentionally):
+  meta/migrations.rs ensure_migrations placeholder; read_at_into wiring
+  is tracked by #6.
+---
+ src/cadapter/mod.rs  |  1 -
+ src/chunk/store.rs   | 70 --------------------------------------------
+ src/daemon/worker.rs |  5 ----
+ src/fuse/adapter.rs  |  6 ----
+ src/fuse/mod.rs      |  2 --
+ src/vfs/mod.rs       |  6 ----
+ 6 files changed, 90 deletions(-)
+ delete mode 100644 src/fuse/adapter.rs
+
+diff --git a/src/cadapter/mod.rs b/src/cadapter/mod.rs
+index b52a3a7..4e5d056 100644
+--- a/src/cadapter/mod.rs
++++ b/src/cadapter/mod.rs
+@@ -12,4 +12,3 @@
+ pub mod client;
+ pub mod localfs;
+ pub mod s3;
+-// Module-level TODOs remain: implement concrete adapter logic and tests.
+diff --git a/src/chunk/store.rs b/src/chunk/store.rs
+index b360fe5..9fa1736 100644
+--- a/src/chunk/store.rs
++++ b/src/chunk/store.rs
+@@ -13,7 +13,6 @@ use crate::{
+ use anyhow::{self, Context};
+ use async_trait::async_trait;
+ use bytes::Bytes;
+-use futures::executor::block_on;
+ use hex::encode;
+ use moka::{Entry, ops::compute::Op};
+ use sha2::{Digest, Sha256};
+@@ -381,31 +380,6 @@ impl BlockStoreConfig {
+ }
+ 
+ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
+-    #[allow(dead_code)]
+-    pub fn new(client: ObjectClient<B>) -> Self {
+-        let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
+-
+-        let _ = fs::create_dir_all(cache_dir.clone());
+-
+-        let block_cache = block_on(ChunksCache::new_with_config(ChunksCacheConfig::default()))
+-            .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))
+-            .unwrap();
+-        let config = BlockStoreConfig::default();
+-        config.validate().expect("default config must be valid");
+-        let page_cache = ReadPageCache::new(config.page_cache_capacity, config.page_size);
+-        Self {
+-            client: Arc::new(client),
+-            block_cache,
+-            page_cache,
+-            page_flight: SingleFlight::new(),
+-            read_flight: Arc::new(SingleFlight::new()),
+-            range_prefetch_limit: Arc::new(Semaphore::new(8)),
+-            config,
+-            bandwidth: BandwidthLimiter::unlimited(),
+-            object_metrics: Arc::new(ObjectStoreMetrics::default()),
+-        }
+-    }
+-
+     #[allow(dead_code)]
+     pub async fn new_async(client: ObjectClient<B>) -> anyhow::Result<Self> {
+         Self::new_with_configs_async(
+@@ -416,43 +390,6 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
+         .await
+     }
+ 
+-    /// Creates a new ObjectBlockStore with custom cache configuration
+-    #[allow(unused)]
+-    pub fn new_with_config(
+-        client: ObjectClient<B>,
+-        cache_config: ChunksCacheConfig,
+-    ) -> anyhow::Result<Self> {
+-        Self::new_with_configs(client, cache_config, BlockStoreConfig::default())
+-    }
+-
+-    /// Creates a new ObjectBlockStore with custom cache and block store configurations
+-    #[allow(unused)]
+-    pub fn new_with_configs(
+-        client: ObjectClient<B>,
+-        cache_config: ChunksCacheConfig,
+-        store_config: BlockStoreConfig,
+-    ) -> anyhow::Result<Self> {
+-        store_config.validate()?;
+-        let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
+-        let _ = fs::create_dir_all(cache_dir.clone());
+-
+-        let block_cache = block_on(ChunksCache::new_with_config(cache_config))
+-            .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))?;
+-        let page_cache =
+-            ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
+-        Ok(Self {
+-            client: Arc::new(client),
+-            block_cache,
+-            page_cache,
+-            page_flight: SingleFlight::new(),
+-            read_flight: Arc::new(SingleFlight::new()),
+-            range_prefetch_limit: Arc::new(Semaphore::new(8)),
+-            config: store_config,
+-            bandwidth: BandwidthLimiter::unlimited(),
+-            object_metrics: Arc::new(ObjectStoreMetrics::default()),
+-        })
+-    }
+-
+     pub async fn new_with_configs_async(
+         client: ObjectClient<B>,
+         cache_config: ChunksCacheConfig,
+@@ -982,13 +919,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
+         Ok(())
+     }
+ 
+-    #[allow(dead_code)]
+-    async fn cache_block(&self, key: BlockKey, data: &[u8]) -> anyhow::Result<()> {
+-        let key_str = Self::key_for(key);
+-        let _ = self.block_cache.insert(&key_str, &data.to_vec()).await;
+-        Ok(())
+-    }
+-
+     fn cache_counters(&self) -> (Option<Arc<AtomicU64>>, Option<Arc<AtomicU64>>) {
+         (
+             Some(self.block_cache.cache_hits.clone()),
+diff --git a/src/daemon/worker.rs b/src/daemon/worker.rs
+index 5dbaaa4..d1b51f9 100644
+--- a/src/daemon/worker.rs
++++ b/src/daemon/worker.rs
+@@ -11,11 +11,6 @@ use std::time::Duration;
+ use tokio::time::interval;
+ use tracing::{debug, error, info, warn};
+ 
+-#[allow(dead_code)]
+-pub(crate) fn start_upload_workers() {
+-    // TODO: implement upload worker pool
+-}
+-
+ /// Configuration for object-level garbage collection.
+ #[derive(Debug, Clone)]
+ #[allow(dead_code)]
+diff --git a/src/fuse/adapter.rs b/src/fuse/adapter.rs
+deleted file mode 100644
+index 4af8c1e..0000000
+--- a/src/fuse/adapter.rs
++++ /dev/null
+@@ -1,6 +0,0 @@
+-//! FUSE adapter glue code (placeholder)
+-
+-#[allow(dead_code)]
+-pub(crate) fn register_callbacks() {
+-    // TODO: register FUSE handlers
+-}
+diff --git a/src/fuse/mod.rs b/src/fuse/mod.rs
+index f3a5040..e756ab0 100644
+--- a/src/fuse/mod.rs
++++ b/src/fuse/mod.rs
+@@ -4,7 +4,6 @@
+ //! to the operating system via the FUSE protocol.
+ //!
+ //! Main components:
+-//! - `adapter`: Contains the FUSE adapter implementation.
+ //! - `mount`: Handles mounting the virtual filesystem using FUSE.
+ //! - Implementation of the `Filesystem` trait for `VFS`, enabling translation of FUSE requests
+ //!   into virtual filesystem operations.
+@@ -12,7 +11,6 @@
+ //!
+ //! The module also includes platform-specific tests for mounting and basic operations,
+ //! and provides utilities for mapping VFS metadata to FUSE attributes.
+-pub(crate) mod adapter;
+ pub mod mount;
+ use crate::chunk::store::BlockStore;
+ use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index 4ec5b91..29db676 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -8,10 +8,6 @@
+ //! - Coordinate with the meta client for metadata lookup and the chunk writer
+ //!   for producing blocks.
+ //!
+-//! Important notes / TODOs:
+-//! - Implement handle lifecycle and cache invalidation policies.
+-//! - Offer concurrency-safe APIs for reader/writer paths.
+-//!
+ //! Submodules:
+ //! - `handles`: file and directory handle management
+ //! - `cache`: caching helpers and policies
+@@ -27,8 +23,6 @@ pub mod memory;
+ pub(crate) mod meta_ops;
+ pub mod sdk;
+ pub mod stats;
+-// Module implementation TODOs remain.
+-
+ pub(crate) use inode::Inode;
+ 
+ const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+-- 
+2.50.1 (Apple Git-155)
+

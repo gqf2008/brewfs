@@ -1,0 +1,821 @@
+From 47b0b8550833b056613ad27e5d8c24e13f048920 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 09:56:11 +0800
+Subject: [PATCH 23/29] refactor(vfs/stats): extract writeback sync methods
+ into stats_writeback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partial #12 (gqf2008/brewfs)
+
+Fifth slice: move the 14 sync_writeback_* and 2 add_writeback_* methods
+(~373 lines) into src/vfs/stats_writeback.rs as an extension impl, with
+ORD made pub(crate) for the sibling module. Pure code motion — no
+behavior change; stats tests pass.
+---
+ src/vfs/mod.rs             |   1 +
+ src/vfs/stats.rs           | 376 +-----------------------------------
+ src/vfs/stats_writeback.rs | 384 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 386 insertions(+), 375 deletions(-)
+ create mode 100644 src/vfs/stats_writeback.rs
+
+diff --git a/src/vfs/mod.rs b/src/vfs/mod.rs
+index c1ec575..9171cbe 100644
+--- a/src/vfs/mod.rs
++++ b/src/vfs/mod.rs
+@@ -25,6 +25,7 @@ pub mod sdk;
+ pub mod stats;
+ pub(crate) mod stats_snapshot;
+ pub(crate) mod stats_timer;
++pub(crate) mod stats_writeback;
+ pub(crate) use inode::Inode;
+ 
+ const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+diff --git a/src/vfs/stats.rs b/src/vfs/stats.rs
+index 4395566..9112a18 100644
+--- a/src/vfs/stats.rs
++++ b/src/vfs/stats.rs
+@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
+ 
+ /// Relaxed ordering is sufficient for stats counters — we only need eventual
+ /// visibility, not happens-before relationships.
+-const ORD: Ordering = Ordering::Relaxed;
++pub(crate) const ORD: Ordering = Ordering::Relaxed;
+ 
+ pub use crate::vfs::stats_snapshot::FsStatsSnapshot;
+ /// Global filesystem statistics, designed for lock-free concurrent updates.
+@@ -893,380 +893,6 @@ impl FsStats {
+         self.buf_read_bytes.store(read_bytes, ORD);
+     }
+ 
+-    pub fn sync_writeback_dirty_breakdown(
+-        &self,
+-        live_bytes: u64,
+-        live_slices: u64,
+-        recent_pending_upload_bytes: u64,
+-        recent_pending_upload_slices: u64,
+-        recent_uploaded_bytes: u64,
+-        recent_uploaded_slices: u64,
+-    ) {
+-        self.writeback_live_dirty_bytes.store(live_bytes, ORD);
+-        self.writeback_live_slices.store(live_slices, ORD);
+-        self.writeback_recent_pending_upload_bytes
+-            .store(recent_pending_upload_bytes, ORD);
+-        self.writeback_recent_pending_upload_slices
+-            .store(recent_pending_upload_slices, ORD);
+-        self.writeback_recent_uploaded_bytes
+-            .store(recent_uploaded_bytes, ORD);
+-        self.writeback_recent_uploaded_slices
+-            .store(recent_uploaded_slices, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_live_origin_metrics(
+-        &self,
+-        normal_only_bytes: u64,
+-        normal_only_slices: u64,
+-        cached_only_bytes: u64,
+-        cached_only_slices: u64,
+-        mixed_origin_bytes: u64,
+-        mixed_origin_slices: u64,
+-        unknown_origin_bytes: u64,
+-        unknown_origin_slices: u64,
+-    ) {
+-        self.writeback_live_normal_only_bytes
+-            .store(normal_only_bytes, ORD);
+-        self.writeback_live_normal_only_slices
+-            .store(normal_only_slices, ORD);
+-        self.writeback_live_cached_only_bytes
+-            .store(cached_only_bytes, ORD);
+-        self.writeback_live_cached_only_slices
+-            .store(cached_only_slices, ORD);
+-        self.writeback_live_mixed_origin_bytes
+-            .store(mixed_origin_bytes, ORD);
+-        self.writeback_live_mixed_origin_slices
+-            .store(mixed_origin_slices, ORD);
+-        self.writeback_live_unknown_origin_bytes
+-            .store(unknown_origin_bytes, ORD);
+-        self.writeback_live_unknown_origin_slices
+-            .store(unknown_origin_slices, ORD);
+-    }
+-
+-    pub fn add_writeback_backpressure_soft_sleep(&self, duration: Duration) {
+-        self.writeback_backpressure_soft_sleep_ops.fetch_add(1, ORD);
+-        self.writeback_backpressure_soft_sleep_us
+-            .fetch_add(duration.as_micros().min(u128::from(u64::MAX)) as u64, ORD);
+-    }
+-
+-    pub fn add_writeback_backpressure_hard_wait(&self, duration: Duration) {
+-        self.writeback_backpressure_hard_wait_ops.fetch_add(1, ORD);
+-        self.writeback_backpressure_hard_wait_us
+-            .fetch_add(duration.as_micros().min(u128::from(u64::MAX)) as u64, ORD);
+-    }
+-
+-    pub fn sync_writeback_backpressure_metrics(
+-        &self,
+-        soft_sleep_ops: u64,
+-        soft_sleep_us: u64,
+-        hard_wait_ops: u64,
+-        hard_wait_us: u64,
+-    ) {
+-        self.writeback_backpressure_soft_sleep_ops
+-            .store(soft_sleep_ops, ORD);
+-        self.writeback_backpressure_soft_sleep_us
+-            .store(soft_sleep_us, ORD);
+-        self.writeback_backpressure_hard_wait_ops
+-            .store(hard_wait_ops, ORD);
+-        self.writeback_backpressure_hard_wait_us
+-            .store(hard_wait_us, ORD);
+-    }
+-
+-    pub fn sync_writeback_buffer_backpressure_metrics(
+-        &self,
+-        soft_sleep_ops: u64,
+-        soft_sleep_us: u64,
+-        moderate_sleep_ops: u64,
+-        moderate_sleep_us: u64,
+-        hard_sleep_ops: u64,
+-        hard_sleep_us: u64,
+-    ) {
+-        self.writeback_buffer_soft_sleep_ops
+-            .store(soft_sleep_ops, ORD);
+-        self.writeback_buffer_soft_sleep_us
+-            .store(soft_sleep_us, ORD);
+-        self.writeback_buffer_moderate_sleep_ops
+-            .store(moderate_sleep_ops, ORD);
+-        self.writeback_buffer_moderate_sleep_us
+-            .store(moderate_sleep_us, ORD);
+-        self.writeback_buffer_hard_sleep_ops
+-            .store(hard_sleep_ops, ORD);
+-        self.writeback_buffer_hard_sleep_us
+-            .store(hard_sleep_us, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_phase_metrics(
+-        &self,
+-        stage_inflight_bytes: u64,
+-        remote_upload_inflight_bytes: u64,
+-        stage_ops: u64,
+-        stage_bytes: u64,
+-        stage_lat_us: u64,
+-        stage_failures: u64,
+-        commit_before_stage_ops: u64,
+-    ) {
+-        self.writeback_stage_inflight_bytes
+-            .store(stage_inflight_bytes, ORD);
+-        self.writeback_remote_upload_inflight_bytes
+-            .store(remote_upload_inflight_bytes, ORD);
+-        self.writeback_stage_ops.store(stage_ops, ORD);
+-        self.writeback_stage_bytes.store(stage_bytes, ORD);
+-        self.writeback_stage_lat_us.store(stage_lat_us, ORD);
+-        self.writeback_stage_failures.store(stage_failures, ORD);
+-        self.writeback_commit_before_stage_ops
+-            .store(commit_before_stage_ops, ORD);
+-    }
+-
+-    pub fn sync_writeback_commit_wait_metrics(
+-        &self,
+-        upload_ops: u64,
+-        upload_us: u64,
+-        retry_ops: u64,
+-        retry_us: u64,
+-    ) {
+-        self.writeback_commit_wait_upload_ops.store(upload_ops, ORD);
+-        self.writeback_commit_wait_upload_us.store(upload_us, ORD);
+-        self.writeback_commit_wait_retry_ops.store(retry_ops, ORD);
+-        self.writeback_commit_wait_retry_us.store(retry_us, ORD);
+-    }
+-
+-    pub fn sync_writeback_flush_wait_metrics(&self, ops: u64, us: u64, slices: u64) {
+-        self.writeback_flush_wait_ops.store(ops, ORD);
+-        self.writeback_flush_wait_us.store(us, ORD);
+-        self.writeback_flush_wait_slices.store(slices, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_flush_fragmentation_metrics(
+-        &self,
+-        ops: u64,
+-        slices: u64,
+-        bytes: u64,
+-        cached_sub_block_slices: u64,
+-        cached_sub_block_bytes: u64,
+-        full_block_slices: u64,
+-        full_block_bytes: u64,
+-    ) {
+-        self.writeback_flush_fragmentation_ops.store(ops, ORD);
+-        self.writeback_flush_fragmentation_slices.store(slices, ORD);
+-        self.writeback_flush_fragmentation_bytes.store(bytes, ORD);
+-        self.writeback_flush_fragmentation_cached_sub_block_slices
+-            .store(cached_sub_block_slices, ORD);
+-        self.writeback_flush_fragmentation_cached_sub_block_bytes
+-            .store(cached_sub_block_bytes, ORD);
+-        self.writeback_flush_fragmentation_full_block_slices
+-            .store(full_block_slices, ORD);
+-        self.writeback_flush_fragmentation_full_block_bytes
+-            .store(full_block_bytes, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_commit_wait_breakdown_metrics(
+-        &self,
+-        size_ops: u64,
+-        size_us: u64,
+-        max_unflushed_ops: u64,
+-        max_unflushed_us: u64,
+-        explicit_flush_ops: u64,
+-        explicit_flush_us: u64,
+-        auto_ops: u64,
+-        auto_us: u64,
+-        commit_age_ops: u64,
+-        commit_age_us: u64,
+-        unknown_reason_ops: u64,
+-        unknown_reason_us: u64,
+-        normal_only_ops: u64,
+-        normal_only_us: u64,
+-        cached_only_ops: u64,
+-        cached_only_us: u64,
+-        mixed_origin_ops: u64,
+-        mixed_origin_us: u64,
+-        unknown_origin_ops: u64,
+-        unknown_origin_us: u64,
+-    ) {
+-        self.writeback_commit_wait_upload_size_ops
+-            .store(size_ops, ORD);
+-        self.writeback_commit_wait_upload_size_us
+-            .store(size_us, ORD);
+-        self.writeback_commit_wait_upload_max_unflushed_ops
+-            .store(max_unflushed_ops, ORD);
+-        self.writeback_commit_wait_upload_max_unflushed_us
+-            .store(max_unflushed_us, ORD);
+-        self.writeback_commit_wait_upload_explicit_flush_ops
+-            .store(explicit_flush_ops, ORD);
+-        self.writeback_commit_wait_upload_explicit_flush_us
+-            .store(explicit_flush_us, ORD);
+-        self.writeback_commit_wait_upload_auto_ops
+-            .store(auto_ops, ORD);
+-        self.writeback_commit_wait_upload_auto_us
+-            .store(auto_us, ORD);
+-        self.writeback_commit_wait_upload_commit_age_ops
+-            .store(commit_age_ops, ORD);
+-        self.writeback_commit_wait_upload_commit_age_us
+-            .store(commit_age_us, ORD);
+-        self.writeback_commit_wait_upload_unknown_reason_ops
+-            .store(unknown_reason_ops, ORD);
+-        self.writeback_commit_wait_upload_unknown_reason_us
+-            .store(unknown_reason_us, ORD);
+-        self.writeback_commit_wait_upload_normal_only_ops
+-            .store(normal_only_ops, ORD);
+-        self.writeback_commit_wait_upload_normal_only_us
+-            .store(normal_only_us, ORD);
+-        self.writeback_commit_wait_upload_cached_only_ops
+-            .store(cached_only_ops, ORD);
+-        self.writeback_commit_wait_upload_cached_only_us
+-            .store(cached_only_us, ORD);
+-        self.writeback_commit_wait_upload_mixed_origin_ops
+-            .store(mixed_origin_ops, ORD);
+-        self.writeback_commit_wait_upload_mixed_origin_us
+-            .store(mixed_origin_us, ORD);
+-        self.writeback_commit_wait_upload_unknown_origin_ops
+-            .store(unknown_origin_ops, ORD);
+-        self.writeback_commit_wait_upload_unknown_origin_us
+-            .store(unknown_origin_us, ORD);
+-    }
+-
+-    pub fn sync_writeback_slice_selection_metrics(
+-        &self,
+-        create_ops: u64,
+-        reuse_ops: u64,
+-        reject_older_unique_ops: u64,
+-        reject_dispatched_prefix_ops: u64,
+-    ) {
+-        self.writeback_slice_create_ops.store(create_ops, ORD);
+-        self.writeback_slice_reuse_ops.store(reuse_ops, ORD);
+-        self.writeback_slice_reject_older_unique_ops
+-            .store(reject_older_unique_ops, ORD);
+-        self.writeback_slice_reject_dispatched_prefix_ops
+-            .store(reject_dispatched_prefix_ops, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_freeze_metrics(
+-        &self,
+-        size_ops: u64,
+-        size_bytes: u64,
+-        max_unflushed_ops: u64,
+-        max_unflushed_bytes: u64,
+-        explicit_flush_ops: u64,
+-        explicit_flush_bytes: u64,
+-        auto_ops: u64,
+-        auto_bytes: u64,
+-        commit_age_ops: u64,
+-        commit_age_bytes: u64,
+-    ) {
+-        self.writeback_freeze_size_ops.store(size_ops, ORD);
+-        self.writeback_freeze_size_bytes.store(size_bytes, ORD);
+-        self.writeback_freeze_max_unflushed_ops
+-            .store(max_unflushed_ops, ORD);
+-        self.writeback_freeze_max_unflushed_bytes
+-            .store(max_unflushed_bytes, ORD);
+-        self.writeback_freeze_explicit_flush_ops
+-            .store(explicit_flush_ops, ORD);
+-        self.writeback_freeze_explicit_flush_bytes
+-            .store(explicit_flush_bytes, ORD);
+-        self.writeback_freeze_auto_ops.store(auto_ops, ORD);
+-        self.writeback_freeze_auto_bytes.store(auto_bytes, ORD);
+-        self.writeback_freeze_commit_age_ops
+-            .store(commit_age_ops, ORD);
+-        self.writeback_freeze_commit_age_bytes
+-            .store(commit_age_bytes, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_upload_batch_metrics(
+-        &self,
+-        ops: u64,
+-        bytes: u64,
+-        blocks: u64,
+-        partial_tail_ops: u64,
+-        partial_tail_size_ops: u64,
+-        partial_tail_max_unflushed_ops: u64,
+-        partial_tail_explicit_flush_ops: u64,
+-        partial_tail_auto_ops: u64,
+-        partial_tail_auto_age_ops: u64,
+-        partial_tail_auto_idle_ops: u64,
+-        partial_tail_auto_pressure_ops: u64,
+-        partial_tail_auto_too_many_ops: u64,
+-        partial_tail_auto_buffer_high_ops: u64,
+-        partial_tail_auto_flush_duration_ops: u64,
+-        partial_tail_auto_unknown_ops: u64,
+-        partial_tail_commit_age_ops: u64,
+-    ) {
+-        self.writeback_upload_batch_ops.store(ops, ORD);
+-        self.writeback_upload_batch_bytes.store(bytes, ORD);
+-        self.writeback_upload_batch_blocks.store(blocks, ORD);
+-        self.writeback_upload_partial_tail_ops
+-            .store(partial_tail_ops, ORD);
+-        self.writeback_upload_partial_tail_size_ops
+-            .store(partial_tail_size_ops, ORD);
+-        self.writeback_upload_partial_tail_max_unflushed_ops
+-            .store(partial_tail_max_unflushed_ops, ORD);
+-        self.writeback_upload_partial_tail_explicit_flush_ops
+-            .store(partial_tail_explicit_flush_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_ops
+-            .store(partial_tail_auto_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_age_ops
+-            .store(partial_tail_auto_age_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_idle_ops
+-            .store(partial_tail_auto_idle_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_pressure_ops
+-            .store(partial_tail_auto_pressure_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_too_many_ops
+-            .store(partial_tail_auto_too_many_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_buffer_high_ops
+-            .store(partial_tail_auto_buffer_high_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_flush_duration_ops
+-            .store(partial_tail_auto_flush_duration_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_unknown_ops
+-            .store(partial_tail_auto_unknown_ops, ORD);
+-        self.writeback_upload_partial_tail_commit_age_ops
+-            .store(partial_tail_commit_age_ops, ORD);
+-    }
+-
+-    pub fn sync_writeback_upload_batch_shape_metrics(
+-        &self,
+-        single_block_ops: u64,
+-        multi_block_ops: u64,
+-    ) {
+-        self.writeback_upload_batch_single_block_ops
+-            .store(single_block_ops, ORD);
+-        self.writeback_upload_batch_multi_block_ops
+-            .store(multi_block_ops, ORD);
+-    }
+-
+-    #[allow(clippy::too_many_arguments)]
+-    pub fn sync_writeback_upload_origin_metrics(
+-        &self,
+-        partial_tail_normal_only_ops: u64,
+-        partial_tail_cached_only_ops: u64,
+-        partial_tail_mixed_origin_ops: u64,
+-        partial_tail_unknown_origin_ops: u64,
+-        partial_tail_auto_normal_only_ops: u64,
+-        partial_tail_auto_cached_only_ops: u64,
+-        partial_tail_auto_mixed_origin_ops: u64,
+-        partial_tail_auto_unknown_origin_ops: u64,
+-    ) {
+-        self.writeback_upload_partial_tail_normal_only_ops
+-            .store(partial_tail_normal_only_ops, ORD);
+-        self.writeback_upload_partial_tail_cached_only_ops
+-            .store(partial_tail_cached_only_ops, ORD);
+-        self.writeback_upload_partial_tail_mixed_origin_ops
+-            .store(partial_tail_mixed_origin_ops, ORD);
+-        self.writeback_upload_partial_tail_unknown_origin_ops
+-            .store(partial_tail_unknown_origin_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_normal_only_ops
+-            .store(partial_tail_auto_normal_only_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_cached_only_ops
+-            .store(partial_tail_auto_cached_only_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_mixed_origin_ops
+-            .store(partial_tail_auto_mixed_origin_ops, ORD);
+-        self.writeback_upload_partial_tail_auto_unknown_origin_ops
+-            .store(partial_tail_auto_unknown_origin_ops, ORD);
+-    }
+-
+     #[allow(clippy::too_many_arguments)]
+     pub fn sync_object_store_metrics(
+         &self,
+diff --git a/src/vfs/stats_writeback.rs b/src/vfs/stats_writeback.rs
+new file mode 100644
+index 0000000..65b184b
+--- /dev/null
++++ b/src/vfs/stats_writeback.rs
+@@ -0,0 +1,384 @@
++//! Writeback statistics sync helpers for `FsStats`.
++//!
++//! Split out of `stats.rs` (part of the writer/stats decomposition): these
++//! methods copy writeback accounting counters into atomics. Pure code motion —
++//! no behavior changes.
++
++use crate::vfs::stats::{FsStats, ORD};
++use std::time::Duration;
++
++impl FsStats {
++    pub fn sync_writeback_dirty_breakdown(
++        &self,
++        live_bytes: u64,
++        live_slices: u64,
++        recent_pending_upload_bytes: u64,
++        recent_pending_upload_slices: u64,
++        recent_uploaded_bytes: u64,
++        recent_uploaded_slices: u64,
++    ) {
++        self.writeback_live_dirty_bytes.store(live_bytes, ORD);
++        self.writeback_live_slices.store(live_slices, ORD);
++        self.writeback_recent_pending_upload_bytes
++            .store(recent_pending_upload_bytes, ORD);
++        self.writeback_recent_pending_upload_slices
++            .store(recent_pending_upload_slices, ORD);
++        self.writeback_recent_uploaded_bytes
++            .store(recent_uploaded_bytes, ORD);
++        self.writeback_recent_uploaded_slices
++            .store(recent_uploaded_slices, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_live_origin_metrics(
++        &self,
++        normal_only_bytes: u64,
++        normal_only_slices: u64,
++        cached_only_bytes: u64,
++        cached_only_slices: u64,
++        mixed_origin_bytes: u64,
++        mixed_origin_slices: u64,
++        unknown_origin_bytes: u64,
++        unknown_origin_slices: u64,
++    ) {
++        self.writeback_live_normal_only_bytes
++            .store(normal_only_bytes, ORD);
++        self.writeback_live_normal_only_slices
++            .store(normal_only_slices, ORD);
++        self.writeback_live_cached_only_bytes
++            .store(cached_only_bytes, ORD);
++        self.writeback_live_cached_only_slices
++            .store(cached_only_slices, ORD);
++        self.writeback_live_mixed_origin_bytes
++            .store(mixed_origin_bytes, ORD);
++        self.writeback_live_mixed_origin_slices
++            .store(mixed_origin_slices, ORD);
++        self.writeback_live_unknown_origin_bytes
++            .store(unknown_origin_bytes, ORD);
++        self.writeback_live_unknown_origin_slices
++            .store(unknown_origin_slices, ORD);
++    }
++
++    pub fn add_writeback_backpressure_soft_sleep(&self, duration: Duration) {
++        self.writeback_backpressure_soft_sleep_ops.fetch_add(1, ORD);
++        self.writeback_backpressure_soft_sleep_us
++            .fetch_add(duration.as_micros().min(u128::from(u64::MAX)) as u64, ORD);
++    }
++
++    pub fn add_writeback_backpressure_hard_wait(&self, duration: Duration) {
++        self.writeback_backpressure_hard_wait_ops.fetch_add(1, ORD);
++        self.writeback_backpressure_hard_wait_us
++            .fetch_add(duration.as_micros().min(u128::from(u64::MAX)) as u64, ORD);
++    }
++
++    pub fn sync_writeback_backpressure_metrics(
++        &self,
++        soft_sleep_ops: u64,
++        soft_sleep_us: u64,
++        hard_wait_ops: u64,
++        hard_wait_us: u64,
++    ) {
++        self.writeback_backpressure_soft_sleep_ops
++            .store(soft_sleep_ops, ORD);
++        self.writeback_backpressure_soft_sleep_us
++            .store(soft_sleep_us, ORD);
++        self.writeback_backpressure_hard_wait_ops
++            .store(hard_wait_ops, ORD);
++        self.writeback_backpressure_hard_wait_us
++            .store(hard_wait_us, ORD);
++    }
++
++    pub fn sync_writeback_buffer_backpressure_metrics(
++        &self,
++        soft_sleep_ops: u64,
++        soft_sleep_us: u64,
++        moderate_sleep_ops: u64,
++        moderate_sleep_us: u64,
++        hard_sleep_ops: u64,
++        hard_sleep_us: u64,
++    ) {
++        self.writeback_buffer_soft_sleep_ops
++            .store(soft_sleep_ops, ORD);
++        self.writeback_buffer_soft_sleep_us
++            .store(soft_sleep_us, ORD);
++        self.writeback_buffer_moderate_sleep_ops
++            .store(moderate_sleep_ops, ORD);
++        self.writeback_buffer_moderate_sleep_us
++            .store(moderate_sleep_us, ORD);
++        self.writeback_buffer_hard_sleep_ops
++            .store(hard_sleep_ops, ORD);
++        self.writeback_buffer_hard_sleep_us
++            .store(hard_sleep_us, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_phase_metrics(
++        &self,
++        stage_inflight_bytes: u64,
++        remote_upload_inflight_bytes: u64,
++        stage_ops: u64,
++        stage_bytes: u64,
++        stage_lat_us: u64,
++        stage_failures: u64,
++        commit_before_stage_ops: u64,
++    ) {
++        self.writeback_stage_inflight_bytes
++            .store(stage_inflight_bytes, ORD);
++        self.writeback_remote_upload_inflight_bytes
++            .store(remote_upload_inflight_bytes, ORD);
++        self.writeback_stage_ops.store(stage_ops, ORD);
++        self.writeback_stage_bytes.store(stage_bytes, ORD);
++        self.writeback_stage_lat_us.store(stage_lat_us, ORD);
++        self.writeback_stage_failures.store(stage_failures, ORD);
++        self.writeback_commit_before_stage_ops
++            .store(commit_before_stage_ops, ORD);
++    }
++
++    pub fn sync_writeback_commit_wait_metrics(
++        &self,
++        upload_ops: u64,
++        upload_us: u64,
++        retry_ops: u64,
++        retry_us: u64,
++    ) {
++        self.writeback_commit_wait_upload_ops.store(upload_ops, ORD);
++        self.writeback_commit_wait_upload_us.store(upload_us, ORD);
++        self.writeback_commit_wait_retry_ops.store(retry_ops, ORD);
++        self.writeback_commit_wait_retry_us.store(retry_us, ORD);
++    }
++
++    pub fn sync_writeback_flush_wait_metrics(&self, ops: u64, us: u64, slices: u64) {
++        self.writeback_flush_wait_ops.store(ops, ORD);
++        self.writeback_flush_wait_us.store(us, ORD);
++        self.writeback_flush_wait_slices.store(slices, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_flush_fragmentation_metrics(
++        &self,
++        ops: u64,
++        slices: u64,
++        bytes: u64,
++        cached_sub_block_slices: u64,
++        cached_sub_block_bytes: u64,
++        full_block_slices: u64,
++        full_block_bytes: u64,
++    ) {
++        self.writeback_flush_fragmentation_ops.store(ops, ORD);
++        self.writeback_flush_fragmentation_slices.store(slices, ORD);
++        self.writeback_flush_fragmentation_bytes.store(bytes, ORD);
++        self.writeback_flush_fragmentation_cached_sub_block_slices
++            .store(cached_sub_block_slices, ORD);
++        self.writeback_flush_fragmentation_cached_sub_block_bytes
++            .store(cached_sub_block_bytes, ORD);
++        self.writeback_flush_fragmentation_full_block_slices
++            .store(full_block_slices, ORD);
++        self.writeback_flush_fragmentation_full_block_bytes
++            .store(full_block_bytes, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_commit_wait_breakdown_metrics(
++        &self,
++        size_ops: u64,
++        size_us: u64,
++        max_unflushed_ops: u64,
++        max_unflushed_us: u64,
++        explicit_flush_ops: u64,
++        explicit_flush_us: u64,
++        auto_ops: u64,
++        auto_us: u64,
++        commit_age_ops: u64,
++        commit_age_us: u64,
++        unknown_reason_ops: u64,
++        unknown_reason_us: u64,
++        normal_only_ops: u64,
++        normal_only_us: u64,
++        cached_only_ops: u64,
++        cached_only_us: u64,
++        mixed_origin_ops: u64,
++        mixed_origin_us: u64,
++        unknown_origin_ops: u64,
++        unknown_origin_us: u64,
++    ) {
++        self.writeback_commit_wait_upload_size_ops
++            .store(size_ops, ORD);
++        self.writeback_commit_wait_upload_size_us
++            .store(size_us, ORD);
++        self.writeback_commit_wait_upload_max_unflushed_ops
++            .store(max_unflushed_ops, ORD);
++        self.writeback_commit_wait_upload_max_unflushed_us
++            .store(max_unflushed_us, ORD);
++        self.writeback_commit_wait_upload_explicit_flush_ops
++            .store(explicit_flush_ops, ORD);
++        self.writeback_commit_wait_upload_explicit_flush_us
++            .store(explicit_flush_us, ORD);
++        self.writeback_commit_wait_upload_auto_ops
++            .store(auto_ops, ORD);
++        self.writeback_commit_wait_upload_auto_us
++            .store(auto_us, ORD);
++        self.writeback_commit_wait_upload_commit_age_ops
++            .store(commit_age_ops, ORD);
++        self.writeback_commit_wait_upload_commit_age_us
++            .store(commit_age_us, ORD);
++        self.writeback_commit_wait_upload_unknown_reason_ops
++            .store(unknown_reason_ops, ORD);
++        self.writeback_commit_wait_upload_unknown_reason_us
++            .store(unknown_reason_us, ORD);
++        self.writeback_commit_wait_upload_normal_only_ops
++            .store(normal_only_ops, ORD);
++        self.writeback_commit_wait_upload_normal_only_us
++            .store(normal_only_us, ORD);
++        self.writeback_commit_wait_upload_cached_only_ops
++            .store(cached_only_ops, ORD);
++        self.writeback_commit_wait_upload_cached_only_us
++            .store(cached_only_us, ORD);
++        self.writeback_commit_wait_upload_mixed_origin_ops
++            .store(mixed_origin_ops, ORD);
++        self.writeback_commit_wait_upload_mixed_origin_us
++            .store(mixed_origin_us, ORD);
++        self.writeback_commit_wait_upload_unknown_origin_ops
++            .store(unknown_origin_ops, ORD);
++        self.writeback_commit_wait_upload_unknown_origin_us
++            .store(unknown_origin_us, ORD);
++    }
++
++    pub fn sync_writeback_slice_selection_metrics(
++        &self,
++        create_ops: u64,
++        reuse_ops: u64,
++        reject_older_unique_ops: u64,
++        reject_dispatched_prefix_ops: u64,
++    ) {
++        self.writeback_slice_create_ops.store(create_ops, ORD);
++        self.writeback_slice_reuse_ops.store(reuse_ops, ORD);
++        self.writeback_slice_reject_older_unique_ops
++            .store(reject_older_unique_ops, ORD);
++        self.writeback_slice_reject_dispatched_prefix_ops
++            .store(reject_dispatched_prefix_ops, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_freeze_metrics(
++        &self,
++        size_ops: u64,
++        size_bytes: u64,
++        max_unflushed_ops: u64,
++        max_unflushed_bytes: u64,
++        explicit_flush_ops: u64,
++        explicit_flush_bytes: u64,
++        auto_ops: u64,
++        auto_bytes: u64,
++        commit_age_ops: u64,
++        commit_age_bytes: u64,
++    ) {
++        self.writeback_freeze_size_ops.store(size_ops, ORD);
++        self.writeback_freeze_size_bytes.store(size_bytes, ORD);
++        self.writeback_freeze_max_unflushed_ops
++            .store(max_unflushed_ops, ORD);
++        self.writeback_freeze_max_unflushed_bytes
++            .store(max_unflushed_bytes, ORD);
++        self.writeback_freeze_explicit_flush_ops
++            .store(explicit_flush_ops, ORD);
++        self.writeback_freeze_explicit_flush_bytes
++            .store(explicit_flush_bytes, ORD);
++        self.writeback_freeze_auto_ops.store(auto_ops, ORD);
++        self.writeback_freeze_auto_bytes.store(auto_bytes, ORD);
++        self.writeback_freeze_commit_age_ops
++            .store(commit_age_ops, ORD);
++        self.writeback_freeze_commit_age_bytes
++            .store(commit_age_bytes, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_upload_batch_metrics(
++        &self,
++        ops: u64,
++        bytes: u64,
++        blocks: u64,
++        partial_tail_ops: u64,
++        partial_tail_size_ops: u64,
++        partial_tail_max_unflushed_ops: u64,
++        partial_tail_explicit_flush_ops: u64,
++        partial_tail_auto_ops: u64,
++        partial_tail_auto_age_ops: u64,
++        partial_tail_auto_idle_ops: u64,
++        partial_tail_auto_pressure_ops: u64,
++        partial_tail_auto_too_many_ops: u64,
++        partial_tail_auto_buffer_high_ops: u64,
++        partial_tail_auto_flush_duration_ops: u64,
++        partial_tail_auto_unknown_ops: u64,
++        partial_tail_commit_age_ops: u64,
++    ) {
++        self.writeback_upload_batch_ops.store(ops, ORD);
++        self.writeback_upload_batch_bytes.store(bytes, ORD);
++        self.writeback_upload_batch_blocks.store(blocks, ORD);
++        self.writeback_upload_partial_tail_ops
++            .store(partial_tail_ops, ORD);
++        self.writeback_upload_partial_tail_size_ops
++            .store(partial_tail_size_ops, ORD);
++        self.writeback_upload_partial_tail_max_unflushed_ops
++            .store(partial_tail_max_unflushed_ops, ORD);
++        self.writeback_upload_partial_tail_explicit_flush_ops
++            .store(partial_tail_explicit_flush_ops, ORD);
++        self.writeback_upload_partial_tail_auto_ops
++            .store(partial_tail_auto_ops, ORD);
++        self.writeback_upload_partial_tail_auto_age_ops
++            .store(partial_tail_auto_age_ops, ORD);
++        self.writeback_upload_partial_tail_auto_idle_ops
++            .store(partial_tail_auto_idle_ops, ORD);
++        self.writeback_upload_partial_tail_auto_pressure_ops
++            .store(partial_tail_auto_pressure_ops, ORD);
++        self.writeback_upload_partial_tail_auto_too_many_ops
++            .store(partial_tail_auto_too_many_ops, ORD);
++        self.writeback_upload_partial_tail_auto_buffer_high_ops
++            .store(partial_tail_auto_buffer_high_ops, ORD);
++        self.writeback_upload_partial_tail_auto_flush_duration_ops
++            .store(partial_tail_auto_flush_duration_ops, ORD);
++        self.writeback_upload_partial_tail_auto_unknown_ops
++            .store(partial_tail_auto_unknown_ops, ORD);
++        self.writeback_upload_partial_tail_commit_age_ops
++            .store(partial_tail_commit_age_ops, ORD);
++    }
++
++    pub fn sync_writeback_upload_batch_shape_metrics(
++        &self,
++        single_block_ops: u64,
++        multi_block_ops: u64,
++    ) {
++        self.writeback_upload_batch_single_block_ops
++            .store(single_block_ops, ORD);
++        self.writeback_upload_batch_multi_block_ops
++            .store(multi_block_ops, ORD);
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_writeback_upload_origin_metrics(
++        &self,
++        partial_tail_normal_only_ops: u64,
++        partial_tail_cached_only_ops: u64,
++        partial_tail_mixed_origin_ops: u64,
++        partial_tail_unknown_origin_ops: u64,
++        partial_tail_auto_normal_only_ops: u64,
++        partial_tail_auto_cached_only_ops: u64,
++        partial_tail_auto_mixed_origin_ops: u64,
++        partial_tail_auto_unknown_origin_ops: u64,
++    ) {
++        self.writeback_upload_partial_tail_normal_only_ops
++            .store(partial_tail_normal_only_ops, ORD);
++        self.writeback_upload_partial_tail_cached_only_ops
++            .store(partial_tail_cached_only_ops, ORD);
++        self.writeback_upload_partial_tail_mixed_origin_ops
++            .store(partial_tail_mixed_origin_ops, ORD);
++        self.writeback_upload_partial_tail_unknown_origin_ops
++            .store(partial_tail_unknown_origin_ops, ORD);
++        self.writeback_upload_partial_tail_auto_normal_only_ops
++            .store(partial_tail_auto_normal_only_ops, ORD);
++        self.writeback_upload_partial_tail_auto_cached_only_ops
++            .store(partial_tail_auto_cached_only_ops, ORD);
++        self.writeback_upload_partial_tail_auto_mixed_origin_ops
++            .store(partial_tail_auto_mixed_origin_ops, ORD);
++        self.writeback_upload_partial_tail_auto_unknown_origin_ops
++            .store(partial_tail_auto_unknown_origin_ops, ORD);
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

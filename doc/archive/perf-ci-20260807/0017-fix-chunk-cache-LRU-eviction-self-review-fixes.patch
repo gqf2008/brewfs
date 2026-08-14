@@ -1,0 +1,81 @@
+From 9807b7c4e5ec253ca57ee4caf0979113f064c376 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 09:32:20 +0800
+Subject: [PATCH 17/29] fix(chunk/cache): LRU eviction self-review fixes
+
+- evict_lru logging now includes bytes freed by the legacy fallback path.
+- Tighten test_disk_eviction_index_handles_removed_keys_lazily so it
+  actually triggers eviction after k1 removal (needed_bytes must exceed
+  max - current) and asserts the lazily-validated order (stale k1/k2
+  entries skipped, oldest valid k3 evicted, re-accessed k2 survives).
+---
+ src/chunk/cache.rs | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/chunk/cache.rs b/src/chunk/cache.rs
+index c51ebd0..4ad4284 100644
+--- a/src/chunk/cache.rs
++++ b/src/chunk/cache.rs
+@@ -670,7 +670,7 @@ impl DiskStorage {
+         // Fallback for entries that predate the access index (e.g., files
+         // written by an older process): full directory scan with atime sort.
+         if freed < to_free {
+-            self.evict_lru_fallback(to_free - freed).await;
++            freed += self.evict_lru_fallback(to_free - freed).await;
+         }
+         debug!(
+             "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
+@@ -682,12 +682,13 @@ impl DiskStorage {
+     /// Legacy eviction path used only when the in-memory LRU index has no more
+     /// candidates (pre-index cache files). Scans the directory and sorts by
+     /// host atime, same as the original implementation.
+-    async fn evict_lru_fallback(&self, needed_bytes: u64) {
++    /// Returns the number of bytes freed.
++    async fn evict_lru_fallback(&self, needed_bytes: u64) -> u64 {
+         // Collect files with their access times
+         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
+         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+             Ok(e) => e,
+-            Err(_) => return,
++            Err(_) => return 0,
+         };
+         while let Ok(Some(entry)) = entries.next_entry().await {
+             if let Ok(meta) = entry.metadata().await
+@@ -722,6 +723,7 @@ impl DiskStorage {
+             freed,
+             freed as f64 / 1048576.0
+         );
++        freed
+     }
+ 
+     pub async fn load(&self, key: &str) -> anyhow::Result<bytes::Bytes> {
+@@ -3028,16 +3030,21 @@ mod tests {
+ 
+         storage.store("k1", &data).await.unwrap();
+         storage.store("k2", &data).await.unwrap();
++        storage.store("k3", &data).await.unwrap();
+         // Remove k1 explicitly; its stale queue entry must be skipped lazily.
+         storage.remove("k1").await.unwrap();
++        // Re-access k2 so its older queue entries become stale too.
++        let _ = storage.load("k2").await.unwrap();
+ 
+-        storage.evict_lru(300 * 1024).await;
++        // current = 200 KiB (k2+k3). evict_lru(320 KiB) sets target = 192 KiB,
++        // so to_free = 8 KiB and exactly one entry must be evicted. k1's stale
++        // entry and k2's stale entries are skipped lazily; k3 is now the
++        // oldest valid entry and is evicted, while re-accessed k2 survives.
++        storage.evict_lru(320 * 1024).await;
+ 
+         assert!(storage.load("k1").await.is_err());
+-        assert!(
+-            storage.load("k2").await.is_ok(),
+-            "lazy queue validation must skip removed k1 and evict nothing else"
+-        );
++        assert!(storage.load("k2").await.is_ok());
++        assert!(storage.load("k3").await.is_err());
+     }
+ 
+     #[tokio::test]
+-- 
+2.50.1 (Apple Git-155)
+

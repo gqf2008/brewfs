@@ -1,0 +1,277 @@
+From e5e12b8ae435326f1ed02b12627f7f8ca1184742 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 12:28:46 +0800
+Subject: [PATCH 22/29] =?UTF-8?q?chore:=20review=20follow-ups=20=E2=80=94?=
+ =?UTF-8?q?=20delete=20error=20context,=20qlean=20cfg,=20docs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- chunk/store: delete_range error now reports the key count; del_ops is
+  documented as credited only on full-batch success; new test covers
+  partial batch failure propagation + idempotent retry.
+- tests: qlean integration tests gated to linux/x86_64, matching the
+  dev-dependency gate in Cargo.toml (keeps cargo test --workspace
+  compiling on macOS/aarch64).
+- compact worker: document multi-threaded runtime requirement for the
+  semaphore await in the spawn loop.
+- bench comment updated (insert_hot no longer forces run_pending_tasks).
+- doc/performance: record accepted 2026-08 perf changes with the CI
+  focused-profile evidence.
+---
+ benches/brewfs_bench.rs                      |   6 +-
+ doc/performance/perf-optimization-roadmap.md |  21 +++
+ src/chunk/compact/worker.rs                  |   3 +
+ src/chunk/store.rs                           | 143 ++++++++++++++++++-
+ tests/test_brewfs_kvm_integration.rs         |   2 +-
+ tests/test_brewfs_qlean_multinode_smoke.rs   |   2 +-
+ 6 files changed, 168 insertions(+), 9 deletions(-)
+
+diff --git a/benches/brewfs_bench.rs b/benches/brewfs_bench.rs
+index 1699b68..f7f316d 100644
+--- a/benches/brewfs_bench.rs
++++ b/benches/brewfs_bench.rs
+@@ -1053,9 +1053,9 @@ fn bench_small_stats(c: &mut Criterion) {
+     group.finish();
+ }
+ 
+-/// A/B harness for issue #11: measure `insert_hot` (which currently forces
+-/// `hot_cache.run_pending_tasks()` after every insert) under eviction churn.
+-/// Run with `--bench insert_hot` before and after the change to compare.
++/// A/B harness for issue #11: measure `insert_hot` without a forced
++/// `run_pending_tasks` on the hot path, under eviction churn. Run with
++/// `--bench insert_hot` to compare against a baseline build.
+ fn bench_insert_hot(c: &mut Criterion) {
+     let runtime = tokio_runtime(2);
+     let mut group = c.benchmark_group("brewfs_insert_hot");
+diff --git a/doc/performance/perf-optimization-roadmap.md b/doc/performance/perf-optimization-roadmap.md
+index 25a97e8..b4d6de4 100644
+--- a/doc/performance/perf-optimization-roadmap.md
++++ b/doc/performance/perf-optimization-roadmap.md
+@@ -228,8 +228,29 @@ write-tail regression in the A/B sample. Keep focus on the bottleneck reported
+ by tools/perf: write buffer backpressure, auto-flush, and committed-but-not-
+ uploaded drain behavior.
+ 
++## Accepted (2026-08, non-meta batch)
++
++Focused writeback profile on Linux CI (ubuntu, `run_redis_perf.sh --s3
++--writeback-throughput-profile --tools "fio-seqwrite fio-randwrite fio-randrw"`,
++artifact `perf-run-1786074081-14345`):
++
++- Disk-cache LRU eviction indexed in memory (access-index + lazy heap), replacing
++  host-atime + full-directory-scan; bounded queue with access-index snapshot
++  compaction; legacy fallback skips indexed keys.
++- `insert_hot` no longer forces `run_pending_tasks` per insert (criterion A/B:
++  -30% time / +43% throughput; moka auto-maintenance keeps listener delivery
++  bounded).
++- readdirplus batches child stats (MetaLayer::batch_stat, Redis MGET), chunked at
++  512 inodes; lock read path uses per-inode POSIX lock counts (O(1)); compaction
++  worker runs with bounded concurrency; S3 deletes use DeleteObjects.
++
++Result vs README baseline (BrewFS Redis): seqwrite 21s (21s), randwrite 23s
++(24s), randrw 20s (26s); zero warnings/timeouts; post-write drain leaves
++pending/dirty bytes at 0.
++
+ ## Measurement
+ 
++
+ Run benchmarks before/after each optimization:
+ ```bash
+ tools/perf/run_perf.sh --quick --skip-offcpu --no-build
+diff --git a/src/chunk/compact/worker.rs b/src/chunk/compact/worker.rs
+index 0c7b289..be836a6 100644
+--- a/src/chunk/compact/worker.rs
++++ b/src/chunk/compact/worker.rs
+@@ -301,6 +301,9 @@ where
+     // Bounded concurrency: chunks in one cycle are distinct, and the per-chunk
+     // global lock already prevents two nodes (or two tasks) from compacting the
+     // same chunk, so parallel processing only overlaps independent chunks.
++    // NOTE: the await inside this loop requires a multi-threaded runtime
++    // (current_thread would deadlock: the loop would block the only worker
++    // while spawned compaction tasks need it to run).
+     let sem = Arc::new(tokio::sync::Semaphore::new(
+         config.max_concurrent_tasks.max(1),
+     ));
+diff --git a/src/chunk/store.rs b/src/chunk/store.rs
+index 9fa1736..a30447c 100644
+--- a/src/chunk/store.rs
++++ b/src/chunk/store.rs
+@@ -908,11 +908,16 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
+         let end = start + block_count.as_u32();
+         let keys: Vec<String> = (start..end).map(|i| Self::key_for((chunk_id, i))).collect();
+         if !keys.is_empty() {
+-            self.client
+-                .delete_objects(&keys)
+-                .await
+-                .map_err(|e| anyhow::anyhow!("object store batch delete failed: {e:?}"))?;
++            self.client.delete_objects(&keys).await.map_err(|e| {
++                anyhow::anyhow!(
++                    "object store batch delete failed for {} keys: {e:?}",
++                    keys.len()
++                )
++            })?;
+         }
++        // del_ops is credited only after the whole batch succeeds; a partial
++        // failure returns Err above and the caller retries the batch, so
++        // counting per key here would over-report after retries.
+         for _ in 0..block_count {
+             self.object_metrics.record_delete();
+         }
+@@ -2751,4 +2756,134 @@ mod tests {
+ 
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn test_delete_range_propagates_partial_batch_failure_and_retries_idempotent()
++    -> anyhow::Result<()> {
++        use std::collections::HashMap;
++        use std::sync::atomic::{AtomicBool, Ordering};
++        use std::sync::{Arc, Mutex};
++
++        #[derive(Clone, Default)]
++        struct FlakyMockBackend {
++            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
++            delete_calls: Arc<Mutex<u64>>,
++            fail_next: Arc<AtomicBool>,
++        }
++
++        #[async_trait]
++        impl ObjectBackend for FlakyMockBackend {
++            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
++                self.data
++                    .lock()
++                    .unwrap()
++                    .insert(key.to_string(), data.to_vec());
++                Ok(())
++            }
++
++            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
++                Ok(self.data.lock().unwrap().get(key).cloned())
++            }
++
++            async fn get_object_range(
++                &self,
++                key: &str,
++                offset: u64,
++                buf: &mut [u8],
++            ) -> anyhow::Result<usize> {
++                let mut written = 0;
++                if let Some(data) = self.data.lock().unwrap().get(key) {
++                    let start = offset as usize;
++                    let end = (start + buf.len()).min(data.len());
++                    if start < data.len() {
++                        let copy_len = end - start;
++                        buf[..copy_len].copy_from_slice(&data[start..end]);
++                        written = copy_len;
++                    }
++                }
++                Ok(written)
++            }
++
++            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
++                Ok("etag".to_string())
++            }
++
++            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
++                self.data.lock().unwrap().remove(key);
++                Ok(())
++            }
++
++            async fn delete_objects(&self, keys: &[String]) -> anyhow::Result<()> {
++                *self.delete_calls.lock().unwrap() += 1;
++                let mut data = self.data.lock().unwrap();
++                for key in keys {
++                    data.remove(key);
++                }
++                drop(data);
++                if self.fail_next.swap(false, Ordering::SeqCst) {
++                    return Err(anyhow::anyhow!("simulated partial backend failure"));
++                }
++                Ok(())
++            }
++        }
++
++        let backend = FlakyMockBackend::default();
++        let cache_dir = tempfile::tempdir()?;
++        let store = ObjectBlockStore::new_with_configs_async(
++            ObjectClient::new(backend.clone()),
++            ChunksCacheConfig::with_budgets(
++                16 * 1024 * 1024,
++                16 * 1024 * 1024,
++                cache_dir.path().to_path_buf(),
++            ),
++            BlockStoreConfig {
++                block_size: 64 * 1024,
++                page_size: 4 * 1024,
++                compression: Compression::None,
++                ..Default::default()
++            },
++        )
++        .await?;
++        let metrics = store
++            .object_store_metrics()
++            .expect("ObjectBlockStore exposes object metrics");
++
++        for i in 0..3 {
++            backend
++                .data
++                .lock()
++                .unwrap()
++                .insert(format!("chunks/12/{i}"), vec![1u8; 1024]);
++        }
++
++        // First attempt: the backend applies the deletes but still reports a
++        // failure. delete_range must surface the Err and NOT credit del_ops.
++        backend.fail_next.store(true, Ordering::SeqCst);
++        let err = store.delete_range((12, 0), 3).await.unwrap_err();
++        assert!(
++            err.to_string().contains("batch delete failed"),
++            "delete_range should propagate the batch error: {err}"
++        );
++        assert!(
++            backend.data.lock().unwrap().is_empty(),
++            "backend applied the deletes before failing"
++        );
++        assert_eq!(
++            metrics.snapshot().del_ops,
++            0,
++            "del_ops must not be credited for a failed batch"
++        );
++
++        // Retry: deleting already-missing keys is idempotent and the batch
++        // succeeds, so del_ops is credited once.
++        store.delete_range((12, 0), 3).await?;
++        assert_eq!(
++            metrics.snapshot().del_ops,
++            3,
++            "successful retry should credit per-key delete metrics"
++        );
++        assert_eq!(*backend.delete_calls.lock().unwrap(), 2);
++
++        Ok(())
++    }
+ }
+diff --git a/tests/test_brewfs_kvm_integration.rs b/tests/test_brewfs_kvm_integration.rs
+index 50b1904..fb00cc4 100644
+--- a/tests/test_brewfs_kvm_integration.rs
++++ b/tests/test_brewfs_kvm_integration.rs
+@@ -1,4 +1,4 @@
+-#![cfg(unix)]
++#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+ //! Unix-only: uses qlean QEMU VM orchestration (vsock) which is not available on Windows.
+ use std::path::{Path, PathBuf};
+ 
+diff --git a/tests/test_brewfs_qlean_multinode_smoke.rs b/tests/test_brewfs_qlean_multinode_smoke.rs
+index 795ac61..d339396 100644
+--- a/tests/test_brewfs_qlean_multinode_smoke.rs
++++ b/tests/test_brewfs_qlean_multinode_smoke.rs
+@@ -1,4 +1,4 @@
+-#![cfg(unix)]
++#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+ //! Unix-only: uses qlean QEMU VM orchestration (vsock) which is not available on Windows.
+ use std::path::{Path, PathBuf};
+ use std::sync::Once;
+-- 
+2.50.1 (Apple Git-155)
+

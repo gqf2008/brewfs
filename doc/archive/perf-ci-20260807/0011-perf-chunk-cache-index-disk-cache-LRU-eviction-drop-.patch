@@ -1,0 +1,247 @@
+From 52867c32aa94a1af52bdaedd3c5d1a4ede9fa43e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 23:28:22 +0800
+Subject: [PATCH 11/29] perf(chunk/cache): index disk-cache LRU eviction, drop
+ atime + dir scan
+
+Closes #5 (gqf2008/brewfs)
+
+Eviction relied on host atime (which reads intentionally never update,
+so hot data could be evicted first) and did a full directory scan +
+O(n log n) sort on every eviction.
+
+- DiskStorage now keeps an in-memory access index (key -> last access)
+  updated on store/load/range-load, plus a lazy min-heap of
+  (last_access, key).
+- evict_lru pops the heap and validates lazily (skips re-accessed or
+  removed keys), so it no longer scans the directory or trusts atime on
+  the common path. A legacy scan fallback covers pre-index files.
+- Tests: oldest entry evicted first; recently accessed entry retained;
+  explicitly removed keys are skipped lazily.
+- Note: fio-randrw / writeback drain acceptance (run_redis_perf.sh
+  --s3 --writeback-throughput-profile) still needs a compose run.
+---
+ src/chunk/cache.rs | 148 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 145 insertions(+), 3 deletions(-)
+
+diff --git a/src/chunk/cache.rs b/src/chunk/cache.rs
+index c11bfc9..3b71258 100644
+--- a/src/chunk/cache.rs
++++ b/src/chunk/cache.rs
+@@ -348,6 +348,18 @@ struct DiskStorage {
+     /// Semaphore for write/store operations
+     write_sem: Arc<Semaphore>,
+     integrity_mode: CacheIntegrityMode,
++    /// In-memory last-access index for disk cache entries. Replaces host atime,
++    /// which reads intentionally never update (updating atime would add
++    /// metadata syscalls to every block hit and distort LRU ordering).
++    access_index: Arc<dashmap::DashMap<String, std::time::Instant>>,
++    /// Lazy min-heap of `(last_access, key)` used to pick eviction victims
++    /// without scanning the cache directory. Entries may be stale (key
++    /// re-accessed or removed); `evict_lru` validates lazily.
++    eviction_queue: Arc<
++        std::sync::Mutex<
++            std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, String)>>,
++        >,
++    >,
+ }
+ 
+ impl DiskStorage {
+@@ -389,9 +401,22 @@ impl DiskStorage {
+             read_sem: Arc::new(Semaphore::new(DISK_CACHE_READ_CONCURRENCY)),
+             write_sem: Arc::new(Semaphore::new(DISK_CACHE_WRITE_CONCURRENCY)),
+             integrity_mode,
++            access_index: Arc::new(dashmap::DashMap::new()),
++            eviction_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+         })
+     }
+ 
++    /// Record a cache access (or store) so LRU eviction can pick victims from
++    /// the in-memory index instead of scanning the directory / trusting atime.
++    fn record_access(&self, key: &str) {
++        let now = std::time::Instant::now();
++        self.access_index.insert(key.to_owned(), now);
++        self.eviction_queue
++            .lock()
++            .unwrap()
++            .push(std::cmp::Reverse((now, key.to_owned())));
++    }
++
+     /// Scan directory to calculate total size of cached files
+     async fn scan_dir_size(dir: &Path) -> u64 {
+         let mut total = 0u64;
+@@ -558,6 +583,7 @@ impl DiskStorage {
+             return Err(e);
+         }
+ 
++        self.record_access(key);
+         Ok(())
+     }
+ 
+@@ -593,6 +619,70 @@ impl DiskStorage {
+             to_free as f64 / 1048576.0
+         );
+ 
++        // Indexed path: pop candidates from the in-memory LRU queue (lazily
++        // validated against the access index), avoiding a full directory scan
++        // and sorting on every eviction.
++        let mut freed = 0u64;
++        let mut scanned = 0usize;
++        loop {
++            let batch = {
++                let mut queue = self.eviction_queue.lock().unwrap();
++                let mut out = Vec::with_capacity(1024);
++                while out.len() < 1024 {
++                    match queue.pop() {
++                        Some(std::cmp::Reverse((ts, key))) => out.push((ts, key)),
++                        None => break,
++                    }
++                }
++                out
++            };
++            if batch.is_empty() {
++                break;
++            }
++            for (ts, key) in batch {
++                scanned += 1;
++                // Lazy validation: skip if the key was re-accessed or removed
++                // since this queue entry was pushed.
++                match self.access_index.get(&key) {
++                    Some(current) if *current == ts => {}
++                    _ => continue,
++                }
++                let filepath = self.base_dir.join(Self::key_to_filename(&key));
++                let Ok(meta) = tokio::fs::metadata(&filepath).await else {
++                    self.access_index.remove(&key);
++                    continue;
++                };
++                if tokio::fs::remove_file(&filepath).await.is_ok() {
++                    freed += meta.len();
++                    self.saturating_fetch_sub_bytes(meta.len());
++                    self.access_index.remove(&key);
++                    trace!("Evicted cache file: {:?} ({} bytes)", filepath, meta.len());
++                }
++                if freed >= to_free {
++                    break;
++                }
++            }
++            if freed >= to_free || scanned >= 10_000 {
++                break;
++            }
++        }
++
++        // Fallback for entries that predate the access index (e.g., files
++        // written by an older process): full directory scan with atime sort.
++        if freed < to_free {
++            self.evict_lru_fallback(to_free - freed).await;
++        }
++        debug!(
++            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
++            freed,
++            freed as f64 / 1048576.0
++        );
++    }
++
++    /// Legacy eviction path used only when the in-memory LRU index has no more
++    /// candidates (pre-index cache files). Scans the directory and sorts by
++    /// host atime, same as the original implementation.
++    async fn evict_lru_fallback(&self, needed_bytes: u64) {
+         // Collect files with their access times
+         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
+         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+@@ -618,7 +708,7 @@ impl DiskStorage {
+ 
+         let mut freed = 0u64;
+         for (path, size, _) in &files {
+-            if freed >= to_free {
++            if freed >= needed_bytes {
+                 break;
+             }
+             if tokio::fs::remove_file(path).await.is_ok() {
+@@ -628,7 +718,7 @@ impl DiskStorage {
+             }
+         }
+         debug!(
+-            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
++            "Disk cache eviction fallback: freed {} bytes ({:.1} MiB)",
+             freed,
+             freed as f64 / 1048576.0
+         );
+@@ -651,7 +741,10 @@ impl DiskStorage {
+ 
+         // Decode with CRC32C verification (handles legacy unencoded files too)
+         match super::cache_integrity::decode_bytes(raw) {
+-            Some(data) => Ok(data),
++            Some(data) => {
++                self.record_access(key);
++                Ok(data)
++            }
+             None => {
+                 // Corrupted — delete the file and return error
+                 let _ = tokio::fs::remove_file(&filepath).await;
+@@ -682,6 +775,7 @@ impl DiskStorage {
+         match self.load_range(key, offset, buf).await {
+             Ok(read_len) => {
+                 self.health.record_success();
++                self.record_access(key);
+                 Ok(Some(read_len))
+             }
+             Err(err) => {
+@@ -2897,6 +2991,54 @@ mod tests {
+         assert!(!tmp_path.exists(), "leftover tmp file should be cleaned up");
+     }
+ 
++    #[tokio::test]
++    async fn test_disk_eviction_index_picks_oldest_and_keeps_recently_accessed() {
++        let temp_dir = tempdir().unwrap();
++        let storage = DiskStorage::new(temp_dir.path(), 512 * 1024).await.unwrap();
++        let data = vec![1u8; 100 * 1024];
++
++        storage.store("k1", &data).await.unwrap();
++        storage.store("k2", &data).await.unwrap();
++        storage.store("k3", &data).await.unwrap();
++        assert!(storage.load("k1").await.is_ok());
++        assert!(storage.load("k2").await.is_ok());
++        assert!(storage.load("k3").await.is_ok());
++
++        // Access k2 so it becomes the most-recently-used entry; k1 stays the
++        // oldest in the in-memory access index.
++        let _ = storage.load("k2").await.unwrap();
++
++        // Need to free 88 KiB: exactly one 100 KiB entry must be evicted.
++        storage.evict_lru(300 * 1024).await;
++
++        assert!(
++            storage.load("k1").await.is_err(),
++            "oldest entry (k1) should be evicted first via the access index"
++        );
++        assert!(storage.load("k2").await.is_ok());
++        assert!(storage.load("k3").await.is_ok());
++    }
++
++    #[tokio::test]
++    async fn test_disk_eviction_index_handles_removed_keys_lazily() {
++        let temp_dir = tempdir().unwrap();
++        let storage = DiskStorage::new(temp_dir.path(), 512 * 1024).await.unwrap();
++        let data = vec![1u8; 100 * 1024];
++
++        storage.store("k1", &data).await.unwrap();
++        storage.store("k2", &data).await.unwrap();
++        // Remove k1 explicitly; its stale queue entry must be skipped lazily.
++        storage.remove("k1").await.unwrap();
++
++        storage.evict_lru(300 * 1024).await;
++
++        assert!(storage.load("k1").await.is_err());
++        assert!(
++            storage.load("k2").await.is_ok(),
++            "lazy queue validation must skip removed k1 and evict nothing else"
++        );
++    }
++
+     #[tokio::test]
+     async fn disk_hit_promotes_to_hot_cache_when_hot_tier_has_room() {
+         let temp_dir = tempdir().unwrap();
+-- 
+2.50.1 (Apple Git-155)
+

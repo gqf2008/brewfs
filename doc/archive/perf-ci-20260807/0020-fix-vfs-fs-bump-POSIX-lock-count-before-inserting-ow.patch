@@ -1,0 +1,40 @@
+From 47d5dbb942347b965203935241ee3009ddddd224 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 12:28:46 +0800
+Subject: [PATCH 20/29] fix(vfs/fs): bump POSIX lock count before inserting
+ owner
+
+Independent-review finding: remember_posix_lock_owner inserted the owner
+before incrementing the per-inode count, so a concurrent read path could
+observe the owner but a zero count (false negative on the lock fast
+path). Increment inside the Vacant arm before insert: ordering this way
+only ever over-reports (conservative), never under-reports, and the
+entry API keeps duplicate registrations from inflating the count.
+---
+ src/vfs/fs/mod.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/vfs/fs/mod.rs b/src/vfs/fs/mod.rs
+index 1d808fa..f5dd557 100644
+--- a/src/vfs/fs/mod.rs
++++ b/src/vfs/fs/mod.rs
+@@ -4183,10 +4183,15 @@ where
+         lock_type: FileLockType,
+     ) {
+         if lock_type != FileLockType::UnLock {
++            // Bump the per-inode count BEFORE inserting the owner: a concurrent
++            // read path that observes the new owner only via the OLD O(n) scan
++            // must never see a zero count for a lock that is being registered.
++            // Ordering this way only ever over-reports (conservative sleep),
++            // never under-reports.
+             match self.state.posix_lock_owners.entry((inode, owner)) {
+                 Entry::Vacant(entry) => {
+-                    entry.insert(());
+                     *self.state.posix_lock_inode_counts.entry(inode).or_insert(0) += 1;
++                    entry.insert(());
+                 }
+                 Entry::Occupied(_) => {}
+             }
+-- 
+2.50.1 (Apple Git-155)
+

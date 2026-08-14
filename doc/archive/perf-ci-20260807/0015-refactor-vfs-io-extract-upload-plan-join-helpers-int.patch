@@ -1,0 +1,209 @@
+From 984f910c8fe500e2e4783d537b361b3ce57c5094 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Fri, 7 Aug 2026 09:04:51 +0800
+Subject: [PATCH 15/29] refactor(vfs/io): extract upload plan + join helpers
+ into writer_upload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partial #12 (gqf2008/brewfs)
+
+Third slice of the decomposition: move UploadPlan, WriteOriginKind, the
+persist/upload join helpers and should_stage_first_writeback_upload into
+a sibling module src/vfs/io/writer_upload.rs. Pure code motion — no
+behavior change; writer tests (70) pass.
+---
+ src/vfs/io/mod.rs           |  1 +
+ src/vfs/io/writer.rs        | 57 ++------------------------------
+ src/vfs/io/writer_upload.rs | 65 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 55 deletions(-)
+ create mode 100644 src/vfs/io/writer_upload.rs
+
+diff --git a/src/vfs/io/mod.rs b/src/vfs/io/mod.rs
+index cdac5bc..5ceb4c1 100644
+--- a/src/vfs/io/mod.rs
++++ b/src/vfs/io/mod.rs
+@@ -4,6 +4,7 @@ pub(crate) mod cached_block_assembler;
+ pub(crate) mod reader;
+ pub(crate) mod writer;
+ pub(crate) mod writer_policy;
++pub(crate) mod writer_upload;
+ 
+ pub(crate) use reader::DataReader;
+ pub(crate) use reader::FileReader;
+diff --git a/src/vfs/io/writer.rs b/src/vfs/io/writer.rs
+index dbedad4..e75b0d2 100644
+--- a/src/vfs/io/writer.rs
++++ b/src/vfs/io/writer.rs
+@@ -10,6 +10,7 @@
+ //   While flushing, new writes are blocked via flush_waiting/write_waiting gates.
+ 
+ use super::reader::DataReader;
++use super::writer_upload::*;
+ use crate::chunk::writer::{DataUploader, UploadPriority};
+ use crate::chunk::{BlockStore, SliceDesc};
+ use crate::meta::backoff::backoff;
+@@ -27,13 +28,11 @@ use crate::vfs::config::WriteConfig;
+ use crate::vfs::extract_ino_and_chunk_index;
+ use crate::vfs::io::split_chunk_spans;
+ use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard, PressureLevel};
+-use bytes::Bytes;
+ use dashmap::DashMap;
+ use parking_lot::Mutex as ParkingMutex;
+ use rand::RngCore;
+ use std::collections::{BTreeMap, VecDeque};
+ use std::fmt::Write as FmtWrite;
+-use std::future::Future;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, LazyLock, Weak};
+ use std::time::{Duration, Instant};
+@@ -50,51 +49,6 @@ static DEBUG_CACHED_WRITE_OFFSET: LazyLock<Option<u64>> = LazyLock::new(|| {
+         .and_then(|value| value.trim().parse::<u64>().ok())
+ });
+ 
+-struct UploadPlan {
+-    chunk_id: u64,
+-    data: Vec<(usize, Vec<Bytes>)>,
+-    slice_id: Option<u64>,
+-    uploaded: u64,
+-    write_origin: WriteOriginKind,
+-}
+-
+-async fn join_best_effort_persist<P, U, T>(
+-    persist: Option<P>,
+-    upload: U,
+-) -> (Option<anyhow::Result<()>>, T)
+-where
+-    P: Future<Output = anyhow::Result<()>>,
+-    U: Future<Output = T>,
+-{
+-    match persist {
+-        Some(persist) => {
+-            let (persist_result, upload_result) = tokio::join!(persist, upload);
+-            (Some(persist_result), upload_result)
+-        }
+-        None => (None, upload.await),
+-    }
+-}
+-
+-async fn join_writeback_stage_then_upload<P, U, T>(persist: P, upload: U) -> (anyhow::Result<()>, T)
+-where
+-    P: Future<Output = anyhow::Result<()>>,
+-    U: Future<Output = T>,
+-{
+-    let persist_result = persist.await;
+-    let upload_result = upload.await;
+-    (persist_result, upload_result)
+-}
+-
+-fn should_stage_first_writeback_upload(
+-    priority: UploadPriority,
+-    has_persist: bool,
+-    write_origin: WriteOriginKind,
+-) -> bool {
+-    has_persist
+-        && matches!(priority, UploadPriority::Writeback)
+-        && matches!(write_origin, WriteOriginKind::CachedOnly)
+-}
+-
+ #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
+ pub(crate) enum SliceStatus {
+     /// Writable: slice is writable and there may be uploaded blocks.
+@@ -144,14 +98,6 @@ impl WriteOrigin {
+     }
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-enum WriteOriginKind {
+-    Unknown,
+-    NormalOnly,
+-    CachedOnly,
+-    Mixed,
+-}
+-
+ pub(crate) struct SliceState {
+     state: SliceStatus,
+     /// ID of the chunk it belongs to.
+@@ -5873,6 +5819,7 @@ mod tests {
+     use crate::vfs::Inode;
+     use crate::vfs::config::ReadConfig;
+     use async_trait::async_trait;
++    use bytes::Bytes;
+     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+     use tokio::time::{sleep, timeout};
+ 
+diff --git a/src/vfs/io/writer_upload.rs b/src/vfs/io/writer_upload.rs
+new file mode 100644
+index 0000000..129d34d
+--- /dev/null
++++ b/src/vfs/io/writer_upload.rs
+@@ -0,0 +1,65 @@
++//! Write-path upload planning helpers.
++//!
++//! Split out of `writer.rs` (part of the writer.rs decomposition): upload plan
++//! bookkeeping, persist/upload join helpers and the write-origin classification
++//! used by the upload pipeline. Pure code motion — no behavior changes.
++
++use crate::chunk::writer::UploadPriority;
++use bytes::Bytes;
++use std::future::Future;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum WriteOriginKind {
++    Unknown,
++    NormalOnly,
++    CachedOnly,
++    Mixed,
++}
++
++pub(crate) struct UploadPlan {
++    pub(crate) chunk_id: u64,
++    pub(crate) data: Vec<(usize, Vec<Bytes>)>,
++    pub(crate) slice_id: Option<u64>,
++    pub(crate) uploaded: u64,
++    pub(crate) write_origin: WriteOriginKind,
++}
++
++pub(crate) async fn join_best_effort_persist<P, U, T>(
++    persist: Option<P>,
++    upload: U,
++) -> (Option<anyhow::Result<()>>, T)
++where
++    P: Future<Output = anyhow::Result<()>>,
++    U: Future<Output = T>,
++{
++    match persist {
++        Some(persist) => {
++            let (persist_result, upload_result) = tokio::join!(persist, upload);
++            (Some(persist_result), upload_result)
++        }
++        None => (None, upload.await),
++    }
++}
++
++pub(crate) async fn join_writeback_stage_then_upload<P, U, T>(
++    persist: P,
++    upload: U,
++) -> (anyhow::Result<()>, T)
++where
++    P: Future<Output = anyhow::Result<()>>,
++    U: Future<Output = T>,
++{
++    let persist_result = persist.await;
++    let upload_result = upload.await;
++    (persist_result, upload_result)
++}
++
++pub(crate) fn should_stage_first_writeback_upload(
++    priority: UploadPriority,
++    has_persist: bool,
++    write_origin: WriteOriginKind,
++) -> bool {
++    has_persist
++        && matches!(priority, UploadPriority::Writeback)
++        && matches!(write_origin, WriteOriginKind::CachedOnly)
++}
+-- 
+2.50.1 (Apple Git-155)
+

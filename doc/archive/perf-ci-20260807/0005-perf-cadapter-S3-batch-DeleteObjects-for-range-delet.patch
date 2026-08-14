@@ -1,0 +1,296 @@
+From 759f2cc23e92043e23607dc0031f94b026f25a7a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=AB=98=E5=BA=86=E4=B8=B0?= <gao.qingfeng@gmail.com>
+Date: Thu, 6 Aug 2026 22:40:36 +0800
+Subject: [PATCH 05/29] perf(cadapter): S3 batch DeleteObjects for range
+ deletion
+
+Closes #9 (gqf2008/brewfs)
+
+delete_range issued one DELETE per block, so GC/compact cleanup of a
+slice could produce dozens of requests.
+
+- ObjectBackend::delete_objects (default loops delete_object) +
+  ObjectClient::delete_objects.
+- S3Backend implements it with DeleteObjects (1000 keys/request,
+  same retry policy as delete_object); per-key server errors are
+  surfaced as one Err for caller retry; missing keys are not errors.
+- ObjectBlockStore::delete_range collects the block keys and issues one
+  batch call, keeping per-key delete metrics.
+- Test: batch-capable backend receives exactly one delete_objects call
+  with all keys, no per-key fallback, all data removed, del_ops == 3.
+---
+ src/cadapter/client.rs |  16 +++++
+ src/cadapter/s3.rs     |  65 ++++++++++++++++++++
+ src/chunk/store.rs     | 134 +++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 211 insertions(+), 4 deletions(-)
+
+diff --git a/src/cadapter/client.rs b/src/cadapter/client.rs
+index 5a5b70c..b0be86d 100644
+--- a/src/cadapter/client.rs
++++ b/src/cadapter/client.rs
+@@ -31,6 +31,17 @@ pub trait ObjectBackend: Send + Sync {
+ 
+     #[allow(dead_code)]
+     async fn delete_object(&self, key: &str) -> Result<()>;
++
++    /// Delete multiple objects. The default implementation falls back to
++    /// per-key [`Self::delete_object`]; backends with native batch delete
++    /// (S3 `DeleteObjects`) should override. A failed batch returns `Err` so
++    /// callers can retry; missing objects are not an error.
++    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
++        for key in keys {
++            self.delete_object(key).await?;
++        }
++        Ok(())
++    }
+ }
+ 
+ #[derive(Clone)]
+@@ -75,4 +86,9 @@ impl<B: ObjectBackend> ObjectClient<B> {
+     pub async fn delete_object(&self, key: &str) -> Result<()> {
+         self.backend.delete_object(key).await
+     }
++
++    #[allow(dead_code)]
++    pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
++        self.backend.delete_objects(keys).await
++    }
+ }
+diff --git a/src/cadapter/s3.rs b/src/cadapter/s3.rs
+index 78a809c..b2f5808 100644
+--- a/src/cadapter/s3.rs
++++ b/src/cadapter/s3.rs
+@@ -8,6 +8,7 @@ use aws_config::timeout::TimeoutConfig;
+ use aws_sdk_s3::config::RequestChecksumCalculation;
+ use aws_sdk_s3::error::SdkError;
+ use aws_sdk_s3::primitives::{ByteStream, SdkBody};
++use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+ use aws_sdk_s3::{Client, config::Region};
+ use base64::Engine as _;
+ use base64::engine::general_purpose::STANDARD as B64;
+@@ -679,6 +680,70 @@ impl ObjectBackend for S3Backend {
+             }
+         }
+     }
++
++    /// Batch delete via S3 `DeleteObjects` (up to 1000 keys per request).
++    /// Missing objects are treated as success (S3 semantics); per-key errors
++    /// returned by the server are surfaced as a single `Err` so the caller
++    /// can retry the whole batch.
++    #[tracing::instrument(level = "debug", skip(self, keys), fields(count = keys.len()))]
++    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
++        const S3_MAX_DELETE_KEYS: usize = 1000;
++
++        for chunk in keys.chunks(S3_MAX_DELETE_KEYS) {
++            let objects = chunk
++                .iter()
++                .map(|key| {
++                    ObjectIdentifier::builder()
++                        .key(key.clone())
++                        .build()
++                        .map_err(|e| anyhow!("invalid S3 delete key {key}: {e}"))
++                })
++                .collect::<Result<Vec<_>>>()?;
++            let delete = Delete::builder()
++                .set_objects(Some(objects))
++                .build()
++                .map_err(|e| anyhow!("failed to build S3 DeleteObjects request: {e}"))?;
++
++            let mut attempt = 0;
++            loop {
++                attempt += 1;
++                match self
++                    .client
++                    .delete_objects()
++                    .bucket(&self.config.bucket)
++                    .delete(delete.clone())
++                    .send()
++                    .await
++                {
++                    Ok(resp) => {
++                        let errors = resp.errors();
++                        if errors.is_empty() {
++                            break;
++                        }
++                        let detail = errors
++                            .iter()
++                            .map(|e| {
++                                format!(
++                                    "{}:{}",
++                                    e.key().unwrap_or("<unknown>"),
++                                    e.code().unwrap_or("<unknown>")
++                                )
++                            })
++                            .collect::<Vec<_>>()
++                            .join(", ");
++                        return Err(anyhow!("S3 DeleteObjects partial failure: {detail}"));
++                    }
++                    Err(_e) if attempt < self.config.max_retries => {
++                        let delay = self.config.retry_base_delay * (1 << (attempt - 1));
++                        sleep(Duration::from_millis(delay)).await;
++                    }
++                    Err(e) => return Err(e.into()),
++                }
++            }
++        }
++
++        Ok(())
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/chunk/store.rs b/src/chunk/store.rs
+index 9f1c68e..b360fe5 100644
+--- a/src/chunk/store.rs
++++ b/src/chunk/store.rs
+@@ -969,12 +969,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
+         let (chunk_id, block_index) = key;
+         let start = block_index;
+         let end = start + block_count.as_u32();
+-        for i in start..end {
+-            let key_str = Self::key_for((chunk_id, i));
++        let keys: Vec<String> = (start..end).map(|i| Self::key_for((chunk_id, i))).collect();
++        if !keys.is_empty() {
+             self.client
+-                .delete_object(&key_str)
++                .delete_objects(&keys)
+                 .await
+-                .map_err(|e| anyhow::anyhow!("object store delete failed: {key_str}, {e:?}"))?;
++                .map_err(|e| anyhow::anyhow!("object store batch delete failed: {e:?}"))?;
++        }
++        for _ in 0..block_count {
+             self.object_metrics.record_delete();
+         }
+         Ok(())
+@@ -2695,4 +2697,128 @@ mod tests {
+ 
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn test_delete_range_uses_batch_delete_objects() -> anyhow::Result<()> {
++        use std::collections::HashMap;
++        use std::sync::{Arc, Mutex};
++
++        #[derive(Clone, Default)]
++        struct BatchMockBackend {
++            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
++            delete_batches: Arc<Mutex<Vec<Vec<String>>>>,
++            delete_object_calls: Arc<Mutex<u64>>,
++        }
++
++        #[async_trait]
++        impl ObjectBackend for BatchMockBackend {
++            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
++                self.data
++                    .lock()
++                    .unwrap()
++                    .insert(key.to_string(), data.to_vec());
++                Ok(())
++            }
++
++            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
++                Ok(self.data.lock().unwrap().get(key).cloned())
++            }
++
++            async fn get_object_range(
++                &self,
++                key: &str,
++                offset: u64,
++                buf: &mut [u8],
++            ) -> anyhow::Result<usize> {
++                let mut written = 0;
++                if let Some(data) = self.data.lock().unwrap().get(key) {
++                    let start = offset as usize;
++                    let end = (start + buf.len()).min(data.len());
++                    if start < data.len() {
++                        let copy_len = end - start;
++                        buf[..copy_len].copy_from_slice(&data[start..end]);
++                        written = copy_len;
++                    }
++                }
++                Ok(written)
++            }
++
++            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
++                Ok("etag".to_string())
++            }
++
++            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
++                *self.delete_object_calls.lock().unwrap() += 1;
++                self.data.lock().unwrap().remove(key);
++                Ok(())
++            }
++
++            async fn delete_objects(&self, keys: &[String]) -> anyhow::Result<()> {
++                self.delete_batches.lock().unwrap().push(keys.to_vec());
++                let mut data = self.data.lock().unwrap();
++                for key in keys {
++                    data.remove(key);
++                }
++                Ok(())
++            }
++        }
++
++        let backend = BatchMockBackend::default();
++        let cache_dir = tempfile::tempdir()?;
++        let store = ObjectBlockStore::new_with_configs_async(
++            ObjectClient::new(backend.clone()),
++            ChunksCacheConfig::with_budgets(
++                16 * 1024 * 1024,
++                16 * 1024 * 1024,
++                cache_dir.path().to_path_buf(),
++            ),
++            BlockStoreConfig {
++                block_size: 64 * 1024,
++                page_size: 4 * 1024,
++                compression: Compression::None,
++                ..Default::default()
++            },
++        )
++        .await?;
++        let metrics = store
++            .object_store_metrics()
++            .expect("ObjectBlockStore exposes object metrics");
++
++        for i in 0..3 {
++            backend
++                .data
++                .lock()
++                .unwrap()
++                .insert(format!("chunks/11/{i}"), vec![1u8; 1024]);
++        }
++
++        store.delete_range((11, 0), 3).await?;
++
++        let batches = backend.delete_batches.lock().unwrap().clone();
++        assert_eq!(
++            batches.len(),
++            1,
++            "delete_range should issue a single batch delete"
++        );
++        assert_eq!(
++            batches[0],
++            vec![
++                "chunks/11/0".to_string(),
++                "chunks/11/1".to_string(),
++                "chunks/11/2".to_string()
++            ]
++        );
++        assert_eq!(
++            *backend.delete_object_calls.lock().unwrap(),
++            0,
++            "batch-capable backend should not fall back to per-key delete"
++        );
++        assert!(
++            backend.data.lock().unwrap().is_empty(),
++            "batch delete should remove every key"
++        );
++        assert_eq!(metrics.snapshot().del_ops, 3);
++
++        Ok(())
++    }
+ }
+-- 
+2.50.1 (Apple Git-155)
+
