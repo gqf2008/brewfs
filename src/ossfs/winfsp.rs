@@ -1167,7 +1167,7 @@ impl AsyncFileSystemContext for OssMountContext {
             }
             let data = self
                 .fs
-                .read_range(&*context.path.lock().unwrap(), 0, usize::MAX)
+                .read_range(&context.path.lock().unwrap().clone(), 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             // The object may have grown since stat; top up the reservation.
@@ -1290,17 +1290,11 @@ impl AsyncFileSystemContext for OssMountContext {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let entries = self
-            .fs
-            .list(&*context.path.lock().unwrap())
-            .await
-            .map_err(|e| {
-                eprintln!(
-                    "ossmount: 列目录失败 {}: {e:?}",
-                    *context.path.lock().unwrap()
-                );
-                FspError::from(IoError::other(e.to_string()))
-            })?;
+        let dir_path = context.path.lock().unwrap().clone();
+        let entries = self.fs.list(&dir_path).await.map_err(|e| {
+            eprintln!("ossmount: 列目录失败 {}: {e:?}", dir_path);
+            FspError::from(IoError::other(e.to_string()))
+        })?;
 
         // Remember this directory and its listing so the periodic
         // change-notification pass can diff it and refresh open views.
@@ -1333,12 +1327,13 @@ impl AsyncFileSystemContext for OssMountContext {
         // original listing where the dots preceded every real entry.
         let mut dots: Vec<(String, DirEntry)> = Vec::new();
         if !is_root && start == 0 {
+            let dot_path = context.path.lock().unwrap().clone();
             if matches(".")
-                && let Ok(Some(dot)) = self.fs.stat(&*context.path.lock().unwrap()).await
+                && let Ok(Some(dot)) = self.fs.stat(&dot_path).await
             {
                 dots.push((".".to_string(), dot));
             }
-            let parent = parent_posix(&*context.path.lock().unwrap());
+            let parent = parent_posix(&dot_path);
             if matches("..")
                 && let Ok(Some(dotdot)) = self.fs.stat(&parent).await
             {
