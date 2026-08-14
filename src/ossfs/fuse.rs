@@ -291,9 +291,37 @@ impl OssFs {
     /// Truncate/expand a file with no open write handle via a
     /// read-modify-write against the object store.
     fn truncate_unopened(&self, path: &str, new_size: u64) -> anyhow::Result<()> {
-        let mut data = self.block_on(self.fs.read_range(path, 0, usize::MAX))?;
+        self.block_on(self.truncate_unopened_async(path, new_size))
+    }
+
+    /// Async core of [`Self::truncate_unopened`] (kept separate so tests can
+    /// drive it without a FUSE dispatcher thread to block on).
+    async fn truncate_unopened_async(&self, path: &str, new_size: u64) -> anyhow::Result<()> {
+        // The whole-object read-modify-write holds the object in memory; gate
+        // it against the dirty-buffer budget BEFORE downloading so a huge
+        // truncate fails cleanly instead of exhausting process memory.
+        let remote_size = self.fs.stat(path).await?.map(|e| e.size).unwrap_or(0);
+        let peak = remote_size.max(new_size) as usize;
+        let _permit = self.reserve_rmw_budget(peak).await?;
+        let mut data = self.fs.read_range(path, 0, usize::MAX).await?;
         data.resize(new_size as usize, 0);
-        self.block_on(self.fs.write(path, &data))
+        self.fs.write(path, &data).await
+    }
+
+    /// Reserve dirty-buffer budget for a transient whole-object
+    /// read-modify-write whose peak memory is `bytes`. `None` when the mount
+    /// has no budget configured.
+    async fn reserve_rmw_budget(&self, bytes: usize) -> anyhow::Result<Option<DirtyPermit>> {
+        let Some(budget) = &self.dirty_budget else {
+            return Ok(None);
+        };
+        let units = bytes.div_ceil(budget.unit());
+        if units > budget.max_units() {
+            anyhow::bail!(
+                "truncate read-modify-write of {bytes} bytes exceeds max-dirty-bytes budget"
+            );
+        }
+        budget.acquire_units(units).await.map(Some)
     }
 }
 
@@ -830,6 +858,21 @@ impl Filesystem for OssFs {
         let path = open_snapshot.path.clone();
         let needs_load = open_snapshot.write_buf.is_some() && !open_snapshot.loaded;
         if needs_load {
+            // Reserve the dirty-buffer budget from the stat'd size BEFORE
+            // downloading: the download itself allocates the whole object, so
+            // a post-hoc reserve cannot stop an oversized object from
+            // exhausting process memory.
+            let remote_size = self
+                .block_on(self.fs.stat(&path))
+                .ok()
+                .flatten()
+                .map(|e| e.size as usize)
+                .unwrap_or(0);
+            if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, remote_size)) {
+                warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
+                reply.error(Errno::EIO);
+                return;
+            }
             let data = match self.block_on(self.fs.read_range(&path, 0, usize::MAX)) {
                 Ok(d) => d,
                 Err(e) => {
@@ -838,6 +881,7 @@ impl Filesystem for OssFs {
                     return;
                 }
             };
+            // The object may have grown since stat; top up the reservation.
             if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, data.len())) {
                 warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
                 reply.error(Errno::EIO);
@@ -1550,6 +1594,7 @@ pub async fn mount_oss_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ossfs::{MockS3, test_fs_with_budget};
 
     #[test]
     fn inode_for_path_is_stable_and_distinct() {
@@ -1583,6 +1628,54 @@ mod tests {
         assert_eq!(
             epoch(1_700_000_000),
             UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Whole-object read-modify-write budget tests (in-process S3 mock)
+    // -------------------------------------------------------------------
+
+    fn test_oss(mock_port: u16, max_dirty_bytes: Option<usize>) -> OssFs {
+        let fs = Arc::new(test_fs_with_budget(mock_port, 32, max_dirty_bytes));
+        OssFs::new(fs, Handle::current(), Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn truncate_unopened_rejects_oversized_rmw_before_download() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        // 5 MiB object under a 1 MiB dirty budget: the read-modify-write peak
+        // exceeds the budget, so truncate must fail before downloading.
+        mock.set_object("f", vec![0u8; 5 * 1024 * 1024]);
+        let oss = test_oss(port, Some(1 << 20));
+        let err = oss
+            .truncate_unopened_async("/f", 1024)
+            .await
+            .expect_err("oversized truncate must fail");
+        assert!(
+            err.to_string().contains("max-dirty-bytes"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "oversized truncate must not download the object"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn truncate_unopened_within_budget_reads_modifies_writes() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", vec![0x11u8; 1024 * 1024]);
+        let oss = test_oss(port, Some(64 << 20));
+        oss.truncate_unopened_async("/f", 512)
+            .await
+            .expect("truncate within budget");
+        assert_eq!(mock.get_count.load(Ordering::SeqCst), 1, "one GET");
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(
+            recorded.iter().filter(|r| r.method == "PUT").count(),
+            1,
+            "one PUT"
         );
     }
 }

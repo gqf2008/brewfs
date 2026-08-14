@@ -3723,30 +3723,30 @@ mod s3_mock_tests {
     /// records request targets + bodies, and serves canned responses so the
     /// AWS SDK can round-trip (ListBucketResult and multipart uploads).
     #[derive(Clone, Debug)]
-    struct MockRequest {
-        method: String,
-        target: String,
-        body: Vec<u8>,
-        storage_class: Option<String>,
-        content_md5: Option<String>,
+    pub(crate) struct MockRequest {
+        pub(crate) method: String,
+        pub(crate) target: String,
+        pub(crate) body: Vec<u8>,
+        pub(crate) storage_class: Option<String>,
+        pub(crate) content_md5: Option<String>,
     }
 
-    struct MockS3 {
-        active: Arc<AtomicUsize>,
-        max_concurrent: Arc<AtomicUsize>,
-        requests: Arc<Mutex<Vec<String>>>,
-        recorded: Arc<Mutex<Vec<MockRequest>>>,
-        delay: Duration,
-        entries: Arc<Mutex<Vec<(String, bool)>>>,
-        objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        get_count: Arc<AtomicUsize>,
-        head_count: Arc<AtomicUsize>,
-        crc64: Mutex<u64>,
-        head_etag: Mutex<String>,
+    pub(crate) struct MockS3 {
+        pub(crate) active: Arc<AtomicUsize>,
+        pub(crate) max_concurrent: Arc<AtomicUsize>,
+        pub(crate) requests: Arc<Mutex<Vec<String>>>,
+        pub(crate) recorded: Arc<Mutex<Vec<MockRequest>>>,
+        pub(crate) delay: Duration,
+        pub(crate) entries: Arc<Mutex<Vec<(String, bool)>>>,
+        pub(crate) objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        pub(crate) get_count: Arc<AtomicUsize>,
+        pub(crate) head_count: Arc<AtomicUsize>,
+        pub(crate) crc64: Mutex<u64>,
+        pub(crate) head_etag: Mutex<String>,
     }
 
     impl MockS3 {
-        fn set_object(&self, key: &str, data: Vec<u8>) {
+        pub(crate) fn set_object(&self, key: &str, data: Vec<u8>) {
             self.objects.lock().unwrap().insert(key.to_string(), data);
         }
 
@@ -3758,7 +3758,10 @@ mod s3_mock_tests {
             *self.crc64.lock().unwrap() = v;
         }
 
-        async fn start(entries: Vec<(String, bool)>, delay: Duration) -> (Arc<Self>, u16) {
+        pub(crate) async fn start(
+            entries: Vec<(String, bool)>,
+            delay: Duration,
+        ) -> (Arc<Self>, u16) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let mock = Arc::new(MockS3 {
@@ -3951,10 +3954,11 @@ mod s3_mock_tests {
                 .map(|(_, k)| k.to_string())
                 .unwrap_or_default();
             let objects = mock.objects.lock().unwrap();
-            if objects.get(&key).is_some() {
+            if let Some(obj) = objects.get(&key) {
                 let etag = mock.head_etag.lock().unwrap().clone();
                 format!(
-                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    obj.len()
                 )
             } else {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -4016,7 +4020,15 @@ mod s3_mock_tests {
         body
     }
 
-    fn test_fs(port: u16, limit: usize) -> ObjectFs {
+    pub(crate) fn test_fs(port: u16, limit: usize) -> ObjectFs {
+        test_fs_with_budget(port, limit, None)
+    }
+
+    pub(crate) fn test_fs_with_budget(
+        port: u16,
+        limit: usize,
+        max_dirty_bytes: Option<usize>,
+    ) -> ObjectFs {
         let client = Client::from_conf(
             aws_sdk_s3::config::Builder::new()
                 .endpoint_url(format!("http://127.0.0.1:{port}"))
@@ -4066,7 +4078,7 @@ mod s3_mock_tests {
             multipart_part_size: MULTIPART_PART_SIZE as usize,
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
+            dirty_budget: DirtyBudget::new(max_dirty_bytes.unwrap_or(0)),
         }
     }
 
@@ -4746,3 +4758,8 @@ mod s3_mock_tests {
         assert_eq!(crc64ecma(b"a"), 0x330284772E652B05);
     }
 }
+
+/// Test-only S3 mock shared by the platform adapter test modules
+/// (`ossfs::winfsp` on Windows, `ossfs::fuse` on macOS/Linux).
+#[cfg(test)]
+pub(crate) use s3_mock_tests::{MockS3, test_fs, test_fs_with_budget};
