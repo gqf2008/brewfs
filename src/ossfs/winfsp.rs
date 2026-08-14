@@ -292,7 +292,7 @@ impl OssMountContext {
     /// without a WinFsp dispatcher thread to block on).
     async fn rename_async(
         &self,
-        context: &Self::FileContext,
+        context: &OssFileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         replace_if_exists: bool,
@@ -321,7 +321,7 @@ impl OssMountContext {
     /// drive it without a WinFsp dispatcher thread to block on).
     async fn set_file_size_async(
         &self,
-        context: &Self::FileContext,
+        context: &OssFileContext,
         new_size: u64,
         _set_allocation_size: bool,
         file_info: &mut FileInfo,
