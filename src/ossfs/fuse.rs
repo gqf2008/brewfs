@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use super::{
     DirEntry, DirtyBudget, DirtyPermit, MountAttr, ObjectFs, StreamingUpload, effective_mode,
-    effective_owner,
+    effective_owner, spool_file_path,
 };
 
 /// Attribute/entry cache lifetime. Object storage has no change notifications,
@@ -77,6 +77,33 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// Zero-fill `gap` bytes of a hole in the streaming read-back spool (a write
+/// beyond EOF must materialize the hole — object storage has no sparse
+/// files). Chunked so a huge hole never allocates its full size at once.
+async fn write_zero_gap(f: &mut tokio::fs::File, gap: usize) -> std::io::Result<()> {
+    const ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+    let mut remaining = gap;
+    while remaining > 0 {
+        let n = remaining.min(ZEROS.len());
+        tokio::io::AsyncWriteExt::write_all(f, &ZEROS[..n]).await?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
+/// Zero-fill `gap` bytes of a hole in a streaming multipart upload (see
+/// [`write_zero_gap`]).
+async fn feed_zero_gap(up: &mut StreamingUpload, gap: usize) -> anyhow::Result<()> {
+    const ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+    let mut remaining = gap;
+    while remaining > 0 {
+        let n = remaining.min(ZEROS.len());
+        up.write(&ZEROS[..n]).await?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
 fn epoch(secs: i64) -> SystemTime {
     if secs <= 0 {
         UNIX_EPOCH
@@ -110,6 +137,14 @@ struct OpenFile {
     /// into the stream, so that PUT would upload an empty object over the
     /// previous content.
     stream_failed: Arc<AtomicBool>,
+    /// Set when the backing object was unlinked/removed while this handle was
+    /// open. POSIX keeps the handle usable but the bytes must be discarded on
+    /// close — flushing would resurrect the deleted object (#46).
+    unlinked: bool,
+    /// Read-back spool for streaming handles (#47): while a multipart upload
+    /// is in flight the parts are invisible to reads, so the bytes written so
+    /// far are spilled here and reads are served from it.
+    spool_path: Option<PathBuf>,
     /// Current logical file size (set by setattr/truncate and write).
     logical_size: u64,
 }
@@ -283,6 +318,16 @@ impl OssFs {
     /// Async core of [`Self::flush_open`] (kept separate so tests can drive
     /// it without a FUSE dispatcher thread to block on).
     async fn flush_open_async(&self, open: &OpenFile) -> anyhow::Result<()> {
+        if open.unlinked {
+            // The object was unlinked while this handle was open; POSIX
+            // discards the bytes on close — never resurrect it (#46). An
+            // in-flight multipart must still be aborted, or its parts would
+            // linger as an incomplete upload in the bucket.
+            if let Some(up) = open.stream.lock().await.take() {
+                up.abort().await;
+            }
+            return Ok(());
+        }
         if !open.dirty {
             return Ok(());
         }
@@ -292,6 +337,19 @@ impl OssFs {
             );
         }
         if let Some(up) = open.stream.lock().await.take() {
+            if up.key() != open.path {
+                // The handle was renamed while the upload was in flight: the
+                // stream is bound to the old (deleted) key and completing it
+                // would resurrect the object the rename deleted (#46). The
+                // read-back spool mirrors the stream exactly — abort the
+                // stream and re-upload the spool to the retargeted key so
+                // the written bytes survive the rename.
+                up.abort().await;
+                if let Some(spool) = open.spool_path.clone() {
+                    return self.fs.write_from_file(&open.path, &spool).await;
+                }
+                return Ok(());
+            }
             if let Err(e) = up.finish().await {
                 // The buffer was emptied into the stream, so a later retry
                 // through the buffer path would PUT an empty object over the
@@ -546,14 +604,56 @@ impl Filesystem for OssFs {
                     return;
                 }
                 {
-                    let mut guard = self.files.lock().unwrap();
-                    if let Some(open) = guard.get_mut(&fh.0)
-                        && open.path == path
-                        && open.write_buf.is_some()
-                    {
-                        open.logical_size = new_size;
-                        open.dirty = true;
-                        handled = true;
+                    // #47: a truncate invalidates any in-flight stream —
+                    // bytes written afterwards must not append to it. The
+                    // abort runs outside the files lock (the stream lock is
+                    // never taken under the files lock), and the read-back
+                    // spool is discarded with the stream or reads would
+                    // serve stale pre-truncate bytes.
+                    let stream_arc = {
+                        let guard = self.files.lock().unwrap();
+                        guard
+                            .get(&fh.0)
+                            .filter(|o| o.path == path && o.write_buf.is_some())
+                            .map(|o| o.stream.clone())
+                    };
+                    if let Some(stream_arc) = stream_arc {
+                        let stream = self.block_on(async { stream_arc.lock().await.take() });
+                        if let Some(up) = stream {
+                            self.block_on(up.abort());
+                        }
+                        let mut guard = self.files.lock().unwrap();
+                        if let Some(open) = guard.get_mut(&fh.0) {
+                            if let Some(sp) = open.spool_path.take() {
+                                let _ = std::fs::remove_file(&sp);
+                            }
+                            // The buffer is the content the flush will PUT,
+                            // so the truncate must be applied to it: keep the
+                            // prefix when it covers the new size, zero-pad it
+                            // when it is shorter (extension), and mark the
+                            // empty buffer authoritative for truncate-to-zero
+                            // (the needs_load branch above seeded it with the
+                            // original content otherwise). Without this a
+                            // flush would PUT an empty (or full) buffer over
+                            // the object, destroying the truncate.
+                            if open.loaded {
+                                if let Some(buf) = open.write_buf.as_mut() {
+                                    if buf.len() as u64 >= new_size {
+                                        buf.truncate(new_size as usize);
+                                    } else {
+                                        buf.resize(new_size as usize, 0);
+                                    }
+                                }
+                            } else if new_size == 0 {
+                                if let Some(buf) = open.write_buf.as_mut() {
+                                    buf.clear();
+                                }
+                                open.loaded = true;
+                            }
+                            open.logical_size = new_size;
+                            open.dirty = true;
+                            handled = true;
+                        }
                     }
                 }
             }
@@ -695,6 +795,14 @@ impl Filesystem for OssFs {
             reply.error(Errno::EIO);
             return;
         }
+        // Mark handles on the deleted path so their close cannot resurrect
+        // the object (POSIX: unlinked open files discard their bytes) (#46).
+        let mut files = self.files.lock().unwrap();
+        for open in files.values_mut() {
+            if open.path == path {
+                open.unlinked = true;
+            }
+        }
         reply.ok();
     }
 
@@ -716,6 +824,16 @@ impl Filesystem for OssFs {
             reply.error(Errno::EIO);
             return;
         }
+        // Mark handles under the removed tree so their close cannot
+        // resurrect the objects the recursive delete just removed (#46) —
+        // the same guard as unlink.
+        let prefix = format!("{path}/");
+        let mut files = self.files.lock().unwrap();
+        for open in files.values_mut() {
+            if open.path == path || open.path.starts_with(&prefix) {
+                open.unlinked = true;
+            }
+        }
         reply.ok();
     }
 
@@ -726,7 +844,7 @@ impl Filesystem for OssFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (Some(parent_path), Some(newparent_path)) =
@@ -741,10 +859,64 @@ impl Filesystem for OssFs {
         };
         let old = join_path(&parent_path, name);
         let new = join_path(&newparent_path, newname);
-        if let Err(e) = self.block_on(self.fs.rename(&old, &new)) {
+        // RENAME_NOREPLACE only exists on Linux (renameat2); macOS rename
+        // always replaces the target.
+        let replace_if_exists = {
+            #[cfg(target_os = "linux")]
+            {
+                !flags.contains(RenameFlags::RENAME_NOREPLACE)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = flags;
+                true
+            }
+        };
+        if let Err(e) = self.block_on(self.fs.rename(&old, &new, replace_if_exists)) {
             warn!(old = %old, new = %new, error = ?e, "ossfs rename failed");
-            reply.error(Errno::EIO);
+            reply.error(if e.to_string().contains("target already exists") {
+                Errno::EEXIST
+            } else {
+                Errno::EIO
+            });
             return;
+        }
+        // Retarget open handles so a later flush writes the new key instead
+        // of resurrecting the deleted old object (#46). Handles that were
+        // open on the REPLACED target (`new`, when it existed) refer to the
+        // inode the rename destroyed — POSIX discards their bytes on close,
+        // so mark them unlinked or their flush would clobber the renamed
+        // content.
+        let prefix = format!("{old}/");
+        let new_prefix = format!("{new}/");
+        let fhs: Vec<u64> = self.files.lock().unwrap().keys().copied().collect();
+        let mut retargeted = Vec::new();
+        {
+            let mut files = self.files.lock().unwrap();
+            for fh in &fhs {
+                if let Some(open) = files.get_mut(fh) {
+                    if open.path == old {
+                        open.path = new.clone();
+                        retargeted.push(*fh);
+                    } else if let Some(suffix) = open.path.strip_prefix(&prefix) {
+                        open.path = format!("{new}/{suffix}");
+                        retargeted.push(*fh);
+                    }
+                }
+            }
+        }
+        if replace_if_exists {
+            let mut files = self.files.lock().unwrap();
+            for fh in &fhs {
+                if retargeted.contains(fh) {
+                    continue;
+                }
+                if let Some(open) = files.get_mut(fh)
+                    && (open.path == new || open.path.starts_with(&new_prefix))
+                {
+                    open.unlinked = true;
+                }
+            }
         }
         // The kernel re-looks-up the new name; keep the map consistent for the
         // moved path in case it is referenced by its old inode until forget.
@@ -793,6 +965,8 @@ impl Filesystem for OssFs {
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
+                unlinked: false,
+                spool_path: None,
                 logical_size: 0,
             },
         );
@@ -876,6 +1050,8 @@ impl Filesystem for OssFs {
                 budget_permits: Arc::new(Mutex::new(Vec::new())),
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
+                unlinked: false,
+                spool_path: None,
                 logical_size: 0,
             },
         );
@@ -904,6 +1080,29 @@ impl Filesystem for OssFs {
             reply.error(Errno::EBADF);
             return;
         };
+        // #47: a streaming handle's in-flight bytes are only visible through
+        // the read-back spool (the multipart parts are invisible until the
+        // upload completes) — serve reads from it when present.
+        if let Some(path) = open.spool_path.clone() {
+            let data = match self.block_on(async {
+                let mut f = tokio::fs::File::open(&path).await?;
+                tokio::io::AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(offset)).await?;
+                let mut buf = vec![0u8; size as usize];
+                let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+                buf.truncate(n);
+                anyhow::Ok(buf)
+            }) {
+                Ok(d) => {
+                    reply.data(&d);
+                    return;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), offset = offset, error = ?e, "ossfs spool read failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+        }
         if let Some(buf) = open.write_buf
             && open.loaded
         {
@@ -1017,10 +1216,51 @@ impl Filesystem for OssFs {
         {
             let mut guard = self.block_on(async { open_snapshot.stream.lock().await });
             if let Some(up) = guard.as_mut() {
+                // #47: the streaming upload is append-only; a write anchored
+                // anywhere but the current end silently corrupts the object.
+                // Read the live value from the map — the snapshot predates
+                // the stream lock, and Linux runs 4 FUSE threads, so a stale
+                // snapshot would both reject legal sequential writes and let
+                // same-offset concurrent writes slip through.
+                let (live_ls, live_spool) = {
+                    let files = self.files.lock().unwrap();
+                    match files.get(&fh.0) {
+                        Some(o) => (o.logical_size, o.spool_path.clone()),
+                        None => (0, None),
+                    }
+                };
+                if offset != live_ls {
+                    warn!(
+                        path = %path,
+                        offset, logical_size = live_ls,
+                        "ossfs stream write out of order"
+                    );
+                    reply.error(Errno::EIO);
+                    return;
+                }
                 if let Err(e) = self.block_on(up.write(data)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
                     reply.error(Errno::EIO);
                     return;
+                }
+                // #47: mirror the bytes into the read-back spool only after
+                // the stream accepted them — appending first would expose
+                // rejected bytes to reads and double-append on a retry. A
+                // spool failure degrades read-back only; the object is still
+                // correct, so the write still succeeds.
+                if let Some(path) = live_spool {
+                    match self.block_on(tokio::fs::OpenOptions::new().append(true).open(&path)) {
+                        Ok(mut f) => {
+                            if let Err(e) =
+                                self.block_on(tokio::io::AsyncWriteExt::write_all(&mut f, data))
+                            {
+                                warn!(path = %path.display(), error = ?e, "ossfs spool append failed; read-back degraded");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(path = %path.display(), error = ?e, "ossfs spool append open failed; read-back degraded");
+                        }
+                    }
                 }
                 let end = offset.saturating_add(data.len() as u64);
                 let mut files = self.files.lock().unwrap();
@@ -1047,28 +1287,82 @@ impl Filesystem for OssFs {
                     return;
                 }
             };
-            if let Some(existing) = &existing
-                && !existing.is_empty()
+            // #47: place `data` at its declared offset. The buffer holds the
+            // full content (lazy-loaded original + earlier writes), so the
+            // stream must be prefix + data + suffix — appending data after
+            // the whole prefix would silently misplace it on any partial
+            // overwrite. A write beyond EOF zero-fills the hole (object
+            // storage has no sparse files).
+            let existing_len = existing.as_ref().map(|b| b.len()).unwrap_or(0);
+            let cut = (offset as usize).min(existing_len);
+            let end = (offset as usize)
+                .saturating_add(data.len())
+                .min(existing_len);
+            let gap = (offset as usize).saturating_sub(existing_len);
+            // Spill the spliced content to the read-back spool FIRST so a
+            // spool failure aborts the upload before any part is uploaded —
+            // otherwise the handle is left with a live stream full of bytes
+            // from a write that returned an error (#47).
+            let spool = spool_file_path();
             {
-                if let Err(e) = self.block_on(up.write(existing)) {
-                    warn!(path = %path, error = ?e, "ossfs stream write failed");
+                let mut f = match self.block_on(tokio::fs::File::create(&spool)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(path = %path, error = ?e, "ossfs spool create failed");
+                        self.block_on(up.abort());
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                let seed = async {
+                    if let Some(existing) = &existing {
+                        tokio::io::AsyncWriteExt::write_all(&mut f, &existing[..cut]).await?;
+                    }
+                    write_zero_gap(&mut f, gap).await?;
+                    tokio::io::AsyncWriteExt::write_all(&mut f, data).await?;
+                    if let Some(existing) = &existing {
+                        tokio::io::AsyncWriteExt::write_all(&mut f, &existing[end..]).await?;
+                    }
+                    anyhow::Ok(())
+                };
+                if let Err(e) = self.block_on(seed) {
+                    warn!(path = %path, error = ?e, "ossfs spool write failed");
+                    let _ = std::fs::remove_file(&spool);
+                    self.block_on(up.abort());
                     reply.error(Errno::EIO);
                     return;
                 }
             }
-            if let Err(e) = self.block_on(up.write(data)) {
+            let feed = async {
+                if let Some(existing) = &existing {
+                    up.write(&existing[..cut]).await?;
+                }
+                feed_zero_gap(&mut up, gap).await?;
+                up.write(data).await?;
+                if let Some(existing) = &existing {
+                    up.write(&existing[end..]).await?;
+                }
+                anyhow::Ok(())
+            };
+            if let Err(e) = self.block_on(feed) {
                 warn!(path = %path, error = ?e, "ossfs stream write failed");
+                let _ = std::fs::remove_file(&spool);
+                self.block_on(up.abort());
                 reply.error(Errno::EIO);
                 return;
             }
+            // The stream's true byte count — the write may extend past the
+            // old content (append) or stay inside it (overwrite).
+            let stream_len = (existing_len as u64).max(new_size as u64);
             let stream = open_snapshot.stream.clone();
             self.block_on(async move { *stream.lock().await = Some(up) });
             let mut files = self.files.lock().unwrap();
             if let Some(o) = files.get_mut(&fh.0) {
                 o.write_buf = Some(Vec::new());
                 o.loaded = true;
-                o.logical_size = new_size as u64;
+                o.logical_size = stream_len;
                 o.dirty = true;
+                o.spool_path = Some(spool);
             }
             reply.written(data.len() as u32);
             return;
@@ -1121,6 +1415,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
+            // The upload completed; the read-back spool is stale (#47).
+            if let Some(path) = o.spool_path.take() {
+                let _ = std::fs::remove_file(&path);
+            }
             if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;
@@ -1145,6 +1443,9 @@ impl Filesystem for OssFs {
             // Errors on release are not surfaced to the caller; log them.
             if let Err(e) = self.flush_open(&open) {
                 warn!(path = %open.path, error = ?e, "ossfs release flush failed");
+            }
+            if let Some(path) = open.spool_path.clone() {
+                let _ = std::fs::remove_file(&path);
             }
             self.files.lock().unwrap().remove(&fh.0);
         }
@@ -1175,6 +1476,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
+            // The upload completed; the read-back spool is stale (#47).
+            if let Some(path) = o.spool_path.take() {
+                let _ = std::fs::remove_file(&path);
+            }
             if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;
@@ -1766,6 +2071,8 @@ mod tests {
             budget_permits: Arc::new(Mutex::new(Vec::new())),
             stream: Arc::new(tokio::sync::Mutex::new(None)),
             stream_failed: Arc::new(AtomicBool::new(false)),
+            unlinked: false,
+            spool_path: None,
             logical_size,
         }
     }

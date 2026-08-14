@@ -1250,6 +1250,13 @@ pub struct StreamingUpload {
 }
 
 impl StreamingUpload {
+    /// Object key this upload writes to (immutable once started). Adapters
+    /// compare it against the handle's current path so a rename cannot make
+    /// a flush resurrect the deleted old object (#46).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Feed `data` into the upload. Buffers until a full part is ready, then
     /// uploads it in the background.
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -1394,6 +1401,21 @@ impl StreamingUpload {
             check_crc64_response(crc_slot, expected, &self.metrics)?;
         }
         Ok(())
+    }
+
+    /// Abort the multipart upload and discard any uploaded parts, keeping
+    /// the object's previous content (or absence). Used when a truncate /
+    /// overwrite invalidates the in-flight stream (#47).
+    pub async fn abort(mut self) {
+        self.tasks.abort_all();
+        let _ = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await;
     }
 }
 
@@ -2909,19 +2931,36 @@ impl ObjectFs {
 
     /// Rename a file or directory. Directories are copied recursively; the
     /// operation is intentionally non-atomic (object storage semantics).
-    pub async fn rename(&self, old: &str, new: &str) -> Result<()> {
+    /// `replace_if_exists` is honored against the current target state.
+    pub async fn rename(&self, old: &str, new: &str, replace_if_exists: bool) -> Result<()> {
         self.ensure_writable()?;
         let _permit = self.acquire().await?;
-        self.rename_impl(old, new).await
+        self.rename_impl(old, new, replace_if_exists).await
     }
 
-    async fn rename_impl(&self, old: &str, new: &str) -> Result<()> {
+    async fn rename_impl(&self, old: &str, new: &str, replace_if_exists: bool) -> Result<()> {
         self.invalidate_stat(old);
         self.invalidate_stat(new);
         self.clear_read_cache();
+
+        // POSIX rename(a, a) is a successful no-op. rename(a, a/b) must fail
+        // (EINVAL): copying the tree then recursively deleting the source
+        // prefix would re-list the freshly copied `a/b/*` and wipe both.
+        // The reverse direction (moving a directory into its own ancestor)
+        // would likewise scramble the tree, so both are rejected.
+        if old == new {
+            return Ok(());
+        }
+        if new.starts_with(&format!("{old}/")) || old.starts_with(&format!("{new}/")) {
+            anyhow::bail!("rename: cannot move a path into its own subtree");
+        }
+        if !replace_if_exists && self.stat_uncached_impl(new).await?.is_some() {
+            anyhow::bail!("rename: target already exists");
+        }
+
         let old_key = self.key_for(old);
         let new_key = self.key_for(new);
-        let source = format!("{}/{}", self.bucket, old_key);
+        let source = s3_copy_source(&self.bucket, &old_key);
 
         // Determine directory-ness from S3 instead of assuming a trailing
         // slash: WinFsp/FUSE rename paths for directories arrive without a
@@ -3016,7 +3055,7 @@ impl ObjectFs {
                         .copy_object()
                         .bucket(&self.bucket)
                         .key(&dst)
-                        .copy_source(format!("{}/{}", self.bucket, key))
+                        .copy_source(s3_copy_source(&self.bucket, key))
                         .send()
                         .await
                         .context("s3 copy")?;
@@ -3036,10 +3075,9 @@ impl ObjectFs {
             .copy_object()
             .bucket(&self.bucket)
             .key(format!("{}/", new_key.trim_end_matches('/')))
-            .copy_source(format!(
-                "{}/{}/",
-                self.bucket,
-                old_key.trim_end_matches('/')
+            .copy_source(s3_copy_source(
+                &self.bucket,
+                &format!("{}/", old_key.trim_end_matches('/')),
             ))
             .send()
             .await
@@ -3102,6 +3140,41 @@ fn dir_object_prefix(key: &str) -> String {
 /// Strip the leading slash from a normalized path; `"/"` -> `""`.
 pub fn rel_key(path: &str) -> String {
     path.trim().trim_start_matches('/').to_string()
+}
+
+/// Build an S3 `x-amz-copy-source` header value (`/bucket/key`) with the key
+/// percent-encoded per RFC 3986. Slashes inside the key are preserved (they
+/// are object-key separators, not encoded by S3 in copy-source); everything
+/// else that is not an unreserved character is encoded. Without this, keys
+/// containing spaces / `+` / `#` / `%` / non-ASCII break rename and copy.
+fn s3_copy_source(bucket: &str, key: &str) -> String {
+    let mut out = String::with_capacity(bucket.len() + key.len() + 2);
+    out.push('/');
+    out.push_str(bucket);
+    out.push('/');
+    for b in key.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Unique temp-file path for a streaming write handle's read-back spool
+/// (#47): while a multipart upload is in flight the parts are invisible to
+/// reads, so the handle spills the bytes written so far to a temp file and
+/// serves reads from it until the upload completes.
+fn spool_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "ossfs-spool-{}-{}",
+        std::process::id(),
+        SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// Last path component of a normalized POSIX path. `/` stays `/`.
@@ -3309,7 +3382,7 @@ mod tests {
         assert!(fs.mkdir("/d").await.is_err());
         assert!(fs.delete("/a").await.is_err());
         assert!(fs.delete_dir_recursive("/d").await.is_err());
-        assert!(fs.rename("/a", "/b").await.is_err());
+        assert!(fs.rename("/a", "/b", true).await.is_err());
     }
 
     #[tokio::test]
@@ -4049,6 +4122,7 @@ mod s3_mock_tests {
         pub(crate) body: Vec<u8>,
         pub(crate) storage_class: Option<String>,
         pub(crate) content_md5: Option<String>,
+        pub(crate) copy_source: Option<String>,
     }
 
     pub(crate) struct MockS3 {
@@ -4139,6 +4213,7 @@ mod s3_mock_tests {
         let mut range_header: Option<String> = None;
         let mut storage_class_header: Option<String> = None;
         let mut content_md5_header: Option<String> = None;
+        let mut copy_source_header: Option<String> = None;
         for line in head.lines() {
             let lower = line.to_ascii_lowercase();
             if let Some(v) = lower.strip_prefix("range:") {
@@ -4152,6 +4227,9 @@ mod s3_mock_tests {
             }
             if lower.strip_prefix("content-md5:").is_some() {
                 content_md5_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
+            }
+            if lower.strip_prefix("x-amz-copy-source:").is_some() {
+                copy_source_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
             }
         }
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
@@ -4194,6 +4272,7 @@ mod s3_mock_tests {
             body,
             storage_class: storage_class_header.clone(),
             content_md5: content_md5_header.clone(),
+            copy_source: copy_source_header.clone(),
         });
 
         tokio::time::sleep(mock.delay).await;
@@ -4417,12 +4496,112 @@ mod s3_mock_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_rejects_subtree_move() {
+        // #46: rename("/a", "/a/b") would copy the tree then recursively
+        // delete the freshly copied subtree — wipe both. Must fail; a no-op
+        // self-rename succeeds (POSIX).
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let fs = test_fs(port, 32);
+        let err = fs
+            .rename("/a", "/a/b", true)
+            .await
+            .expect_err("subtree rename must fail");
+        assert!(
+            err.to_string().contains("subtree"),
+            "unexpected error: {err:?}"
+        );
+        fs.rename("/a", "/a", true)
+            .await
+            .expect("self-rename is a no-op");
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            0,
+            "no S3 traffic for rejected/no-op renames"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_honors_replace_if_exists() {
+        // #46: without replace the target must not be clobbered; with it,
+        // the rename proceeds.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let fs = test_fs(port, 32);
+        mock.set_object("a", b"old-a".to_vec());
+        mock.set_object("b", b"old-b".to_vec());
+
+        let err = fs
+            .rename("/a", "/b", false)
+            .await
+            .expect_err("existing target without replace must fail");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err:?}"
+        );
+        // Only the existence-check HEAD may have hit the wire; no copy.
+        assert!(
+            !mock
+                .recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.copy_source.is_some()),
+            "no copy for a rejected rename"
+        );
+
+        fs.rename("/a", "/b", true)
+            .await
+            .expect("replace=true must succeed");
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "PUT" && r.copy_source.is_some()),
+            "a copy request must have been issued"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_special_char_key_uses_encoded_copy_source() {
+        // #46: keys with spaces / reserved characters must be RFC 3986
+        // encoded in x-amz-copy-source, or the rename fails / targets the
+        // wrong object.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let fs = test_fs(port, 32);
+        mock.set_object("a b.txt", b"data".to_vec());
+
+        fs.rename("/a b.txt", "/a c.txt", true)
+            .await
+            .expect("rename with space in key");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let copy = recorded
+            .iter()
+            .find(|r| r.method == "PUT" && r.copy_source.is_some())
+            .expect("a copy request must have been issued");
+        assert_eq!(
+            copy.copy_source.as_deref(),
+            Some("/b/a%20b.txt"),
+            "copy-source must be percent-encoded"
+        );
+    }
+
+    #[test]
+    fn s3_copy_source_encodes_reserved_chars() {
+        assert_eq!(s3_copy_source("b", "plain.txt"), "/b/plain.txt");
+        assert_eq!(
+            s3_copy_source("b", "a b+%#中"),
+            "/b/a%20b%2B%25%23%E4%B8%AD"
+        );
+        assert_eq!(s3_copy_source("b", "dir/file.txt"), "/b/dir/file.txt");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rename_dir_disabled_rejects_directory_rename() {
         let entries = vec![("dir/a.txt".to_string(), false)];
         let (mock, port) = MockS3::start(entries, Duration::from_millis(0)).await;
         let mut fs = test_fs(port, 8);
         fs.allow_rename_dir = false;
-        let err = fs.rename("/dir", "/newdir").await.unwrap_err();
+        let err = fs.rename("/dir", "/newdir", true).await.unwrap_err();
         assert!(err.to_string().contains("directory rename is disabled"));
         drop(mock);
     }
@@ -4436,7 +4615,7 @@ mod s3_mock_tests {
         let (mock, port) = MockS3::start(entries, Duration::from_millis(0)).await;
         let mut fs = test_fs(port, 8);
         fs.rename_dir_limit = Some(1);
-        let err = fs.rename("/dir", "/newdir").await.unwrap_err();
+        let err = fs.rename("/dir", "/newdir", true).await.unwrap_err();
         assert!(err.to_string().contains("rename-dir-limit"));
         drop(mock);
     }
