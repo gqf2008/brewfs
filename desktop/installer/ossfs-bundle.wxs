@@ -31,13 +31,12 @@
     <Chain>
       <!-- WinFsp is GPLv3 (with a FLOSS exception allowing redistribution of
            its unmodified installer). The license text is shipped inside the
-           app MSI (INSTALLFOLDER\LICENSES) and this URL documents the
-           license/source provenance of the chained package. -->
+           app MSI (INSTALLFOLDER\LICENSES\WinFsp-License.txt); WiX v4's
+           MsiPackage schema has no LicenseUrl attribute. -->
       <MsiPackage SourceFile="$(var.WinFspMsi)"
                   Vital="yes"
                   Permanent="yes"
-                  InstallCondition="NOT WinFspService"
-                  LicenseUrl="https://github.com/winfsp/winfsp">
+                  InstallCondition="NOT WinFspService">
       </MsiPackage>
       <MsiPackage SourceFile="$(var.AppMsi)"
                   Vital="yes" />
