@@ -9,7 +9,8 @@ OSSFS 托盘（Windows）
 - LICENSES\         第三方组件许可归属（当前为 WinFsp 的 GPLv3 许可文本）
 
 使用前请先安装 WinFsp（本安装包会自动安装）。macOS/Linux 请直接使用
-ossmount（需要 FUSE-T / macFUSE / libfuse）。
+ossmount：macOS 推荐 FUSE-T（免内核扩展，DMG 版会在首次挂载时自动安装），
+也可用 macFUSE；Linux 需要 libfuse。
 
 仓库：https://github.com/gqf2008/ossfs
 

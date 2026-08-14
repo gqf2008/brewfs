@@ -11,7 +11,7 @@
   "dir-mode": "0755",
   "file-mode": "0644",
   "allow-other": false,
-  "umask": "0022",
+  "umask": "0",
   "no-rename-dir": false,
   "rename-dir-limit": 2000000,
   "max-concurrent-requests": 32,

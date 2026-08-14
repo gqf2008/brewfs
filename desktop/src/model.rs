@@ -111,18 +111,22 @@ impl Profile {
     /// Serialize this profile into the same JSON shape `ossmount --config`
     /// accepts. Only the shared mount options are emitted; tray-only fields
     /// (`name` / `drive` / `mode` / payload-checksum toggle) are omitted.
+    /// An empty region is omitted so `ossmount` keeps its documented
+    /// `us-east-1` default instead of expanding `--region ""` (#61).
     pub fn to_ossmount_config(&self) -> String {
-        serde_json::to_string_pretty(&serde_json::json!({
+        let mut obj = serde_json::json!({
             "mount_point": self.drive,
             "bucket": self.s3_bucket,
             "endpoint": self.s3_endpoint,
-            "region": self.s3_region,
             "force-path-style": self.s3_force_path_style,
             "prefix": self.prefix,
             "access_key_id": self.access_key,
             "secret_access_key": self.secret_key,
-        }))
-        .unwrap_or_default()
+        });
+        if !self.s3_region.trim().is_empty() {
+            obj["region"] = serde_json::json!(self.s3_region);
+        }
+        serde_json::to_string_pretty(&obj).unwrap_or_default()
     }
 
     /// Build a tray profile from an `ossmount --config` JSON document.
@@ -653,6 +657,45 @@ pub fn find_ossmount() -> Option<PathBuf> {
     None
 }
 
+/// When a mount log grows past this size it is rotated down to
+/// [`MOUNT_LOG_KEEP_BYTES`] before the next append, so a crash-looping mount
+/// cannot grow the file without bound (#61).
+const MOUNT_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+/// Portion of the log kept when rotating.
+const MOUNT_LOG_KEEP_BYTES: u64 = 256 * 1024;
+
+/// Open the per-profile mount log for appending, rotating it first when it
+/// exceeds [`MOUNT_LOG_ROTATE_BYTES`]. Appending (instead of truncating)
+/// preserves the previous crash's output so a restart loop stays
+/// diagnosable (#61).
+fn open_mount_log(path: &Path) -> std::io::Result<fs::File> {
+    if fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MOUNT_LOG_ROTATE_BYTES {
+        rotate_log_tail(path, MOUNT_LOG_KEEP_BYTES as usize);
+    }
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Keep only the last `keep` bytes of `path` (best effort).
+fn rotate_log_tail(path: &Path, keep: usize) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= keep as u64 {
+        return;
+    }
+    if file.seek(SeekFrom::Start(len - keep as u64)).is_err() {
+        return;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return;
+    }
+    let tmp = path.with_extension("log.tmp");
+    let _ = fs::write(&tmp, &tail).and_then(|()| fs::rename(&tmp, path));
+}
+
 /// Spawn `ossmount mount --bucket ... <drive>` (metadata-less OSS direct
 /// mount) and return (child pid, log path).
 pub fn spawn_oss_mount(ossmount: &Path, profile: &Profile) -> std::io::Result<(u32, PathBuf)> {
@@ -674,7 +717,9 @@ pub fn spawn_oss_mount(ossmount: &Path, profile: &Profile) -> std::io::Result<(u
         })
         .collect();
     let log_path = log_dir.join(format!("{safe_name}-oss.log"));
-    let log_file = fs::File::create(&log_path)?;
+    // Append (with rotation) so a restart loop keeps earlier crash output
+    // instead of truncating it away (#61).
+    let log_file = open_mount_log(&log_path)?;
 
     let mut cmd = Command::new(ossmount);
     cmd.arg("mount")
@@ -707,21 +752,45 @@ pub fn spawn_oss_mount(ossmount: &Path, profile: &Profile) -> std::io::Result<(u
 }
 
 /// Read the tail of a mount log file for error reporting.
+///
+/// The window starts at an arbitrary byte offset, so it may begin in the
+/// middle of a multi-byte UTF-8 sequence (common with Chinese error text);
+/// the leading partial sequence is skipped and anything still undecodable is
+/// replaced lossily instead of failing the whole read with `InvalidData` —
+/// which used to leave the user with only a generic "挂载失败" (#61).
 pub fn read_log_tail(path: &Path, max_bytes: usize) -> String {
     let Ok(meta) = fs::metadata(path) else {
         return String::new();
     };
     let len = meta.len() as usize;
     let skip = len.saturating_sub(max_bytes);
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         return String::new();
     };
-    use std::io::{Read, Seek, SeekFrom};
-    let mut reader = std::io::BufReader::new(file);
-    let _ = reader.seek(SeekFrom::Start(skip as u64));
-    let mut buf = String::new();
-    let _ = reader.read_to_string(&mut buf);
-    buf
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if skip > 0 {
+        use std::io::Seek;
+        if file.seek(std::io::SeekFrom::Start(skip as u64)).is_err() {
+            return String::new();
+        }
+        // Drop continuation bytes of a multi-byte UTF-8 char the window
+        // landed inside (at most 3 per char) and keep from the next char
+        // boundary, so the lossy decode does not start with a replacement
+        // character. The boundary byte itself is kept.
+        let mut probe = [0u8; 1];
+        for _ in 0..3 {
+            if file.read(&mut probe).is_err() {
+                return String::new();
+            }
+            if probe[0] & 0xC0 != 0x80 {
+                buf.extend_from_slice(&probe);
+                break;
+            }
+        }
+    }
+    let _ = file.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,5 +1306,81 @@ mod tests {
         assert_eq!(back.profiles[0].name, "OSS");
         assert_eq!(back.profiles[0].drive, "Z:");
         assert_eq!(back.profiles[0].mode, "oss");
+    }
+
+    #[test]
+    fn export_omits_empty_region() {
+        // Regression (#61): exporting a profile without a region used to emit
+        // `"region": ""`, which ossmount expands to `--region ""` and thereby
+        // overrides its documented `us-east-1` default.
+        let mut p = oss_profile();
+        p.s3_region = String::new();
+        let json: serde_json::Value = serde_json::from_str(&p.to_ossmount_config()).expect("json");
+        assert!(json.get("region").is_none(), "got: {json}");
+
+        p.s3_region = "cn-shanghai".into();
+        let json: serde_json::Value = serde_json::from_str(&p.to_ossmount_config()).expect("json");
+        assert_eq!(json["region"].as_str(), Some("cn-shanghai"));
+    }
+
+    #[test]
+    fn read_log_tail_decodes_partial_utf8_window() {
+        // Regression (#61): a window starting mid multi-byte character used
+        // to fail read_to_string with InvalidData and leave the user with an
+        // empty (generic) failure message.
+        let dir = std::env::temp_dir().join(format!("ossfs-tray-test-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mount.log");
+        // 100 ASCII bytes, then a long CJK message (3 bytes/char): the
+        // 2048-byte window starts at byte 5252, i.e. byte 1 of a 3-byte
+        // character.
+        let head = "x".repeat(100);
+        let tail = "挂载失败：无法解析的响应".repeat(200);
+        fs::write(&path, format!("{head}{tail}")).unwrap();
+
+        let got = read_log_tail(&path, 2048);
+        assert!(
+            got.contains("无法解析的响应"),
+            "tail must decode lossily instead of failing; got {got:?}"
+        );
+        assert!(
+            !got.contains('\u{FFFD}'),
+            "boundary skip must avoid a leading replacement char; got {got:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_mount_log_appends_and_rotates() {
+        // Regression (#61): each spawn truncated the previous crash log with
+        // File::create, making a crash loop undiagnosable.
+        let dir = std::env::temp_dir().join(format!("ossfs-tray-test-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m-oss.log");
+
+        {
+            let mut f = open_mount_log(&path).expect("open");
+            use std::io::Write;
+            f.write_all(b"first crash\n").unwrap();
+        }
+        {
+            let mut f = open_mount_log(&path).expect("open");
+            use std::io::Write;
+            f.write_all(b"second crash\n").unwrap();
+        }
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "first crash\nsecond crash\n", "must append");
+
+        // Past the rotation threshold the log shrinks to its tail.
+        let big = "y".repeat(MOUNT_LOG_ROTATE_BYTES as usize + 100);
+        fs::write(&path, &big).unwrap();
+        open_mount_log(&path).expect("open after rotate");
+        let len = fs::metadata(&path).unwrap().len();
+        assert!(
+            len <= MOUNT_LOG_ROTATE_BYTES as u64,
+            "oversized log must be rotated down, got {len}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

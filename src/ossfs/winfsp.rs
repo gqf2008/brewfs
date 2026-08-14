@@ -23,7 +23,7 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, U16CStr};
 
-use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs, StreamingUpload};
+use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs, StreamingUpload, spool_file_path};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
@@ -34,6 +34,7 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const WIN32_FILE_NOT_FOUND: i32 = 2;
 const WIN32_ACCESS_DENIED: i32 = 5;
 const WIN32_INVALID_PARAMETER: i32 = 87;
+const WIN32_ALREADY_EXISTS: i32 = 183;
 
 /// Above this size a write handle spills its buffer to a temp file so a large
 /// file copy cannot exhaust process memory.
@@ -134,7 +135,11 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// Per-open-file state. Writes are buffered whole-file; reads go straight to
 /// the object store unless the file is open for write.
 pub struct OssFileContext {
-    path: String,
+    /// POSIX path. `Mutex` so the `rename` callback (which only receives an
+    /// immutable context) can retarget an open handle to its new path;
+    /// otherwise a dirty handle would flush to the deleted old key and
+    /// resurrect the object (#46).
+    path: Mutex<String>,
     is_dir: bool,
     /// Whole-file write buffer; `Some` when the handle was opened for write.
     /// Content is loaded **lazily**: `loaded` stays false until the first
@@ -169,9 +174,14 @@ pub struct OssFileContext {
 impl OssFileContext {
     fn index(&self) -> u64 {
         // Stable-ish per-path index derived from the string.
-        self.path.as_bytes().iter().fold(0x9E37_79B9u64, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(*b as u64)
-        })
+        self.path
+            .lock()
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .fold(0x9E37_79B9u64, |acc, b| {
+                acc.wrapping_mul(31).wrapping_add(*b as u64)
+            })
     }
 }
 
@@ -278,6 +288,102 @@ pub struct OssMountContext {
 }
 
 impl OssMountContext {
+    /// Async core of [`Self::rename`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn rename_async(
+        &self,
+        context: &OssFileContext,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> winfsp::Result<()> {
+        let old = win_path_to_posix(file_name);
+        let new = win_path_to_posix(new_file_name);
+        let fs = Arc::clone(&self.fs);
+        let new_for_upload = new.clone();
+        fs.rename(&old, &new_for_upload, replace_if_exists)
+            .await
+            .map_err(|e| {
+                let io = IoError::other(e.to_string());
+                if e.to_string().contains("target already exists") {
+                    FspError::from(IoError::from_raw_os_error(WIN32_ALREADY_EXISTS))
+                } else {
+                    FspError::from(io)
+                }
+            })?;
+        // Retarget this handle to the new path so a later flush writes the
+        // new key instead of resurrecting the deleted old object (#46).
+        *context.path.lock().unwrap() = new;
+        Ok(())
+    }
+
+    /// Async core of [`Self::set_file_size`] (kept separate so tests can
+    /// drive it without a WinFsp dispatcher thread to block on).
+    async fn set_file_size_async(
+        &self,
+        context: &OssFileContext,
+        new_size: u64,
+        _set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        if context.is_dir {
+            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
+        }
+
+        if new_size == 0 {
+            // Truncate to zero: abort any in-flight stream (bytes written
+            // after the truncate would otherwise append to it), discard the
+            // spool and clear the buffer (#47).
+            {
+                let mut stream_guard = context.stream.lock().await;
+                if let Some(up) = stream_guard.take() {
+                    up.abort().await;
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            }
+            context.logical_size.store(0, Ordering::Release);
+            let mut guard = context.write_buf.lock().unwrap();
+            if let Some(buf) = guard.as_mut() {
+                buf.clear();
+            }
+            context.loaded.store(true, Ordering::Release);
+        } else {
+            // Pre-allocation and SetEndOfFile change the logical size; the
+            // actual bytes are streamed/buffered by write_async. Never
+            // materialize the file here (that was the 20GB OOM source).
+            //
+            // #47: when a streaming upload is in flight its parts are
+            // pre-truncate content — a non-zero truncate must abort it and
+            // truncate the read-back spool (`set_len` pads with zeros on
+            // extend) so the uploaded object ends up exactly `new_size`
+            // instead of carrying the pre-truncate tail.
+            {
+                let mut stream_guard = context.stream.lock().await;
+                if let Some(up) = stream_guard.take() {
+                    up.abort().await;
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().clone() {
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    let _ = f.set_len(new_size);
+                }
+                context.spool_size.store(new_size, Ordering::Release);
+            }
+            context.logical_size.store(new_size, Ordering::Release);
+        }
+        context.dirty.store(true, Ordering::Release);
+        let entry = DirEntry {
+            name: context.path.lock().unwrap().clone(),
+            is_dir: false,
+            size: new_size,
+            mtime_secs: 0,
+        };
+        *file_info = file_info_from(&entry, context.index());
+        Ok(())
+    }
     fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future,
@@ -328,6 +434,36 @@ impl OssMountContext {
             )));
         }
         if let Some(up) = ctx.stream.lock().await.take() {
+            let target = ctx.path.lock().unwrap().clone();
+            // Compare key-for-key: `up.key()` is the object key (no leading
+            // slash) while `ctx.path` is the POSIX form (leading slash) — a
+            // direct string compare would always differ and route every
+            // streamed flush through the rename-retarget branch (abort +
+            // spool re-upload; with no spool the write would be silently
+            // dropped).
+            if up.key() != self.fs.key_for(&target) {
+                // The handle was renamed while the upload was in flight: the
+                // stream is bound to the old (deleted) key, and completing it
+                // would resurrect the object the rename deleted (#46). The
+                // read-back spool mirrors the stream exactly — abort the
+                // stream and re-upload the spool to the retargeted key so the
+                // written bytes survive the rename.
+                up.abort().await;
+                let spool = ctx.spool_path.lock().unwrap().take();
+                if let Some(path) = spool {
+                    self.fs
+                        .write_from_file(&target, &path)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    let _ = std::fs::remove_file(&path);
+                    ctx.spool_size.store(0, Ordering::Release);
+                }
+                ctx.logical_size.store(0, Ordering::Release);
+                *ctx.write_buf.lock().unwrap() = Some(Vec::new());
+                ctx.loaded.store(false, Ordering::Release);
+                ctx.dirty.store(false, Ordering::Release);
+                return Ok(());
+            }
             if let Err(e) = up.finish().await {
                 // The buffer was emptied into the stream, so a later retry
                 // through the buffer path would PUT an empty object over the
@@ -335,6 +471,11 @@ impl OssMountContext {
                 ctx.stream_failed.store(true, Ordering::Release);
                 return Err(FspError::from(IoError::other(e.to_string())));
             }
+            // The upload is complete; drop the read-back spool (#47).
+            if let Some(path) = ctx.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+            }
+            ctx.spool_size.store(0, Ordering::Release);
             ctx.logical_size.store(0, Ordering::Release);
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
@@ -344,7 +485,7 @@ impl OssMountContext {
         let spool = ctx.spool_path.lock().unwrap().clone();
         if let Some(path) = spool {
             self.fs
-                .write_from_file(&ctx.path, &path)
+                .write_from_file(&*ctx.path.lock().unwrap(), &path)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             let _ = std::fs::remove_file(&path);
@@ -358,9 +499,51 @@ impl OssMountContext {
             return Ok(());
         }
         let data = ctx.write_buf.lock().unwrap().clone();
-        if let Some(data) = data {
+        if let Some(mut data) = data {
+            // #48: SetEndOfFile/preallocation on a lazily-loaded write handle
+            // records only `logical_size`; uploading the still-empty buffer
+            // would PUT an empty object over the existing content. Fetch the
+            // original object and materialize the logical size (zero-fill
+            // extensions, truncate shrinks) before uploading.
+            let logical = ctx.logical_size.load(Ordering::Acquire) as usize;
+            if logical != data.len() {
+                // Review 3 P1: on a budget-less (default) mount a
+                // SetEndOfFile(50 GB) with no writes would otherwise allocate
+                // 50 GB of zero-fill here and OOM the process. Refuse
+                // extensions past the in-memory threshold and keep the remote
+                // object intact; truncations are safe (no allocation).
+                if logical > data.len() && logical > WRITE_SPOOL_THRESHOLD {
+                    return Err(FspError::from(IoError::other(format!(
+                        "refusing to materialize a {logical}-byte extension past the {} MiB in-memory threshold",
+                        WRITE_SPOOL_THRESHOLD / (1024 * 1024)
+                    ))));
+                }
+                // Gate the flush-time read-modify-write against the dirty
+                // budget BEFORE downloading (same as write_async's lazy
+                // load), and refuse absurd SetEndOfFile preallocations
+                // instead of materializing them (#48 review).
+                if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
+                    let remote_size = self
+                        .fs
+                        .stat(&*ctx.path.lock().unwrap())
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.size as usize)
+                        .unwrap_or(0);
+                    self.reserve_dirty(ctx, remote_size).await?;
+                    data = self
+                        .fs
+                        .read_range(&*ctx.path.lock().unwrap(), 0, usize::MAX)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    self.reserve_dirty(ctx, data.len()).await?;
+                }
+                self.reserve_dirty(ctx, logical).await?;
+                data.resize(logical, 0);
+            }
             self.fs
-                .write(&ctx.path, &data)
+                .write(&*ctx.path.lock().unwrap(), &data)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         }
@@ -415,6 +598,33 @@ fn join_posix(dir: &str, name: &str) -> String {
     } else {
         format!("{dir}/{name}")
     }
+}
+
+/// Zero-fill `gap` bytes of a hole in the streaming read-back spool (a write
+/// beyond EOF must materialize the hole — object storage has no sparse
+/// files). Chunked so a huge hole never allocates its full size at once.
+async fn write_zero_gap(f: &mut tokio::fs::File, gap: usize) -> std::io::Result<()> {
+    const ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+    let mut remaining = gap;
+    while remaining > 0 {
+        let n = remaining.min(ZEROS.len());
+        tokio::io::AsyncWriteExt::write_all(f, &ZEROS[..n]).await?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
+/// Zero-fill `gap` bytes of a hole in a streaming multipart upload (see
+/// [`write_zero_gap`]).
+async fn feed_zero_gap(up: &mut StreamingUpload, gap: usize) -> anyhow::Result<()> {
+    const ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+    let mut remaining = gap;
+    while remaining > 0 {
+        let n = remaining.min(ZEROS.len());
+        up.write(&ZEROS[..n]).await?;
+        remaining -= n;
+    }
+    Ok(())
 }
 
 /// Periodic change detection: every REFRESH_INTERVAL_MS (only when the OS
@@ -663,7 +873,7 @@ impl FileSystemContext for OssMountContext {
         };
         *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
         Ok(OssFileContext {
-            path: posix,
+            path: Mutex::new(posix),
             is_dir,
             write_buf: Mutex::new(write_buf),
             loaded: AtomicBool::new(false),
@@ -697,23 +907,55 @@ impl FileSystemContext for OssMountContext {
         if self.fs.read_only() {
             return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
         }
+        // Real size / lazy-load flag when `create` finds the file already
+        // exists; set below. A brand-new file keeps size 0 with an
+        // authoritative empty buffer.
+        let mut size = 0u64;
+        let mut needs_existing = false;
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        } else {
+            // #50: materialize the object for a brand-new file so it still
+            // exists after the handle closes (a never-PUT path would 404 on
+            // the next stat and the file would "vanish"). An existing file
+            // keeps its content — overwrite semantics are handled by the
+            // `overwrite` callback. (TOCTOU: a concurrent rename could land
+            // on this path between the stat and the PUT and be clobbered by
+            // the empty object; closing that needs a conditional PutObject —
+            // If-None-Match:* — which ObjectFs does not expose yet.)
+            let existing = self
+                .block_on(self.fs.stat(&posix))
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            match existing {
+                Some(entry) => {
+                    size = entry.size;
+                    needs_existing = true;
+                }
+                None => {
+                    self.block_on(self.fs.write(&posix, &[]))
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
+            }
         }
         let entry = DirEntry {
             name: posix.clone(),
             is_dir,
-            size: 0,
+            size,
             mtime_secs: 0,
         };
         let write_buf = if is_dir { None } else { Some(Vec::new()) };
         *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
         Ok(OssFileContext {
-            path: posix,
+            path: Mutex::new(posix),
             is_dir,
             write_buf: Mutex::new(write_buf),
-            loaded: AtomicBool::new(true),
+            // Mirrors the FUSE adapter's `loaded: !needs_existing`: only a
+            // brand-new file's empty buffer is authoritative. For an existing
+            // file (the security lookup raced a concurrent create/rename),
+            // the first write lazy-loads the object so it merges instead of
+            // zero-filling over the content.
+            loaded: AtomicBool::new(!needs_existing),
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
             dir_buffer: DirBuffer::new(),
@@ -731,7 +973,20 @@ impl FileSystemContext for OssMountContext {
         let delete_requested = context.delete_on_close.load(Ordering::Acquire)
             || winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
         if delete_requested {
-            let path = context.path.clone();
+            // Discard an in-flight multipart upload and the read-back spool:
+            // the handle is being deleted, so its bytes must be neither
+            // uploaded nor orphaned as an incomplete multipart (#46/#47).
+            {
+                let mut stream_guard = self.block_on(async { context.stream.lock().await });
+                if let Some(up) = stream_guard.take() {
+                    self.block_on(up.abort());
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            }
+            let path = context.path.lock().unwrap().clone();
             let is_dir = context.is_dir;
             let fs = Arc::clone(&self.fs);
             let result = self.block_on({
@@ -753,11 +1008,25 @@ impl FileSystemContext for OssMountContext {
         if context.dirty.load(Ordering::Acquire)
             && let Err(e) = self.block_on(self.upload_dirty(context))
         {
-            warn!(path = log_path(&context.path), error = ?e, "ossfs cleanup flush failed");
+            warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
         }
     }
 
-    fn close(&self, _context: Self::FileContext) {}
+    fn close(&self, context: Self::FileContext) {
+        // The handle is gone, so nothing can retry a failed upload — release
+        // the read-back spool and abort any leftover stream so neither leaks
+        // in %TEMP% / S3 (#47).
+        if let Some(path) = context.spool_path.lock().unwrap().take() {
+            let _ = std::fs::remove_file(&path);
+            context.spool_size.store(0, Ordering::Release);
+        }
+        self.block_on(async {
+            let mut guard = context.stream.lock().await;
+            if let Some(up) = guard.take() {
+                up.abort().await;
+            }
+        });
+    }
 
     fn flush(
         &self,
@@ -775,9 +1044,12 @@ impl FileSystemContext for OssMountContext {
     ) -> winfsp::Result<()> {
         let logical_size = context.logical_size.load(Ordering::Acquire);
         if logical_size > 0 {
+            let name = context.path.lock().unwrap().clone();
+            // `index()` locks `context.path` again (a non-reentrant std
+            // Mutex), so no guard may be alive when it runs (#46).
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name,
                     is_dir: context.is_dir,
                     size: logical_size,
                     mtime_secs: 0,
@@ -788,9 +1060,10 @@ impl FileSystemContext for OssMountContext {
         }
         if context.spool_path.lock().unwrap().is_some() {
             let size = context.spool_size.load(Ordering::Acquire);
+            let name = context.path.lock().unwrap().clone();
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name,
                     is_dir: context.is_dir,
                     size,
                     mtime_secs: 0,
@@ -802,11 +1075,17 @@ impl FileSystemContext for OssMountContext {
         if let Some(buf) = context.write_buf.lock().unwrap().as_ref()
             && context.loaded.load(Ordering::Acquire)
         {
+            let size = buf.len() as u64;
+            let name = context.path.lock().unwrap().clone();
+            // `index()` locks `context.path` again (it is a `Mutex<String>`),
+            // so the guard above must be dropped first — a std Mutex is not
+            // reentrant and holding the guard across `index()` deadlocks the
+            // dispatcher thread (#46).
             *file_info = file_info_from(
                 &DirEntry {
-                    name: context.path.clone(),
+                    name,
                     is_dir: context.is_dir,
-                    size: buf.len() as u64,
+                    size,
                     mtime_secs: 0,
                 },
                 context.index(),
@@ -814,7 +1093,7 @@ impl FileSystemContext for OssMountContext {
             return Ok(());
         }
         let entry = self
-            .block_on(self.fs.stat(&context.path))
+            .block_on(self.fs.stat(&*context.path.lock().unwrap()))
             .map_err(|e| FspError::from(IoError::other(e.to_string())))?
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
         *file_info = file_info_from(&entry, context.index());
@@ -833,6 +1112,15 @@ impl FileSystemContext for OssMountContext {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
         }
+        // #47: an in-flight streaming upload must be aborted or the bytes
+        // written after the overwrite would append to the old stream and the
+        // object would end up containing pre-overwrite content.
+        {
+            let mut stream_guard = self.block_on(async { context.stream.lock().await });
+            if let Some(up) = stream_guard.take() {
+                self.block_on(up.abort());
+            }
+        }
         if let Some(path) = context.spool_path.lock().unwrap().take() {
             let _ = std::fs::remove_file(&path);
             context.spool_size.store(0, Ordering::Release);
@@ -845,7 +1133,7 @@ impl FileSystemContext for OssMountContext {
         context.loaded.store(true, Ordering::Release);
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
-            name: context.path.clone(),
+            name: context.path.lock().unwrap().clone(),
             is_dir: false,
             size: 0,
             mtime_secs: 0,
@@ -856,18 +1144,12 @@ impl FileSystemContext for OssMountContext {
 
     fn rename(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let old = win_path_to_posix(file_name);
-        let new = win_path_to_posix(new_file_name);
-        let fs = Arc::clone(&self.fs);
-        self.block_on(async move { fs.rename(&old, &new).await })
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        let _ = replace_if_exists;
-        Ok(())
+        self.block_on(self.rename_async(context, file_name, new_file_name, replace_if_exists))
     }
 
     fn set_basic_info(
@@ -896,16 +1178,19 @@ impl FileSystemContext for OssMountContext {
         };
         let entry = if let Some(size) = buf_size {
             DirEntry {
-                name: context.path.clone(),
+                name: context.path.lock().unwrap().clone(),
                 is_dir: context.is_dir,
                 size,
                 mtime_secs: 0,
             }
         } else {
-            self.block_on(self.fs.stat(&context.path))
+            // Clone first: `context.path` is a non-reentrant std Mutex and
+            // the fallback DirEntry below locks it again (#46).
+            let path = context.path.lock().unwrap().clone();
+            self.block_on(self.fs.stat(&path))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?
                 .unwrap_or(DirEntry {
-                    name: context.path.clone(),
+                    name: path,
                     is_dir: context.is_dir,
                     size: 0,
                     mtime_secs: 0,
@@ -931,40 +1216,10 @@ impl FileSystemContext for OssMountContext {
         &self,
         context: &Self::FileContext,
         new_size: u64,
-        _set_allocation_size: bool,
+        set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        if context.is_dir {
-            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
-        }
-
-        if new_size == 0 {
-            // Truncate to zero: discard spool and clear the buffer.
-            if let Some(path) = context.spool_path.lock().unwrap().take() {
-                let _ = std::fs::remove_file(&path);
-                context.spool_size.store(0, Ordering::Release);
-            }
-            context.logical_size.store(0, Ordering::Release);
-            let mut guard = context.write_buf.lock().unwrap();
-            if let Some(buf) = guard.as_mut() {
-                buf.clear();
-            }
-            context.loaded.store(true, Ordering::Release);
-        } else {
-            // Pre-allocation and SetEndOfFile only change the logical size;
-            // the actual bytes are streamed/buffered by write_async. Never
-            // materialize the file here (that was the 20GB OOM source).
-            context.logical_size.store(new_size, Ordering::Release);
-        }
-        context.dirty.store(true, Ordering::Release);
-        let entry = DirEntry {
-            name: context.path.clone(),
-            is_dir: false,
-            size: new_size,
-            mtime_secs: 0,
-        };
-        *file_info = file_info_from(&entry, context.index());
-        Ok(())
+        self.block_on(self.set_file_size_async(context, new_size, set_allocation_size, file_info))
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
@@ -1018,11 +1273,8 @@ impl AsyncFileSystemContext for OssMountContext {
                 }
             }
         }
-        match self
-            .fs
-            .read_range(&context.path, offset, buffer.len())
-            .await
-        {
+        let read_path = context.path.lock().unwrap().clone();
+        match self.fs.read_range(&read_path, offset, buffer.len()).await {
             Ok(data) => {
                 let n = data.len().min(buffer.len());
                 buffer[..n].copy_from_slice(&data[..n]);
@@ -1031,7 +1283,7 @@ impl AsyncFileSystemContext for OssMountContext {
             Err(e) => {
                 eprintln!(
                     "ossfs read_range err path={} offset={} len={}: {e:?}",
-                    context.path,
+                    *context.path.lock().unwrap(),
                     offset,
                     buffer.len()
                 );
@@ -1058,14 +1310,43 @@ impl AsyncFileSystemContext for OssMountContext {
         {
             let mut stream_guard = context.stream.lock().await;
             if let Some(up) = stream_guard.as_mut() {
-                up.write(buffer)
-                    .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                // #47: the streaming upload is append-only. A write anchored
+                // anywhere but the current end (or past it) would silently
+                // corrupt the object — reject it explicitly.
                 let base = if write_to_eof {
                     context.logical_size.load(Ordering::Acquire)
                 } else {
                     offset
                 };
+                let cur = context.logical_size.load(Ordering::Acquire);
+                if base != cur {
+                    return Err(FspError::from(IoError::other(format!(
+                        "streaming write at offset {base} while current size is {cur}"
+                    ))));
+                }
+                up.write(buffer)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                // #47: mirror the bytes into the read-back spool only after
+                // the stream accepted them — appending first would expose
+                // rejected bytes to reads and double-append on a retry. A
+                // spool failure degrades read-back only; the object is still
+                // correct, so the write still succeeds.
+                let spool = context.spool_path.lock().unwrap().clone();
+                if let Some(path) = spool {
+                    let mut f = tokio::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut f, buffer).await {
+                        warn!(path = %path.display(), error = ?e, "ossfs spool append failed; read-back degraded");
+                    } else {
+                        context
+                            .spool_size
+                            .fetch_add(buffer.len() as u64, Ordering::Release);
+                    }
+                }
                 let end = base.saturating_add(buffer.len() as u64);
                 let cur = context.logical_size.load(Ordering::Acquire);
                 if end > cur {
@@ -1073,7 +1354,7 @@ impl AsyncFileSystemContext for OssMountContext {
                 }
                 context.dirty.store(true, Ordering::Release);
                 let entry = DirEntry {
-                    name: context.path.clone(),
+                    name: context.path.lock().unwrap().clone(),
                     is_dir: false,
                     size: context.logical_size.load(Ordering::Acquire),
                     mtime_secs: 0,
@@ -1091,9 +1372,10 @@ impl AsyncFileSystemContext for OssMountContext {
         // the stat would be dead work).
         if !context.loaded.load(Ordering::Acquire) {
             if self.dirty_budget.is_some() {
+                let stat_path = context.path.lock().unwrap().clone();
                 let remote_size = self
                     .fs
-                    .stat(&context.path)
+                    .stat(&stat_path)
                     .await
                     .ok()
                     .flatten()
@@ -1101,14 +1383,24 @@ impl AsyncFileSystemContext for OssMountContext {
                     .unwrap_or(0);
                 self.reserve_dirty(context, remote_size).await?;
             }
+            let lazy_path = context.path.lock().unwrap().clone();
             let data = self
                 .fs
-                .read_range(&context.path, 0, usize::MAX)
+                .read_range(&lazy_path, 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             // The object may have grown since stat; top up the reservation.
             if self.dirty_budget.is_some() {
                 self.reserve_dirty(context, data.len()).await?;
+            }
+            // Reserve BEFORE materializing a pending SetEndOfFile extension:
+            // a 50 GB preallocation followed by a 1-byte write would
+            // otherwise allocate the zero-filled seed ahead of any budget
+            // check (review 2). Must run before taking the buffer lock.
+            let pending_logical = context.logical_size.load(Ordering::Acquire);
+            if pending_logical > 0 {
+                self.reserve_dirty(context, pending_logical as usize)
+                    .await?;
             }
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
@@ -1117,7 +1409,21 @@ impl AsyncFileSystemContext for OssMountContext {
                 )));
             };
             if !context.loaded.load(Ordering::Acquire) {
-                *buf = data;
+                // Seeding must keep `logical_size` authoritative (#48 review):
+                // a pending SetEndOfFile truncate/extend (recorded without
+                // loading) is materialized here, and the seeded length becomes
+                // the logical size when there is none pending. Without this, a
+                // partial overwrite of a larger object would be truncated to
+                // the write's end on flush (data loss).
+                let mut seeded = data;
+                if pending_logical > 0 {
+                    seeded.resize(pending_logical as usize, 0);
+                }
+                *buf = seeded;
+                let len = buf.len() as u64;
+                context
+                    .logical_size
+                    .store(len.max(pending_logical), Ordering::Release);
                 context.loaded.store(true, Ordering::Release);
             }
         }
@@ -1137,34 +1443,86 @@ impl AsyncFileSystemContext for OssMountContext {
         if new_size > WRITE_SPOOL_THRESHOLD {
             self.reserve_dirty(context, new_size).await?;
             let existing = context.write_buf.lock().unwrap().clone();
+            let stream_path = context.path.lock().unwrap().clone();
             let mut up = self
                 .fs
-                .begin_streaming_upload(&context.path)
+                .begin_streaming_upload(&stream_path)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-            if let Some(existing) = &existing
-                && !existing.is_empty()
+            // #47: place `buffer` at its declared anchor. The buffer holds
+            // the full content (lazy-loaded original + earlier writes), so
+            // the stream must be prefix + buffer + suffix — naively appending
+            // the buffer after the whole prefix would silently misplace data
+            // on any partial overwrite.
+            let anchor = if write_to_eof {
+                existing.as_ref().map(|b| b.len()).unwrap_or(0)
+            } else {
+                offset as usize
+            };
+            let existing_len = existing.as_ref().map(|b| b.len()).unwrap_or(0);
+            let cut = anchor.min(existing_len);
+            let end = anchor.saturating_add(buffer.len()).min(existing_len);
+            // A write beyond EOF must zero-fill the hole (object storage has
+            // no sparse files).
+            let gap = anchor.saturating_sub(existing_len);
+            // Spill the (spliced) content to the read-back spool FIRST so a
+            // spool failure aborts the upload before any part is uploaded —
+            // otherwise the handle is left with a live stream full of bytes
+            // from a write that returned an error (#47).
+            let spool = spool_file_path();
             {
-                up.write(existing)
+                let mut f = tokio::fs::File::create(&spool)
                     .await
                     .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                let seed = async {
+                    if let Some(existing) = &existing {
+                        tokio::io::AsyncWriteExt::write_all(&mut f, &existing[..cut]).await?;
+                    }
+                    write_zero_gap(&mut f, gap).await?;
+                    tokio::io::AsyncWriteExt::write_all(&mut f, buffer).await?;
+                    if let Some(existing) = &existing {
+                        tokio::io::AsyncWriteExt::write_all(&mut f, &existing[end..]).await?;
+                    }
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(e) = seed {
+                    let _ = std::fs::remove_file(&spool);
+                    up.abort().await;
+                    return Err(FspError::from(IoError::other(e.to_string())));
+                }
             }
-            up.write(buffer)
-                .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            let feed = async {
+                if let Some(existing) = &existing {
+                    up.write(&existing[..cut]).await?;
+                }
+                feed_zero_gap(&mut up, gap).await?;
+                up.write(buffer).await?;
+                if let Some(existing) = &existing {
+                    up.write(&existing[end..]).await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = feed {
+                let _ = std::fs::remove_file(&spool);
+                up.abort().await;
+                return Err(FspError::from(IoError::other(e.to_string())));
+            }
+            // The stream's true byte count — the buffer may extend past the
+            // old content (append) or stay inside it (overwrite).
+            let stream_len = (existing_len as u64).max(new_size as u64);
+            *context.spool_path.lock().unwrap() = Some(spool);
+            context.spool_size.store(stream_len, Ordering::Release);
             *context.write_buf.lock().unwrap() = Some(Vec::new());
             context.loaded.store(true, Ordering::Release);
             *context.stream.lock().await = Some(up);
-            let sz = context
-                .logical_size
-                .load(Ordering::Acquire)
-                .max(new_size as u64);
-            context.logical_size.store(sz, Ordering::Release);
+            context.logical_size.store(stream_len, Ordering::Release);
             context.dirty.store(true, Ordering::Release);
             let entry = DirEntry {
-                name: context.path.clone(),
+                name: context.path.lock().unwrap().clone(),
                 is_dir: false,
-                size: new_size as u64,
+                size: stream_len,
                 mtime_secs: 0,
             };
             *file_info = file_info_from(&entry, context.index());
@@ -1189,9 +1547,14 @@ impl AsyncFileSystemContext for OssMountContext {
             }
             buf[start..start + buffer.len()].copy_from_slice(buffer);
         }
+        // Keep `logical_size` authoritative for the small-buffer path too:
+        // upload_dirty materializes it on flush (#48/#49), so a write that
+        // only grows the buffer must be reflected here.
+        let end = (new_size as u64).max(context.logical_size.load(Ordering::Acquire));
+        context.logical_size.store(end, Ordering::Release);
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
-            name: context.path.clone(),
+            name: context.path.lock().unwrap().clone(),
             is_dir: false,
             size: new_size as u64,
             mtime_secs: 0,
@@ -1207,16 +1570,17 @@ impl AsyncFileSystemContext for OssMountContext {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let entries = self.fs.list(&context.path).await.map_err(|e| {
-            eprintln!("ossmount: 列目录失败 {}: {e:?}", context.path);
+        let dir_path = context.path.lock().unwrap().clone();
+        let entries = self.fs.list(&dir_path).await.map_err(|e| {
+            eprintln!("ossmount: 列目录失败 {}: {e:?}", dir_path);
             FspError::from(IoError::other(e.to_string()))
         })?;
 
         // Remember this directory and its listing so the periodic
         // change-notification pass can diff it and refresh open views.
-        self.record_browsed(&context.path, &entries);
+        self.record_browsed(&*context.path.lock().unwrap(), &entries);
 
-        let is_root = context.path == "/";
+        let is_root = *context.path.lock().unwrap() == "/";
         let pat = pattern.map(|p| p.to_string_lossy());
 
         // Resume from the marker entry if present. Entries are streamed
@@ -1243,12 +1607,13 @@ impl AsyncFileSystemContext for OssMountContext {
         // original listing where the dots preceded every real entry.
         let mut dots: Vec<(String, DirEntry)> = Vec::new();
         if !is_root && start == 0 {
+            let dot_path = context.path.lock().unwrap().clone();
             if matches(".")
-                && let Ok(Some(dot)) = self.fs.stat(&context.path).await
+                && let Ok(Some(dot)) = self.fs.stat(&dot_path).await
             {
                 dots.push((".".to_string(), dot));
             }
-            let parent = parent_posix(&context.path);
+            let parent = parent_posix(&dot_path);
             if matches("..")
                 && let Ok(Some(dotdot)) = self.fs.stat(&parent).await
             {
@@ -1355,6 +1720,14 @@ mod tests {
     use super::*;
     use crate::ossfs::{MockS3, test_fs_with_budget};
     use std::time::Duration;
+
+    /// NUL-terminated U16CStr for callback tests (leaked, tests only).
+    fn w(s: &str) -> &'static U16CStr {
+        let mut units: Vec<u16> = s.encode_utf16().collect();
+        units.push(0);
+        let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
+        U16CStr::from_slice(leaked).unwrap()
+    }
 
     fn entry(name: &str) -> DirEntry {
         DirEntry {
@@ -1478,7 +1851,7 @@ mod tests {
     /// same approach as the existing `w()` helper).
     fn test_file_with(path: &str, loaded: bool) -> &'static OssFileContext {
         Box::leak(Box::new(OssFileContext {
-            path: path.to_string(),
+            path: Mutex::new(path.to_string()),
             is_dir: false,
             write_buf: Mutex::new(Some(Vec::new())),
             loaded: AtomicBool::new(loaded),
@@ -1628,6 +2001,238 @@ mod tests {
             mock.get_count.load(Ordering::SeqCst),
             0,
             "oversized lazy-load must not download the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_retargets_handle_path() {
+        // #46: after a rename the open handle must flush to the new key —
+        // otherwise a dirty handle resurrects the deleted old object.
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/a");
+        // Drive the async core directly: the sync `rename` wrapper calls
+        // `block_on`, which panics from inside a #[tokio::test] runtime.
+        ctx.rename_async(&file, w("\\a"), w("\\b"), true)
+            .await
+            .expect("rename");
+        assert_eq!(
+            *file.path.lock().unwrap(),
+            "/b",
+            "handle must be retargeted to the new path"
+        );
+    }
+
+    /// Data larger than WRITE_SPOOL_THRESHOLD with a distinguishable byte
+    /// pattern for read-back verification.
+    fn big_data() -> Vec<u8> {
+        (0..(WRITE_SPOOL_THRESHOLD + 1024 * 1024))
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streaming_write_out_of_order_rejected() {
+        // #47: once streaming, a write anchored anywhere but the current end
+        // must fail instead of silently corrupting the object.
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        let big = big_data();
+        let n = ctx
+            .write_async(file, &big, 0, false, false, &mut fi)
+            .await
+            .expect("first write");
+        assert_eq!(n as usize, big.len());
+
+        ctx.write_async(file, b"xx", 0, false, false, &mut fi)
+            .await
+            .expect_err("out-of-order write must fail");
+        // (The `expect_err` above is the guard; the mock request count is
+        // timing-dependent because the first part upload runs as a background
+        // task, so no count assertion here.)
+    }
+
+    #[tokio::test]
+    async fn truncate_zero_aborts_inflight_stream() {
+        // #47: truncate-to-zero must abort the in-flight stream or bytes
+        // written after it would append to the old upload.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, &big_data(), 0, false, false, &mut fi)
+            .await
+            .expect("write");
+
+        // Drive the async core directly: the sync `set_file_size` wrapper
+        // calls `block_on`, which panics from inside a #[tokio::test]
+        // runtime.
+        ctx.set_file_size_async(file, 0, false, &mut fi)
+            .await
+            .expect("truncate to zero");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.to_lowercase().contains("uploadid")),
+            "in-flight stream must be aborted on truncate-to-zero"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|r| r.method == "POST" && r.target.to_lowercase().contains("uploadid")),
+            "no multipart completion after truncate"
+        );
+    }
+
+    /// The single whole-object PUT body recorded by the mock, if any.
+    fn last_put_body(mock: &MockS3) -> Option<Vec<u8>> {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .last()
+            .map(|r| r.body.clone())
+    }
+
+    #[tokio::test]
+    async fn set_file_size_expand_on_unloaded_handle_preserves_content() {
+        // #48: SetEndOfFile(N) on an unloaded write handle records only the
+        // logical size; flushing must fetch the original object and
+        // zero-extend it — not PUT an empty object over the existing content.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size_async(file, 10, false, &mut fi)
+            .await
+            .expect("set_file_size");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        let mut expected = b"hello".to_vec();
+        expected.resize(10, 0);
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(expected.as_slice()),
+            "flush must fetch the original object and zero-extend it"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            1,
+            "exactly one GET for the original content"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_handle_reads_back_spooled_bytes() {
+        // #47: while a multipart upload is in flight the parts are invisible
+        // to reads — the handle must serve the bytes written so far from its
+        // read-back spool instead of reporting EOF.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        let big = big_data();
+        ctx.write_async(file, &big, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+
+        let mut head = vec![0u8; 4096];
+        let n = ctx.read_async(file, &mut head, 0).await.expect("read");
+        assert_eq!(n as usize, 4096);
+        assert_eq!(&head[..], &big[..4096], "head read-back must match");
+
+        let mut mid = vec![0u8; 4096];
+        let n2 = ctx.read_async(file, &mut mid, 1024).await.expect("read");
+        assert_eq!(
+            &mid[..],
+            &big[1024..1024 + 4096],
+            "mid read-back must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_zero_on_unloaded_handle_still_truncates() {
+        // #48: SetEndOfFile(0) is a genuine truncate-to-zero — the empty PUT
+        // must keep working (set_file_size(0) marks the buffer loaded, so the
+        // new fetch guard must not interfere).
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size_async(file, 0, false, &mut fi)
+            .await
+            .expect("set_file_size(0)");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&[][..]),
+            "truncate-to-zero must still upload an empty object"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "truncate-to-zero needs no GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_overwrite_preserves_tail() {
+        // Review regression: opening an existing object for write and
+        // overwriting only its head must NOT truncate the object to the
+        // write's end — the lazy-load seed must keep logical_size at the full
+        // original length.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"0123456789ABCDEFGHIJ".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false); // unloaded write handle
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, b"XXXXX", 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&b"XXXXX56789ABCDEFGHIJ"[..]),
+            "partial overwrite must preserve the unmodified tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_beyond_threshold_fails_without_materializing() {
+        // Review 3 P1: on the default (budget-less) mount, a SetEndOfFile
+        // past WRITE_SPOOL_THRESHOLD must fail on flush instead of
+        // allocating the zero-fill extension and OOM-ing the process; the
+        // remote object stays intact.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None)); // no budget
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size_async(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
+            .await
+            .expect("set_file_size");
+        ctx.upload_dirty(file)
+            .await
+            .expect_err("oversized extension must be refused on flush");
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "no GET for a refused extension"
         );
     }
 }

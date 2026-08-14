@@ -85,8 +85,12 @@ cargo test --workspace --lib --bins --tests -- --test-threads=1
   profiles: buffered FUSE mmap after truncate/extend can expose stale
   page-cache data, and the tiny-overlap direct-I/O profile has a
   split-write/page-cache coherency race. See `doc/README.md`.
-- FIFO, socket, char/block device inodes and `rdev` are persisted as object
-  markers; the WinFsp/FUSE adapters map them back on readdir/stat.
+- Special file types are **not supported**: the FUSE adapter only produces
+  `Directory` / `RegularFile` attributes (`rdev` is always 0) and `mknod`
+  rejects non-regular modes with `EPERM`. Symlinks, hard links, xattrs,
+  `lseek`, `fallocate` and POSIX locks (`setlk`/`getlk`) answer `ENOSYS`
+  (fuser defaults); `rmdir` recursively deletes the prefix. See
+  `doc/README.md` "Known POSIX / FUSE limitations".
 
 ## Artifact Hygiene
 
