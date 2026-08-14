@@ -697,6 +697,11 @@ impl FileSystemContext for OssMountContext {
         if self.fs.read_only() {
             return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
         }
+        // Real size / lazy-load flag when `create` finds the file already
+        // exists; set below. A brand-new file keeps size 0 with an
+        // authoritative empty buffer.
+        let mut size = 0u64;
+        let mut needs_existing = false;
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
@@ -705,20 +710,28 @@ impl FileSystemContext for OssMountContext {
             // exists after the handle closes (a never-PUT path would 404 on
             // the next stat and the file would "vanish"). An existing file
             // keeps its content — overwrite semantics are handled by the
-            // `overwrite` callback.
-            let exists = self
+            // `overwrite` callback. (TOCTOU: a concurrent rename could land
+            // on this path between the stat and the PUT and be clobbered by
+            // the empty object; closing that needs a conditional PutObject —
+            // If-None-Match:* — which ObjectFs does not expose yet.)
+            let existing = self
                 .block_on(self.fs.stat(&posix))
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?
-                .is_some();
-            if !exists {
-                self.block_on(self.fs.write(&posix, &[]))
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            match existing {
+                Some(entry) => {
+                    size = entry.size;
+                    needs_existing = true;
+                }
+                None => {
+                    self.block_on(self.fs.write(&posix, &[]))
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
             }
         }
         let entry = DirEntry {
             name: posix.clone(),
             is_dir,
-            size: 0,
+            size,
             mtime_secs: 0,
         };
         let write_buf = if is_dir { None } else { Some(Vec::new()) };
@@ -727,7 +740,12 @@ impl FileSystemContext for OssMountContext {
             path: posix,
             is_dir,
             write_buf: Mutex::new(write_buf),
-            loaded: AtomicBool::new(true),
+            // Mirrors the FUSE adapter's `loaded: !needs_existing`: only a
+            // brand-new file's empty buffer is authoritative. For an existing
+            // file (the security lookup raced a concurrent create/rename),
+            // the first write lazy-loads the object so it merges instead of
+            // zero-filling over the content.
+            loaded: AtomicBool::new(!needs_existing),
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
             dir_buffer: DirBuffer::new(),

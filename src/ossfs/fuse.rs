@@ -75,6 +75,14 @@ fn is_regular_file_mode(mode: u32) -> bool {
     mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
 }
 
+/// True when a CREATE with these open flags conflicts with an existing path:
+/// `O_CREAT|O_EXCL` must fail `EEXIST` instead of silently opening (or, with
+/// `O_TRUNC`, clobbering) the existing object. Without it, `open(O_EXCL)`
+/// behaves like a plain `O_CREAT` open.
+fn create_conflicts(flags: i32, existing: bool) -> bool {
+    existing && flags & libc::O_EXCL != 0
+}
+
 /// Join a parent path and a name into a normalized POSIX path.
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
@@ -490,6 +498,14 @@ impl OssFs {
     /// - S3 permission errors (`AccessDenied`, `SignatureDoesNotMatch`, ...)
     ///   map to `EACCES`;
     /// - everything else stays `EIO`.
+    ///
+    /// Marker matching walks the whole `anyhow` chain: ObjectFs contexts
+    /// sometimes embed the object path (`bail!("directory {old} ...")`), so a
+    /// path that itself contains a marker word (e.g. a directory named
+    /// `forbidden`) can be misclassified as `EACCES`. S3 service errors carry
+    /// the error code rather than the key, so in practice the markers fire on
+    /// real 403s; the residual risk only shifts the errno class of an
+    /// operation that failed anyway.
     fn errno_for(&self, e: &anyhow::Error, mutation: bool) -> Errno {
         if mutation && self.fs.read_only() {
             return Errno::EROFS;
@@ -980,6 +996,12 @@ impl Filesystem for OssFs {
                 return;
             }
         };
+        if create_conflicts(flags, existing.is_some()) {
+            // POSIX: O_CREAT|O_EXCL on an existing path is EEXIST, not a
+            // silent open (or truncate) of the existing object.
+            reply.error(Errno::EEXIST);
+            return;
+        }
         if let Some(entry) = &existing
             && entry.is_dir
         {
@@ -989,7 +1011,10 @@ impl Filesystem for OssFs {
         let needs_existing = existing.is_some() && !truncate;
         // A brand-new file has no S3 object yet; create the empty object now
         // so that subsequent GETATTR (e.g. the NFS/FUSE client stat after
-        // create) finds it instead of ENOENT.
+        // create) finds it instead of ENOENT. (TOCTOU: a concurrent rename
+        // could land on this path between the stat and the PUT and be
+        // clobbered by the empty object; closing that needs a conditional
+        // PutObject — If-None-Match:* — which ObjectFs does not expose yet.)
         if existing.is_none()
             && let Err(e) = self.block_on(self.fs.write(&path, &[]))
         {
@@ -1889,6 +1914,20 @@ mod tests {
     }
 
     #[test]
+    fn create_o_excl_conflicts_only_with_existing_path() {
+        let excl = libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL;
+        assert!(
+            create_conflicts(excl, true),
+            "O_CREAT|O_EXCL on an existing path must fail EEXIST"
+        );
+        assert!(!create_conflicts(excl, false));
+        assert!(
+            !create_conflicts(libc::O_CREAT | libc::O_WRONLY, true),
+            "plain O_CREAT still opens an existing file"
+        );
+    }
+
+    #[test]
     fn epoch_maps_nonpositive_to_unix_epoch() {
         assert_eq!(epoch(0), UNIX_EPOCH);
         assert_eq!(epoch(-5), UNIX_EPOCH);
@@ -2074,7 +2113,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn errno_for_access_denied_is_eacces() {
-        use anyhow::Context as _;
         let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
         let oss = test_oss(port, None);
         let err = anyhow::anyhow!("service error: PutObject: AccessDenied (400)");
