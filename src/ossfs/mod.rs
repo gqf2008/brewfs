@@ -1250,6 +1250,13 @@ pub struct StreamingUpload {
 }
 
 impl StreamingUpload {
+    /// Object key this upload writes to (immutable once started). Adapters
+    /// compare it against the handle's current path so a rename cannot make
+    /// a flush resurrect the deleted old object (#46).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Feed `data` into the upload. Buffers until a full part is ready, then
     /// uploads it in the background.
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
