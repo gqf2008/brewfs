@@ -1,11 +1,16 @@
 //! Data model for the OSSFS tray app: saved mount profiles and live
 //! `ossmount` instance records read from the runtime registry.
 
+use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::secrets::{Credentials, SecretStore};
 
 // ---------------------------------------------------------------------------
 // Saved mount profiles
@@ -26,8 +31,16 @@ pub struct Profile {
     pub s3_disable_payload_checksum: bool,
     /// Optional object-key namespace for OSS direct mode (e.g. "myns/").
     pub prefix: String,
+    /// In-memory credential fields. On disk they are only written when the
+    /// OS secure store is unavailable (warned plaintext fallback); after a
+    /// successful [`load_profiles`] they are repopulated from the store.
     pub access_key: String,
     pub secret_key: String,
+    /// Key of this profile's credentials inside the OS secure store
+    /// (Windows Credential Manager / macOS Keychain, service `ossfs-tray`).
+    /// Absent = legacy plaintext profile not yet migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
 }
 
 /// Default mount point for a fresh config. Windows uses drive letters and the
@@ -57,6 +70,7 @@ impl Default for Profile {
             prefix: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            secret_ref: None,
         }
     }
 }
@@ -150,6 +164,7 @@ impl Profile {
             prefix: get_str("prefix"),
             access_key: get_str("access_key_id"),
             secret_key: get_str("secret_access_key"),
+            secret_ref: None,
         })
     }
 }
@@ -167,21 +182,323 @@ pub fn profiles_path() -> PathBuf {
         .join("profiles.json")
 }
 
-pub fn load_profiles() -> ProfilesFile {
-    let path = profiles_path();
-    match fs::read(&path) {
-        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
-        Err(_) => ProfilesFile::default(),
-    }
+/// Result of loading the profiles file.
+#[derive(Debug)]
+pub struct LoadProfilesResult {
+    pub file: ProfilesFile,
+    /// User-visible, non-fatal problems (corrupt file recovered, secure
+    /// store unavailable, credentials missing from the store, ...).
+    pub warnings: Vec<String>,
 }
 
-pub fn save_profiles(file: &ProfilesFile) -> std::io::Result<()> {
-    let path = profiles_path();
+/// Result of saving the profiles file.
+#[derive(Debug, Default)]
+pub struct SaveProfilesResult {
+    /// User-visible, non-fatal problems (warned plaintext fallback).
+    pub warnings: Vec<String>,
+}
+
+pub fn load_profiles() -> LoadProfilesResult {
+    load_profiles_from(crate::secrets::system_store(), &profiles_path())
+}
+
+pub fn save_profiles(file: &ProfilesFile) -> io::Result<SaveProfilesResult> {
+    save_profiles_to(crate::secrets::system_store(), &profiles_path(), file)
+}
+
+/// Load profiles from `path`, resolving credentials from the secure store
+/// and migrating legacy plaintext credentials into it.
+pub fn load_profiles_from(store: Option<&dyn SecretStore>, path: &Path) -> LoadProfilesResult {
+    let mut warnings = Vec::new();
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return LoadProfilesResult {
+                file: ProfilesFile::default(),
+                warnings,
+            };
+        }
+        Err(e) => {
+            warnings.push(format!("无法读取配置文件 {}: {e}", path.display()));
+            return LoadProfilesResult {
+                file: ProfilesFile::default(),
+                warnings,
+            };
+        }
+    };
+    let mut file: ProfilesFile = match serde_json::from_slice(&raw) {
+        Ok(file) => file,
+        Err(e) => {
+            // Never silently reset: report the corruption and keep the
+            // original bytes as a timestamped backup next to the file.
+            match backup_corrupt_file(path) {
+                Some(backup) => warnings.push(format!(
+                    "配置文件已损坏（{e}），已重置为空配置；原文件备份在 {}，请手动找回需要的配置",
+                    backup.display()
+                )),
+                None => warnings.push(format!(
+                    "配置文件已损坏（{e}），已重置为空配置；原文件保留在 {}（无法自动备份，请手动处理）",
+                    path.display()
+                )),
+            }
+            return LoadProfilesResult {
+                file: ProfilesFile::default(),
+                warnings,
+            };
+        }
+    };
+
+    let mut migrated = false;
+    for p in &mut file.profiles {
+        if p.secret_ref.as_deref() == Some("") {
+            p.secret_ref = None;
+        }
+        match p.secret_ref.as_deref() {
+            Some(secret_ref) => match store {
+                None => {
+                    if p.access_key.is_empty() && p.secret_key.is_empty() {
+                        // The credentials live only in the (here unavailable)
+                        // secure store; there is no plaintext to fall back to.
+                        warnings.push(format!(
+                            "本平台无系统安全存储，配置「{}」的凭据仅保存在系统安全存储中，本次无法读取；挂载前请重新填写 AccessKey/SecretKey",
+                            p.name
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 以明文保存在 {}",
+                            p.name,
+                            path.display()
+                        ));
+                    }
+                }
+                Some(store) => match store.get(secret_ref) {
+                    Ok(Some(creds)) => {
+                        p.access_key = creds.access_key;
+                        p.secret_key = creds.secret_key;
+                    }
+                    Ok(None) => warnings.push(format!(
+                        "配置「{}」的凭据不在系统安全存储中（可能已被清除），请重新填写 AccessKey/SecretKey",
+                        p.name
+                    )),
+                    Err(e) => warnings.push(format!(
+                        "读取配置「{}」的凭据失败（{e}），如文件内无明文凭据则需重新填写",
+                        p.name
+                    )),
+                },
+            },
+            None if !p.secret_key.is_empty() || !p.access_key.is_empty() => {
+                // Legacy plaintext profile: migrate into the secure store
+                // now; the sanitized file is persisted right after.
+                match store {
+                    Some(store) => {
+                        let secret_ref = format!("profile-{}", new_secret_ref_suffix());
+                        let creds = Credentials {
+                            access_key: p.access_key.clone(),
+                            secret_key: p.secret_key.clone(),
+                        };
+                        match store.put(&secret_ref, &creds) {
+                            Ok(()) => {
+                                p.secret_ref = Some(secret_ref);
+                                migrated = true;
+                            }
+                            Err(e) => warnings.push(format!(
+                                "迁移配置「{}」的密钥到系统安全存储失败（{e}），将继续以明文保存",
+                                p.name
+                            )),
+                        }
+                    }
+                    None => warnings.push(format!(
+                        "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 将以明文保存在 {}",
+                        p.name,
+                        path.display()
+                    )),
+                }
+            }
+            None => {}
+        }
+    }
+
+    // A migration happened: persist the sanitized file so the plaintext
+    // credentials actually leave the disk (store already holds them).
+    if migrated {
+        match save_profiles_to(store, path, &file) {
+            Ok(res) => warnings.extend(res.warnings),
+            Err(e) => warnings.push(format!(
+                "移除配置文件中的明文密钥失败（{e}），明文暂仍保留在 {}",
+                path.display()
+            )),
+        }
+    }
+
+    LoadProfilesResult { file, warnings }
+}
+
+/// Persist `file` to `path` atomically (temp file + rename), moving the
+/// credentials of every profile into the secure store first so the JSON on
+/// disk contains no plaintext secrets (unless the store is unavailable —
+/// in that case the plaintext fallback is kept and a warning returned).
+pub fn save_profiles_to(
+    store: Option<&dyn SecretStore>,
+    path: &Path,
+    file: &ProfilesFile,
+) -> io::Result<SaveProfilesResult> {
+    let mut warnings = Vec::new();
+
+    let old_refs: HashSet<String> = fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ProfilesFile>(&raw).ok())
+        .map(|old| {
+            old.profiles
+                .iter()
+                .filter_map(|p| p.secret_ref.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut sanitized = ProfilesFile {
+        profiles: Vec::with_capacity(file.profiles.len()),
+    };
+    let mut new_refs: HashSet<String> = HashSet::new();
+    for p in &file.profiles {
+        let mut q = p.clone();
+        let has_creds = !(q.secret_key.is_empty() && q.access_key.is_empty());
+        if !has_creds && q.secret_ref.as_deref().map_or(true, |r| r.is_empty()) {
+            // No credentials and no store entry: nothing to protect.
+            sanitized.profiles.push(q);
+            continue;
+        }
+        if has_creds && q.secret_ref.as_deref().map_or(true, |r| r.is_empty()) {
+            q.secret_ref = Some(format!("profile-{}", new_secret_ref_suffix()));
+        }
+        let secret_ref = q.secret_ref.clone().unwrap_or_default();
+        // A profile that keeps its ref while its in-memory credentials are
+        // empty is one whose store entry could not be READ at load time
+        // (locked keychain, transient failure): the store entry is the only
+        // copy of the credentials, so it must be neither rewritten nor
+        // treated as an orphan below.
+        let mut protected = !has_creds;
+        if has_creds {
+            match store {
+                Some(store) => {
+                    let creds = Credentials {
+                        access_key: q.access_key.clone(),
+                        secret_key: q.secret_key.clone(),
+                    };
+                    match store.put(&secret_ref, &creds) {
+                        Ok(()) => protected = true,
+                        Err(e) => warnings.push(format!(
+                            "写入配置「{}」的密钥到系统安全存储失败（{e}），AccessKey/SecretKey 将以明文保存在 {}",
+                            q.name,
+                            path.display()
+                        )),
+                    }
+                }
+                None => warnings.push(format!(
+                    "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 将以明文保存在 {}",
+                    q.name,
+                    path.display()
+                )),
+            }
+        }
+        if protected {
+            q.access_key.clear();
+            q.secret_key.clear();
+            new_refs.insert(secret_ref);
+        } else {
+            // Plaintext fallback: drop the ref as well. Invariant — a ref in
+            // the file exists exactly while the credentials are protected in
+            // the store. Keeping a ref next to (newer) plaintext would let a
+            // later load with a healthy store clobber that plaintext with the
+            // stale store entry, silently reverting the user's credentials.
+            q.secret_ref = None;
+        }
+        sanitized.profiles.push(q);
+    }
+
+    write_profiles_atomic(path, &sanitized)?;
+
+    // Best-effort cleanup of secrets that the file no longer references
+    // (profile deleted, or ref dropped by the plaintext fallback above).
+    if let Some(store) = store {
+        for orphan in old_refs.difference(&new_refs) {
+            let _ = store.delete(orphan);
+        }
+    }
+
+    Ok(SaveProfilesResult { warnings })
+}
+
+/// Atomically replace `path` with the JSON of `file`: write a sibling temp
+/// file, fsync it, then rename over the target. A crash mid-write can never
+/// truncate an existing profiles.json.
+fn write_profiles_atomic(path: &Path, file: &ProfilesFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
-    fs::write(path, data)
+    let data = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
+    let tmp = sibling_temp_path(path);
+    let write = || -> io::Result<()> {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // The file may contain credential fallbacks; restrict it to the current
+    // user. (%APPDATA% is already per-user on Windows.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn sibling_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("profiles.json"),
+        std::ffi::OsStr::to_owned,
+    );
+    name.push(format!(".tmp-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Rename a corrupt profiles file aside as `<name>.corrupt-<unix-ts>`.
+/// Returns `None` when the original could not be moved (it then stays in
+/// place for manual inspection).
+fn backup_corrupt_file(path: &Path) -> Option<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut name = path.file_name()?.to_owned();
+    name.push(format!(".corrupt-{ts}"));
+    let backup = path.with_file_name(name);
+    fs::rename(path, &backup).ok()?;
+    Some(backup)
+}
+
+/// Generate an opaque per-process-unique secret-store key suffix
+/// (timestamp + pid + monotonic counter).
+fn new_secret_ref_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}-{n:x}-{:x}", std::process::id())
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +800,7 @@ pub fn read_log_tail(path: &Path, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::memory::MemoryStore;
 
     fn oss_profile() -> Profile {
         Profile {
@@ -495,6 +813,312 @@ mod tests {
             secret_key: "sk".into(),
             ..Profile::default()
         }
+    }
+
+    fn temp_profiles_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ossfs-tray-model-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("profiles.json")
+    }
+
+    fn credentialed_profile() -> Profile {
+        Profile {
+            name: "OSS".into(),
+            mode: "oss".into(),
+            drive: "Z:".into(),
+            s3_bucket: "my-bucket".into(),
+            s3_endpoint: "https://s3.example.com".into(),
+            access_key: "AKIA-test-123".into(),
+            secret_key: "topsecret-456".into(),
+            ..Profile::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #56 secure credential storage + atomic profiles.json
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn save_moves_secrets_out_of_profiles_json() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("save-sanitize");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        let res = save_profiles_to(Some(&store), &path, &file).unwrap();
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !raw.contains("topsecret-456"),
+            "plaintext SecretKey must not be written to profiles.json: {raw}"
+        );
+        assert!(
+            !raw.contains("AKIA-test-123"),
+            "plaintext AccessKey must not be written to profiles.json: {raw}"
+        );
+        assert!(raw.contains("secret_ref"), "store key must be kept: {raw}");
+        // In memory the profile keeps its credentials for the running app.
+        assert_eq!(file.profiles[0].secret_key, "topsecret-456");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_resolves_credentials_from_store() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("load-from-store");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+
+        let out = load_profiles_from(Some(&store), &path);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.file.profiles.len(), 1);
+        let p = &out.file.profiles[0];
+        assert_eq!(p.access_key, "AKIA-test-123");
+        assert_eq!(p.secret_key, "topsecret-456");
+        assert!(p.secret_ref.is_some());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_into_store_and_sanitizes_file() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("legacy-migrate");
+        let legacy = serde_json::json!({
+            "profiles": [{
+                "name": "legacy",
+                "mode": "oss",
+                "drive": "Z:",
+                "s3_bucket": "b",
+                "s3_endpoint": "https://e",
+                "s3_region": "",
+                "s3_force_path_style": false,
+                "s3_disable_payload_checksum": true,
+                "prefix": "",
+                "access_key": "AKIA-legacy",
+                "secret_key": "legacy-secret"
+            }]
+        });
+        fs::write(&path, legacy.to_string()).unwrap();
+
+        let out = load_profiles_from(Some(&store), &path);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let p = &out.file.profiles[0];
+        // Repopulated in memory for the running app...
+        assert_eq!(p.access_key, "AKIA-legacy");
+        assert_eq!(p.secret_key, "legacy-secret");
+        // ...stored in the secure store...
+        let secret_ref = p.secret_ref.clone().expect("migrated ref");
+        assert!(store.contains(&secret_ref));
+        // ...and removed from the on-disk JSON right away.
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(!raw.contains("legacy-secret"), "{raw}");
+        assert!(!raw.contains("AKIA-legacy"), "{raw}");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn corrupt_profiles_file_is_backed_up_and_reported() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("corrupt-backup");
+        let garbage = "{\"profiles\": [ truncated";
+        fs::write(&path, garbage).unwrap();
+
+        let out = load_profiles_from(Some(&store), &path);
+        assert!(out.file.profiles.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("损坏"), "{:?}", out.warnings);
+
+        let dir = path.parent().unwrap();
+        let backups: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("profiles.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one timestamped backup");
+        assert_eq!(
+            fs::read_to_string(backups[0].path()).unwrap(),
+            garbage,
+            "backup must keep the original bytes"
+        );
+        assert!(!path.exists(), "corrupt file must be moved aside");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unavailable_store_keeps_plaintext_with_warning() {
+        let path = temp_profiles_path("no-store-fallback");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        let res = save_profiles_to(None, &path, &file).unwrap();
+        assert!(
+            !res.warnings.is_empty(),
+            "plaintext fallback must be warned"
+        );
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(raw.contains("topsecret-456"), "{raw}");
+
+        let out = load_profiles_from(None, &path);
+        assert_eq!(out.file.profiles[0].secret_key, "topsecret-456");
+        assert!(!out.warnings.is_empty(), "loading must warn too");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_files() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("atomic");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+        // Save again over the existing file: the rename-replace path.
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+
+        let dir = path.parent().unwrap();
+        let names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["profiles.json".to_string()],
+            "no temp files may survive the atomic write: {names:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removed_profile_secret_is_deleted_from_store() {
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("orphan-cleanup");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile(), oss_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+        assert_eq!(store.len(), 2);
+
+        let mut reloaded = load_profiles_from(Some(&store), &path).file;
+        reloaded.profiles.pop();
+        save_profiles_to(Some(&store), &path, &reloaded).unwrap();
+        assert_eq!(store.len(), 1, "orphaned secret must be deleted");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_file_is_user_read_write_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("perms");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "profiles.json must be 0600");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn secret_ref_suffixes_are_unique() {
+        let a = new_secret_ref_suffix();
+        let b = new_secret_ref_suffix();
+        assert_ne!(a, b);
+    }
+
+    /// A store whose `put` always fails (simulates a locked keychain while
+    /// the entry itself remains readable).
+    struct PutFailStore(MemoryStore);
+
+    impl SecretStore for PutFailStore {
+        fn put(&self, _: &str, _: &Credentials) -> Result<(), crate::secrets::StoreError> {
+            Err(crate::secrets::StoreError::Failure(
+                "simulated keychain write failure".into(),
+            ))
+        }
+        fn get(&self, r: &str) -> Result<Option<Credentials>, crate::secrets::StoreError> {
+            self.0.get(r)
+        }
+        fn delete(&self, r: &str) -> Result<(), crate::secrets::StoreError> {
+            self.0.delete(r)
+        }
+    }
+
+    #[test]
+    fn save_keeps_store_entry_of_profile_with_unread_credentials() {
+        // Regression: a profile whose credentials could not be READ from the
+        // store at load time (locked keychain) keeps its ref with empty
+        // in-memory credentials. Saving in that state must NOT delete the
+        // store entry — it is the only remaining copy of the credentials.
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("keep-unreadable-entry");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+        assert_eq!(store.len(), 1);
+
+        let mut loaded = load_profiles_from(Some(&store), &path).file;
+        loaded.profiles[0].access_key.clear();
+        loaded.profiles[0].secret_key.clear();
+        save_profiles_to(Some(&store), &path, &loaded).unwrap();
+
+        assert_eq!(store.len(), 1, "store entry must survive the save");
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw.contains("secret_ref"),
+            "ref must stay in the file so the entry stays reachable: {raw}"
+        );
+        // And a healthy load still resolves the credentials.
+        let healthy = load_profiles_from(Some(&store), &path);
+        assert!(healthy.warnings.is_empty(), "{:?}", healthy.warnings);
+        assert_eq!(healthy.file.profiles[0].secret_key, "topsecret-456");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_store_write_drops_ref_next_to_plaintext() {
+        // Regression: when the store write fails, the plaintext fallback must
+        // also DROP the secret_ref. Keeping a ref next to (newer) plaintext
+        // would let the next load with a healthy store clobber that plaintext
+        // with the stale store entry, silently reverting the credentials.
+        let real = MemoryStore::new();
+        let path = temp_profiles_path("put-fail-drops-ref");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&real), &path, &file).unwrap();
+
+        // User rotates the secret; the next save hits a broken store.
+        let mut rotated = load_profiles_from(Some(&real), &path).file;
+        rotated.profiles[0].secret_key = "rotated-789".into();
+        let failing = PutFailStore(real);
+        let res = save_profiles_to(Some(&failing), &path, &rotated).unwrap();
+        assert!(!res.warnings.is_empty(), "fallback must be warned");
+
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw.contains("rotated-789"),
+            "plaintext fallback must keep the NEW secret: {raw}"
+        );
+        assert!(
+            !raw.contains("secret_ref"),
+            "ref must be dropped so a stale entry cannot clobber the plaintext: {raw}"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(not(windows))]

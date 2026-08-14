@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -122,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -154,9 +154,17 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          # 版本号来自 `cargo metadata`（单一受校验来源），不再对 Cargo.toml 做
+          # "取第一个 version =" 的脆弱文本提取；两个包版本必须一致，否则发版
+          # 产物会贴错版本号（历史上 root=0.1.6 / desktop=0.1.5 曾发生漂移）。
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object { $_.name -eq "ossfs" }).version
+          if ([string]::IsNullOrEmpty($version)) { throw "cannot resolve ossfs version from cargo metadata" }
+          $trayVersion = ($meta.packages | Where-Object { $_.name -eq "ossfs-tray" }).version
+          if ([string]::IsNullOrEmpty($trayVersion)) { throw "cannot resolve ossfs-tray version from cargo metadata" }
+          if ($version -ne $trayVersion) { throw "version mismatch: ossfs=$version but ossfs-tray=$trayVersion; sync desktop/Cargo.toml before releasing" }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "VERSION=$version"
+          Write-Host "VERSION=$version (ossfs-tray=$trayVersion)"
           & powershell -ExecutionPolicy Bypass -File desktop\installer\build-installer.ps1 -Version $version
           if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
 

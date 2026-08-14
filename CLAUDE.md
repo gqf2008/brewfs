@@ -31,10 +31,16 @@ Windows (OSS mount + tray) — mirror the CI `windows` job:
 
 ```bash
 cargo check -p ossfs --no-default-features --features fuse-winfsp
-cargo test -p ossfs --no-default-features --features fuse-winfsp --lib --bins
+cargo test -p ossfs --no-default-features --features fuse-winfsp --lib --bins --tests
+cargo clippy -p ossfs --no-default-features --features fuse-winfsp --lib --bins
 cargo check -p ossfs-tray --all-targets
+cargo clippy -p ossfs-tray --all-targets
 cargo test -p ossfs-tray
 ```
+
+macOS — mirror the CI `macos` job (`cargo check --workspace` /
+`cargo clippy --workspace` cover the `#[cfg(target_os = "macos")]` surface;
+no FUSE-T needed to build).
 
 ## Key files
 

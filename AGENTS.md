@@ -45,10 +45,20 @@ Windows-specific (the OSS mount path) — mirror the CI `windows` job:
 
 ```bash
 cargo check -p ossfs --no-default-features --features fuse-winfsp
-cargo test -p ossfs --no-default-features --features fuse-winfsp --lib --bins
+cargo test -p ossfs --no-default-features --features fuse-winfsp --lib --bins --tests
 cargo clippy -p ossfs --no-default-features --features fuse-winfsp --lib --bins
 cargo check -p ossfs-tray --all-targets
+cargo clippy -p ossfs-tray --all-targets
 cargo test -p ossfs-tray
+```
+
+macOS-specific — mirror the CI `macos` job (compiles/lints the
+`#[cfg(target_os = "macos")]` surface; no FUSE-T install needed to build):
+
+```bash
+cargo check --workspace
+cargo clippy --workspace
+cargo test --workspace --lib --bins --tests -- --test-threads=1
 ```
 
 ## OSSFS-Specific Guardrails
