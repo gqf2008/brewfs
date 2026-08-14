@@ -105,12 +105,12 @@ pub struct OssConfig {
     /// AWS credential-process JSON. Takes precedence over env/profile creds.
     pub credential_process: Option<String>,
     /// Socket connect timeout in seconds (mirrors aliyun/ossfs
-    /// `connect_timeout`). `None` uses [`DEFAULT_CONNECT_TIMEOUT_SECS`].
+    /// `connect_timeout`). `None` uses `DEFAULT_CONNECT_TIMEOUT_SECS`.
     pub connect_timeout_secs: Option<u64>,
     /// Read timeout in seconds (mirrors aliyun/ossfs `readwrite_timeout`).
     /// Bounds each S3 request — including the time to send its body — so a
     /// stalled connection errors out and retries instead of hanging the
-    /// mount. `None` uses [`DEFAULT_READWRITE_TIMEOUT_SECS`].
+    /// mount. `None` uses `DEFAULT_READWRITE_TIMEOUT_SECS`.
     pub readwrite_timeout_secs: Option<u64>,
     /// Additional retry attempts after the initial request (mirrors
     /// aliyun/ossfs `retries`). `None` keeps the SDK default.
@@ -337,13 +337,17 @@ impl OssConfig {
             self.prefix.push('/');
         }
         // Timeouts default ON. The SDK ships only a 3.1s connect timeout and
-        // NO read timeout, so a silently-stalled connection (NAT/firewall
-        // drop, OSS throttling) parks the request forever. A wedged request
-        // holds an S3 limiter permit — and, for multipart parts, a part slot
-        // plus the write feeder's stream lock — which froze Explorer copies
-        // mid-file and silently swallowed deferred-close uploads under heavy
-        // multi-file copy load. `Some(0)` is treated as unset so the CLI's
-        // `--*-timeout 0` keeps meaning "use the default".
+        // no read timeout for the request-to-response-HEAD wait (fully
+        // stalled response bodies are covered by the SDK's default
+        // StalledStreamProtection, but response-HEAD waits and request-send
+        // stalls are not). A connection that silently stalls there (NAT/
+        // firewall drop, OSS throttling) parks the request forever, and a
+        // wedged request holds an S3 limiter permit — and, for multipart
+        // parts, a part slot plus the write feeder's stream lock — which
+        // froze Explorer copies mid-file and silently swallowed
+        // deferred-close uploads under heavy multi-file copy load. `Some(0)`
+        // is treated as unset so the CLI's `--*-timeout 0` keeps meaning
+        // "use the default".
         if self.connect_timeout_secs.unwrap_or(0) == 0 {
             self.connect_timeout_secs = Some(DEFAULT_CONNECT_TIMEOUT_SECS);
         }
@@ -393,10 +397,12 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default request read timeout. The smithy "read timeout" bounds sending the
 /// request (including its body) plus waiting for the **response headers** —
 /// it does NOT bound streaming the response body, so large downloads are
-/// never cut off mid-stream. The default must tolerate an 8 MiB multipart
-/// part over a slow uplink: 600 s keeps the minimum effective per-request
-/// upload rate at ~14 KB/s while guaranteeing a stalled request errors out
-/// (and the SDK retries) instead of hanging the mount forever.
+/// never cut off mid-stream. The default must tolerate the largest single
+/// request body over a slow uplink: 8 MiB multipart parts (~14 KB/s floor)
+/// and up to the 16 MiB whole-object PUT threshold (~27 KB/s floor). Raising
+/// `--multipart-size` beyond 8 MiB must co-raise this value (a part needs
+/// part_size / 600s of uplink). 600 s guarantees a stalled request errors
+/// out (and the SDK retries) instead of hanging the mount forever.
 const DEFAULT_READWRITE_TIMEOUT_SECS: u64 = 600;
 /// Above this size, `write` uploads via S3 multipart (bounded-concurrency
 /// parts) instead of a single PUT. A single PUT is capped at 5 GiB by OSS/S3
@@ -491,6 +497,24 @@ fn min_free_bytes(reserve: u64, ratio: Option<f64>, total: u64) -> u64 {
 /// to the AWS SDK `max_attempts` (total attempts: initial + retries).
 fn s3_max_attempts(retries: u32) -> u32 {
     retries.saturating_add(1).max(1)
+}
+
+/// Build the SDK timeout config for the mount. `None` fields fall back to
+/// the [`DEFAULT_*_TIMEOUT_SECS`] defaults (normalize() already guarantees
+/// this; the fallback exists so a direct construction can never silently
+/// regress to the SDK's no-read-timeout default).
+fn s3_timeout_config(
+    connect_secs: Option<u64>,
+    read_secs: Option<u64>,
+) -> aws_smithy_types::timeout::TimeoutConfig {
+    aws_smithy_types::timeout::TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(
+            connect_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        ))
+        .read_timeout(Duration::from_secs(
+            read_secs.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
+        ))
+        .build()
 }
 
 /// Resolve [`OssConfig::max_upload_bytes`] into a number of MiB permits.
@@ -1375,21 +1399,14 @@ impl ObjectFs {
         if let Some(command) = &config.credential_process {
             builder = builder.credentials_provider(CredentialProcessProvider::new(command.clone()));
         }
-        if config.connect_timeout_secs.is_some() || config.readwrite_timeout_secs.is_some() {
-            let mut timeout = aws_smithy_types::timeout::TimeoutConfig::builder();
-            if let Some(secs) = config.connect_timeout_secs {
-                timeout = timeout.connect_timeout(Duration::from_secs(secs));
-            }
-            if let Some(secs) = config.readwrite_timeout_secs {
-                timeout = timeout.read_timeout(Duration::from_secs(secs));
-            }
-            let existing = loader
-                .timeout_config()
-                .cloned()
-                .map(aws_smithy_types::timeout::TimeoutConfig::into_builder)
-                .unwrap_or_else(aws_smithy_types::timeout::TimeoutConfig::builder);
-            builder = builder.timeout_config(timeout.take_unset_from(existing).build());
-        }
+        // Request timeouts are always set: post-normalize both fields are
+        // Some, and falling back to the loader's timeout config would
+        // reintroduce the SDK's no-read-timeout default — the wedge this
+        // guards against. See `s3_timeout_config`.
+        builder = builder.timeout_config(s3_timeout_config(
+            config.connect_timeout_secs,
+            config.readwrite_timeout_secs,
+        ));
         if let Some(retries) = config.retries {
             builder = builder.retry_config(
                 aws_smithy_types::retry::RetryConfig::standard()
@@ -3488,12 +3505,34 @@ mod tests {
     }
 
     #[test]
+    fn s3_timeout_config_always_sets_both_timeouts() {
+        // The SDK's own default has no read timeout; any path that lets a
+        // None through to the client builder would reintroduce the
+        // permanent-wedge bug. Explicit values win, None falls back to the
+        // defaults.
+        let explicit = s3_timeout_config(Some(3), Some(120));
+        assert_eq!(explicit.connect_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(explicit.read_timeout(), Some(Duration::from_secs(120)));
+
+        let fallback = s3_timeout_config(None, None);
+        assert_eq!(
+            fallback.connect_timeout(),
+            Some(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        );
+        assert_eq!(
+            fallback.read_timeout(),
+            Some(Duration::from_secs(DEFAULT_READWRITE_TIMEOUT_SECS))
+        );
+    }
+
+    #[test]
     fn normalize_defaults_request_timeouts() {
         // Regression: the SDK ships no read timeout, so a silently-stalled
         // connection held its limiter permit / part slot forever and froze
-        // writes under heavy copy load. Unset (and explicit 0, which the CLI
-        // maps to None) must fall back to real defaults, while an explicit
-        // value is preserved.
+        // writes under heavy copy load. Unset must fall back to real
+        // defaults while an explicit value is preserved (`Some(0)` is only
+        // constructible directly — CLI flags and the config file both map 0
+        // to unset — and is treated as unset too).
         let base = || OssConfig {
             bucket: "b".into(),
             region: "cn-shanghai".into(),
