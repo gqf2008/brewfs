@@ -888,7 +888,8 @@ impl FileSystemContext for OssMountContext {
         let old = win_path_to_posix(file_name);
         let new = win_path_to_posix(new_file_name);
         let fs = Arc::clone(&self.fs);
-        self.block_on(async move { fs.rename(&old, &new, replace_if_exists).await })
+        let new_for_upload = new.clone();
+        self.block_on(async move { fs.rename(&old, &new_for_upload, replace_if_exists).await })
             .map_err(|e| {
                 let io = IoError::other(e.to_string());
                 if e.to_string().contains("target already exists") {
@@ -1059,11 +1060,8 @@ impl AsyncFileSystemContext for OssMountContext {
                 }
             }
         }
-        match self
-            .fs
-            .read_range(&*context.path.lock().unwrap(), offset, buffer.len())
-            .await
-        {
+        let read_path = context.path.lock().unwrap().clone();
+        match self.fs.read_range(&read_path, offset, buffer.len()).await {
             Ok(data) => {
                 let n = data.len().min(buffer.len());
                 buffer[..n].copy_from_slice(&data[..n]);
@@ -1114,7 +1112,8 @@ impl AsyncFileSystemContext for OssMountContext {
                     ))));
                 }
                 // Keep the read-back spool in sync with the stream (#47).
-                if let Some(path) = context.spool_path.lock().unwrap().clone() {
+                let spool = context.spool_path.lock().unwrap().clone();
+                if let Some(path) = spool {
                     let mut f = tokio::fs::OpenOptions::new()
                         .append(true)
                         .open(&path)
@@ -1155,9 +1154,10 @@ impl AsyncFileSystemContext for OssMountContext {
         // the stat would be dead work).
         if !context.loaded.load(Ordering::Acquire) {
             if self.dirty_budget.is_some() {
+                let stat_path = context.path.lock().unwrap().clone();
                 let remote_size = self
                     .fs
-                    .stat(&*context.path.lock().unwrap())
+                    .stat(&stat_path)
                     .await
                     .ok()
                     .flatten()
@@ -1203,7 +1203,7 @@ impl AsyncFileSystemContext for OssMountContext {
             let existing = context.write_buf.lock().unwrap().clone();
             let mut up = self
                 .fs
-                .begin_streaming_upload(&*context.path.lock().unwrap())
+                .begin_streaming_upload(&context.path.lock().unwrap().clone())
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             if let Some(existing) = &existing
