@@ -302,21 +302,32 @@ impl OssFs {
             return Ok(());
         }
         if let Some(buf) = open.write_buf.as_ref() {
-            let mut data = buf.clone();
             // #49: setattr truncate/extend on an open handle records
             // `logical_size` without resizing the buffer, so a flush would
             // upload the untruncated original bytes. Materialize the logical
             // size here (truncate when longer, zero-fill when shorter); a
             // lazily-loaded handle that never loaded must fetch the original
-            // object first (read-modify-write).
+            // object first (read-modify-write), gated on the dirty budget.
             let logical = open.logical_size as usize;
-            if logical != data.len() {
+            if logical == buf.len() {
+                self.fs.write(&open.path, buf).await?;
+            } else {
+                let mut data = buf.clone();
                 if !open.loaded && logical > 0 {
+                    let remote_size = self
+                        .fs
+                        .stat(&open.path)
+                        .await?
+                        .map(|e| e.size as usize)
+                        .unwrap_or(0);
+                    self.reserve_dirty(open, remote_size).await?;
                     data = self.fs.read_range(&open.path, 0, usize::MAX).await?;
+                    self.reserve_dirty(open, data.len()).await?;
                 }
+                self.reserve_dirty(open, logical).await?;
                 data.resize(logical, 0);
+                self.fs.write(&open.path, &data).await?;
             }
-            self.fs.write(&open.path, &data).await?;
         }
         Ok(())
     }
@@ -969,7 +980,18 @@ impl Filesystem for OssFs {
                 if !o.loaded
                     && let Some(buf) = o.write_buf.as_mut()
                 {
-                    *buf = data;
+                    // Seeding must keep `logical_size` authoritative (#48
+                    // review): a pending setattr truncate/extend is
+                    // materialized here; otherwise a partial overwrite of a
+                    // larger object would be truncated to the write's end on
+                    // flush (data loss).
+                    let logical = o.logical_size;
+                    let mut seeded = data;
+                    if logical > 0 {
+                        seeded.resize(logical as usize, 0);
+                    }
+                    *buf = seeded;
+                    o.logical_size = (buf.len() as u64).max(logical);
                     o.loaded = true;
                 }
             }
@@ -1847,6 +1869,41 @@ mod tests {
             recorded.iter().filter(|r| r.method == "PUT").count(),
             1,
             "one PUT"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_uploads_full_buffer_when_aligned() {
+        // Plain create → write → flush must upload the exact bytes written
+        // (regression: a zero logical_size used to be treated as a truncate
+        // target and emptied the upload).
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let data = b"hello ossfs".to_vec();
+        let open = test_open("/f", true, data.clone(), data.len() as u64);
+        oss.flush_open_async(&open).await.expect("flush");
+        assert_eq!(
+            last_put_body(&_mock).as_deref(),
+            Some(data.as_slice()),
+            "flush must upload the written bytes unchanged"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_partial_overwrite_preserves_tail() {
+        // Regression (review): a partial overwrite of an existing object must
+        // upload the seeded content, not a buffer truncated to the write's
+        // end. The seed step itself lives in write(); this asserts the flush
+        // side of the invariant (logical_size == full seeded length).
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let original = b"0123456789ABCDEFGHIJ".to_vec();
+        let open = test_open("/f", true, original.clone(), original.len() as u64);
+        oss.flush_open_async(&open).await.expect("flush");
+        assert_eq!(
+            last_put_body(&_mock).as_deref(),
+            Some(original.as_slice()),
+            "flush must upload the full object when no truncate is pending"
         );
     }
 }

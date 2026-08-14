@@ -366,17 +366,32 @@ impl OssMountContext {
             // extensions, truncate shrinks) before uploading.
             let logical = ctx.logical_size.load(Ordering::Acquire) as usize;
             if logical != data.len() {
+                // Gate the flush-time read-modify-write against the dirty
+                // budget BEFORE downloading (same as write_async's lazy
+                // load), and refuse absurd SetEndOfFile preallocations
+                // instead of materializing them (#48 review).
                 if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
+                    let remote_size = self
+                        .fs
+                        .stat(&*ctx.path.lock().unwrap())
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.size as usize)
+                        .unwrap_or(0);
+                    self.reserve_dirty(ctx, remote_size).await?;
                     data = self
                         .fs
-                        .read_range(&ctx.path, 0, usize::MAX)
+                        .read_range(&*ctx.path.lock().unwrap(), 0, usize::MAX)
                         .await
                         .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    self.reserve_dirty(ctx, data.len()).await?;
                 }
+                self.reserve_dirty(ctx, logical).await?;
                 data.resize(logical, 0);
             }
             self.fs
-                .write(&ctx.path, &data)
+                .write(&*ctx.path.lock().unwrap(), &data)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         }
@@ -1133,7 +1148,22 @@ impl AsyncFileSystemContext for OssMountContext {
                 )));
             };
             if !context.loaded.load(Ordering::Acquire) {
-                *buf = data;
+                // Seeding must keep `logical_size` authoritative (#48 review):
+                // a pending SetEndOfFile truncate/extend (recorded without
+                // loading) is materialized here, and the seeded length becomes
+                // the logical size when there is none pending. Without this, a
+                // partial overwrite of a larger object would be truncated to
+                // the write's end on flush (data loss).
+                let logical = context.logical_size.load(Ordering::Acquire);
+                let mut seeded = data;
+                if logical > 0 {
+                    seeded.resize(logical as usize, 0);
+                }
+                *buf = seeded;
+                let len = buf.len() as u64;
+                context
+                    .logical_size
+                    .store(len.max(logical), Ordering::Release);
                 context.loaded.store(true, Ordering::Release);
             }
         }
@@ -1719,6 +1749,29 @@ mod tests {
             mock.get_count.load(Ordering::SeqCst),
             0,
             "truncate-to-zero needs no GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_overwrite_preserves_tail() {
+        // Review regression: opening an existing object for write and
+        // overwriting only its head must NOT truncate the object to the
+        // write's end — the lazy-load seed must keep logical_size at the full
+        // original length.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"0123456789ABCDEFGHIJ".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false); // unloaded write handle
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, b"XXXXX", 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&b"XXXXX56789ABCDEFGHIJ"[..]),
+            "partial overwrite must preserve the unmodified tail"
         );
     }
 }
