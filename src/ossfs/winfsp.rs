@@ -288,6 +288,102 @@ pub struct OssMountContext {
 }
 
 impl OssMountContext {
+    /// Async core of [`Self::rename`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn rename_async(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> winfsp::Result<()> {
+        let old = win_path_to_posix(file_name);
+        let new = win_path_to_posix(new_file_name);
+        let fs = Arc::clone(&self.fs);
+        let new_for_upload = new.clone();
+        fs.rename(&old, &new_for_upload, replace_if_exists)
+            .await
+            .map_err(|e| {
+                let io = IoError::other(e.to_string());
+                if e.to_string().contains("target already exists") {
+                    FspError::from(IoError::from_raw_os_error(WIN32_ALREADY_EXISTS))
+                } else {
+                    FspError::from(io)
+                }
+            })?;
+        // Retarget this handle to the new path so a later flush writes the
+        // new key instead of resurrecting the deleted old object (#46).
+        *context.path.lock().unwrap() = new;
+        Ok(())
+    }
+
+    /// Async core of [`Self::set_file_size`] (kept separate so tests can
+    /// drive it without a WinFsp dispatcher thread to block on).
+    async fn set_file_size_async(
+        &self,
+        context: &Self::FileContext,
+        new_size: u64,
+        _set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        if context.is_dir {
+            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
+        }
+
+        if new_size == 0 {
+            // Truncate to zero: abort any in-flight stream (bytes written
+            // after the truncate would otherwise append to it), discard the
+            // spool and clear the buffer (#47).
+            {
+                let mut stream_guard = context.stream.lock().await;
+                if let Some(up) = stream_guard.take() {
+                    up.abort().await;
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            }
+            context.logical_size.store(0, Ordering::Release);
+            let mut guard = context.write_buf.lock().unwrap();
+            if let Some(buf) = guard.as_mut() {
+                buf.clear();
+            }
+            context.loaded.store(true, Ordering::Release);
+        } else {
+            // Pre-allocation and SetEndOfFile change the logical size; the
+            // actual bytes are streamed/buffered by write_async. Never
+            // materialize the file here (that was the 20GB OOM source).
+            //
+            // #47: when a streaming upload is in flight its parts are
+            // pre-truncate content — a non-zero truncate must abort it and
+            // truncate the read-back spool (`set_len` pads with zeros on
+            // extend) so the uploaded object ends up exactly `new_size`
+            // instead of carrying the pre-truncate tail.
+            {
+                let mut stream_guard = context.stream.lock().await;
+                if let Some(up) = stream_guard.take() {
+                    up.abort().await;
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().clone() {
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    let _ = f.set_len(new_size);
+                }
+                context.spool_size.store(new_size, Ordering::Release);
+            }
+            context.logical_size.store(new_size, Ordering::Release);
+        }
+        context.dirty.store(true, Ordering::Release);
+        let entry = DirEntry {
+            name: context.path.lock().unwrap().clone(),
+            is_dir: false,
+            size: new_size,
+            mtime_secs: 0,
+        };
+        *file_info = file_info_from(&entry, context.index());
+        Ok(())
+    }
     fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future,
@@ -976,35 +1072,6 @@ impl FileSystemContext for OssMountContext {
         self.block_on(self.rename_async(context, file_name, new_file_name, replace_if_exists))
     }
 
-    /// Async core of [`Self::rename`] (kept separate so tests can drive it
-    /// without a WinFsp dispatcher thread to block on).
-    async fn rename_async(
-        &self,
-        context: &Self::FileContext,
-        file_name: &U16CStr,
-        new_file_name: &U16CStr,
-        replace_if_exists: bool,
-    ) -> winfsp::Result<()> {
-        let old = win_path_to_posix(file_name);
-        let new = win_path_to_posix(new_file_name);
-        let fs = Arc::clone(&self.fs);
-        let new_for_upload = new.clone();
-        fs.rename(&old, &new_for_upload, replace_if_exists)
-            .await
-            .map_err(|e| {
-                let io = IoError::other(e.to_string());
-                if e.to_string().contains("target already exists") {
-                    FspError::from(IoError::from_raw_os_error(WIN32_ALREADY_EXISTS))
-                } else {
-                    FspError::from(io)
-                }
-            })?;
-        // Retarget this handle to the new path so a later flush writes the
-        // new key instead of resurrecting the deleted old object (#46).
-        *context.path.lock().unwrap() = new;
-        Ok(())
-    }
-
     fn set_basic_info(
         &self,
         context: &Self::FileContext,
@@ -1073,74 +1140,6 @@ impl FileSystemContext for OssMountContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         self.block_on(self.set_file_size_async(context, new_size, set_allocation_size, file_info))
-    }
-
-    /// Async core of [`Self::set_file_size`] (kept separate so tests can
-    /// drive it without a WinFsp dispatcher thread to block on).
-    async fn set_file_size_async(
-        &self,
-        context: &Self::FileContext,
-        new_size: u64,
-        _set_allocation_size: bool,
-        file_info: &mut FileInfo,
-    ) -> winfsp::Result<()> {
-        if context.is_dir {
-            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
-        }
-
-        if new_size == 0 {
-            // Truncate to zero: abort any in-flight stream (bytes written
-            // after the truncate would otherwise append to it), discard the
-            // spool and clear the buffer (#47).
-            {
-                let mut stream_guard = context.stream.lock().await;
-                if let Some(up) = stream_guard.take() {
-                    up.abort().await;
-                }
-            }
-            if let Some(path) = context.spool_path.lock().unwrap().take() {
-                let _ = std::fs::remove_file(&path);
-                context.spool_size.store(0, Ordering::Release);
-            }
-            context.logical_size.store(0, Ordering::Release);
-            let mut guard = context.write_buf.lock().unwrap();
-            if let Some(buf) = guard.as_mut() {
-                buf.clear();
-            }
-            context.loaded.store(true, Ordering::Release);
-        } else {
-            // Pre-allocation and SetEndOfFile change the logical size; the
-            // actual bytes are streamed/buffered by write_async. Never
-            // materialize the file here (that was the 20GB OOM source).
-            //
-            // #47: when a streaming upload is in flight its parts are
-            // pre-truncate content — a non-zero truncate must abort it and
-            // truncate the read-back spool (`set_len` pads with zeros on
-            // extend) so the uploaded object ends up exactly `new_size`
-            // instead of carrying the pre-truncate tail.
-            {
-                let mut stream_guard = context.stream.lock().await;
-                if let Some(up) = stream_guard.take() {
-                    up.abort().await;
-                }
-            }
-            if let Some(path) = context.spool_path.lock().unwrap().clone() {
-                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
-                    let _ = f.set_len(new_size);
-                }
-                context.spool_size.store(new_size, Ordering::Release);
-            }
-            context.logical_size.store(new_size, Ordering::Release);
-        }
-        context.dirty.store(true, Ordering::Release);
-        let entry = DirEntry {
-            name: context.path.lock().unwrap().clone(),
-            is_dir: false,
-            size: new_size,
-            mtime_secs: 0,
-        };
-        *file_info = file_info_from(&entry, context.index());
-        Ok(())
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
