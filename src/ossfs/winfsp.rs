@@ -435,7 +435,13 @@ impl OssMountContext {
         }
         if let Some(up) = ctx.stream.lock().await.take() {
             let target = ctx.path.lock().unwrap().clone();
-            if up.key() != target {
+            // Compare key-for-key: `up.key()` is the object key (no leading
+            // slash) while `ctx.path` is the POSIX form (leading slash) — a
+            // direct string compare would always differ and route every
+            // streamed flush through the rename-retarget branch (abort +
+            // spool re-upload; with no spool the write would be silently
+            // dropped).
+            if up.key() != self.fs.key_for(&target) {
                 // The handle was renamed while the upload was in flight: the
                 // stream is bound to the old (deleted) key, and completing it
                 // would resurrect the object the rename deleted (#46). The
@@ -519,7 +525,7 @@ impl OssMountContext {
                 if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
                     let remote_size = self
                         .fs
-                        .stat(&ctx.path)
+                        .stat(&*ctx.path.lock().unwrap())
                         .await
                         .ok()
                         .flatten()
@@ -528,7 +534,7 @@ impl OssMountContext {
                     self.reserve_dirty(ctx, remote_size).await?;
                     data = self
                         .fs
-                        .read_range(&ctx.path, 0, usize::MAX)
+                        .read_range(&*ctx.path.lock().unwrap(), 0, usize::MAX)
                         .await
                         .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
                     self.reserve_dirty(ctx, data.len()).await?;
@@ -2077,7 +2083,8 @@ mod tests {
         let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
         let file = test_file_with("/f", false);
         let mut fi = FileInfo::default();
-        ctx.set_file_size(file, 10, false, &mut fi)
+        ctx.set_file_size_async(file, 10, false, &mut fi)
+            .await
             .expect("set_file_size");
         ctx.upload_dirty(file).await.expect("flush");
 
@@ -2133,7 +2140,8 @@ mod tests {
         let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
         let file = test_file_with("/f", false);
         let mut fi = FileInfo::default();
-        ctx.set_file_size(file, 0, false, &mut fi)
+        ctx.set_file_size_async(file, 0, false, &mut fi)
+            .await
             .expect("set_file_size(0)");
         ctx.upload_dirty(file).await.expect("flush");
 
@@ -2183,7 +2191,8 @@ mod tests {
         let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None)); // no budget
         let file = test_file_with("/f", false);
         let mut fi = FileInfo::default();
-        ctx.set_file_size(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
+        ctx.set_file_size_async(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
+            .await
             .expect("set_file_size");
         ctx.upload_dirty(file)
             .await

@@ -8,6 +8,7 @@ OSSFS 托盘（Windows）
 - ossmount.exe      底层挂载进程（WinFsp 后端）
 
 使用前请先安装 WinFsp（本安装包会自动安装）。macOS/Linux 请直接使用
-ossmount（需要 macFUSE / libfuse）。
+ossmount：macOS 推荐 FUSE-T（免内核扩展，DMG 版会在首次挂载时自动安装），
+也可用 macFUSE；Linux 需要 libfuse。
 
 仓库：https://github.com/ossfs/ossfs

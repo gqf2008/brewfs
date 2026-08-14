@@ -144,8 +144,6 @@ pub struct OssConfig {
     /// written here and reused on later reads (even across remounts).
     /// Mirrors aliyun/ossfs disk cache.
     pub disk_cache_dir: Option<PathBuf>,
-    /// Upper bound on disk-cache bytes; evicts oldest blocks when exceeded.
-    /// `Some(0)` disables the disk cache. Rounded up to 1 MiB units.
     /// Total process memory budget for read/write buffers. When set, it
     /// overrides the read-cache / upload / dirty budgets with a fixed
     /// 2:1:1 split (read cache : upload : dirty). Mirrors aliyun/ossfs
@@ -158,6 +156,8 @@ pub struct OssConfig {
     /// Upper bound on the in-memory read-ahead cache in bytes. `None`
     /// uses the default [`READ_CACHE_MAX_BYTES`].
     pub read_cache_max_bytes: Option<usize>,
+    /// Upper bound on disk-cache bytes; evicts oldest blocks when exceeded.
+    /// `0` disables the disk cache. Rounded up to 1 MiB units.
     pub disk_cache_max_bytes: usize,
     /// Disk-cache block size in bytes. `Some(0)` / `None` uses
     /// [`DISK_CACHE_BLOCK_SIZE`].
@@ -449,6 +449,9 @@ const UPLOAD_BUDGET_UNIT: usize = 1 << 20;
 /// turning a sequential scan into an OOM (the same failure class the global
 /// request limiter already guards against).
 const READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Default share of `total_mem_limit` reserved for the read cache when the
+/// configured ratio is unusable (NaN). Mirrors the CLI default.
+const DEFAULT_TOTAL_MEM_READ_RATIO: f64 = 0.5;
 /// Upper bound on read-ahead cache entries.
 const READ_CACHE_MAX_ENTRIES: usize = 256;
 /// Upper bound on tracked sequential-read hints; cleared when exceeded.
@@ -558,7 +561,14 @@ fn effective_memory_budgets(
 ) -> (Option<usize>, Option<usize>, usize) {
     match total_mem_limit {
         Some(total) if total > 0 => {
-            let ratio = total_mem_read_ratio.clamp(0.01, 0.99);
+            // `NaN.clamp(..)` stays NaN and `(total * NaN) as usize` collapses
+            // to 0, silently zeroing the read-cache budget — fall back to the
+            // documented default split instead (#60).
+            let ratio = if total_mem_read_ratio.is_nan() {
+                DEFAULT_TOTAL_MEM_READ_RATIO
+            } else {
+                total_mem_read_ratio.clamp(0.01, 0.99)
+            };
             let read = ((total as f64) * ratio) as usize;
             let rest = total.saturating_sub(read);
             (Some(rest / 2), Some(rest / 2), read)
@@ -895,14 +905,27 @@ impl DiskCache {
         header.extend_from_slice(&crc.to_le_bytes());
         header.extend_from_slice(data);
         let final_path = self.path_for(key, block);
+        // Size of the block being replaced, if any: `used` must track the
+        // delta, not the new size, or an overwritten block inflates the
+        // budget monotonically and evicts live blocks early (#60).
+        let replaced = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+        // The tmp name is keyed by (key hash, block) exactly like the final
+        // path, so two different blocks can never share a tmp file (#60).
         let tmp = self
             .dir
-            .join(format!(".tmp-{:x}", fnv1a64(key).wrapping_add(block)));
+            .join(format!(".tmp-{:x}-{:08x}", fnv1a64(key), block));
         std::fs::write(&tmp, &header).context("write disk cache block")?;
         std::fs::rename(&tmp, &final_path).context("commit disk cache block")?;
         self.touch(key, block);
         let bytes = header.len() as u64;
-        self.used.fetch_add(bytes, Ordering::Relaxed);
+        // Account for the size delta when overwriting, so `used` tracks the
+        // on-disk total instead of growing monotonically (#60).
+        let delta = bytes as i64 - replaced as i64;
+        if delta > 0 {
+            self.used.fetch_add(delta as u64, Ordering::Relaxed);
+        } else if delta < 0 {
+            self.used.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+        }
         if self.used.load(Ordering::Relaxed) > self.max_bytes {
             self.evict();
         }
@@ -1385,6 +1408,13 @@ impl StreamingUpload {
                 .await,
                 Some(true)
             ) {
+                // `self.hasher` was moved into the crc closure above, so
+                // count via direct field access (field access on a partially
+                // moved value is fine).
+                self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .upload_bytes_total
+                    .fetch_add(self.total_bytes, Ordering::Relaxed);
                 return Ok(());
             }
             let _ = self
@@ -1400,6 +1430,13 @@ impl StreamingUpload {
         if let Some(expected) = expected_crc {
             check_crc64_response(crc_slot, expected, &self.metrics)?;
         }
+        // One completed streamed object: a single PUT-equivalent upload of
+        // `total_bytes` (#60 — streaming uploads used to be invisible to the
+        // put/byte counters).
+        self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .upload_bytes_total
+            .fetch_add(self.total_bytes, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1576,7 +1613,7 @@ impl ObjectFs {
             )?)),
             _ => None,
         };
-        Ok(Self {
+        let fs = Self {
             client,
             bucket: config.bucket,
             prefix: config.prefix,
@@ -1634,7 +1671,38 @@ impl ObjectFs {
                 .max(1),
             metrics: Arc::new(Metrics::default()),
             dirty_budget,
-        })
+        };
+        // Fail fast on a missing bucket: every later request would 404, which
+        // is indistinguishable from "empty bucket" and would surface as a
+        // silently empty drive instead of a configuration error (#60).
+        fs.ensure_bucket_exists().await?;
+        Ok(fs)
+    }
+
+    /// Verify the configured bucket exists (mount-time configuration check).
+    pub async fn ensure_bucket_exists(&self) -> Result<()> {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => Ok(()),
+            Err(e) if is_s3_not_found(&e) => {
+                anyhow::bail!(
+                    "bucket `{}` does not exist at the configured endpoint/region",
+                    self.bucket
+                );
+            }
+            Err(e) => {
+                // 403 (valid credentials lacking s3:ListBucket on an existing
+                // bucket) and 5xx (transient) must not fail the mount — the
+                // bucket very likely exists and later operations will surface
+                // real permission problems (review B1).
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    error = ?e,
+                    "head-bucket check failed (not a 404); continuing — the bucket may exist \
+                     but the credentials may lack s3:ListBucket, or the endpoint is transiently down"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Read-only state of this mount.
@@ -1817,13 +1885,9 @@ impl ObjectFs {
                     mtime_secs: obj.last_modified().map(|d| d.secs()).unwrap_or(0),
                 });
             }
-            if resp.is_truncated() == Some(true) {
-                token = resp.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
             }
         }
         Ok(out)
@@ -1912,8 +1976,6 @@ impl ObjectFs {
     /// HEAD, then prefix probe as a last resort). Caller must hold a limiter
     /// permit.
     async fn stat_uncached_impl(&self, path: &str) -> Result<Option<DirEntry>> {
-        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
-        self.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
         if path == "/" {
             return Ok(Some(DirEntry {
                 name: String::new(),
@@ -1922,6 +1984,10 @@ impl ObjectFs {
                 mtime_secs: 0,
             }));
         }
+        // One request counted per request actually issued below: the initial
+        // HEAD, plus the marker HEAD / prefix probe on the miss path.
+        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+        self.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
         let key = self.key_for(path);
         match self
             .client
@@ -1944,6 +2010,8 @@ impl ObjectFs {
                 // A directory marker lives at `path + "/"`; check it before
                 // falling back to a prefix scan.
                 if !key.ends_with('/') {
+                    self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
                     let marker_key = format!("{key}/");
                     match self
                         .client
@@ -1968,8 +2036,11 @@ impl ObjectFs {
                 // Implied directory (children exist under the prefix).
                 // Probe with max_keys=1 instead of materializing a full
                 // listing: stat storms on missing paths otherwise allocate a
-                // whole directory just to learn "has children".
-                if !path.ends_with('/') && self.has_children_impl(path).await? {
+                // whole directory just to learn "has children". The probe
+                // strips a trailing slash so `stat("/a")` and `stat("/a/")`
+                // resolve the same implied directory (#60).
+                let probe_dir = path.trim_end_matches('/');
+                if !probe_dir.is_empty() && self.has_children_impl(probe_dir).await? {
                     return Ok(Some(DirEntry {
                         name: basename(path),
                         is_dir: true,
@@ -1987,6 +2058,7 @@ impl ObjectFs {
     /// `max_keys = 1` so a missing implied directory costs one tiny request
     /// instead of a full listing. Caller must hold a limiter permit.
     async fn has_children_impl(&self, dir: &str) -> Result<bool> {
+        self.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
         let prefix = self.list_prefix(dir);
         let resp = self
             .client
@@ -2222,16 +2294,18 @@ impl ObjectFs {
     }
 
     async fn verify_disk_cache_etag(&self, key: &str) {
-        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
-        self.metrics.s3_etag_heads.fetch_add(1, Ordering::Relaxed);
         {
             let checked = self.etag_checked.lock().unwrap();
             if let Some(at) = checked.get(key) {
                 if at.elapsed() < self.etag_ttl {
+                    // TTL suppressed the re-check: no HEAD is issued, so no
+                    // HEAD may be counted (#60).
                     return;
                 }
             }
         }
+        self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+        self.metrics.s3_etag_heads.fetch_add(1, Ordering::Relaxed);
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
         let Ok(resp) = self
             .client
@@ -2393,12 +2467,14 @@ impl ObjectFs {
     /// are uploaded via S3 multipart so they are not limited by the single-PUT
     /// object-size cap and can be retried per part.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
+        // Counted only after the read-only gate: a rejected write issued no
+        // request and must not inflate the write/put counters (#60).
         self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .upload_bytes_total
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.ensure_writable()?;
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
         let _budget = self.acquire_upload_budget(data.len()).await?;
@@ -2605,12 +2681,13 @@ impl ObjectFs {
     /// by the WinFsp adapter once a write buffer spills to disk.
     pub async fn write_from_file(&self, path: &str, src: &Path) -> Result<()> {
         let size = std::fs::metadata(src).context("stat spool file")?.len();
+        self.ensure_writable()?;
+        // Counted only after the read-only gate (see [`Self::write`], #60).
         self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_puts.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .upload_bytes_total
             .fetch_add(size, Ordering::Relaxed);
-        self.ensure_writable()?;
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
         let _budget = self.acquire_upload_budget(size as usize).await?;
@@ -2786,6 +2863,12 @@ impl ObjectFs {
     /// upload overlaps with the local write. Call [`StreamingUpload::finish`]
     /// on close.
     pub async fn begin_streaming_upload(&self, path: &str) -> Result<StreamingUpload> {
+        self.ensure_writable()?;
+        self.invalidate_stat(path);
+        // A streaming handle counts as one write up front (the create request
+        // is issued here); the completed object's bytes are counted once the
+        // final size is known, in [`StreamingUpload::finish`] (#60).
+        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         let key = self.key_for(path);
         let mut create = self
             .client
@@ -2832,6 +2915,12 @@ impl ObjectFs {
 
     /// Create an empty directory marker object.
     pub async fn mkdir(&self, path: &str) -> Result<()> {
+        self.ensure_writable()?;
+        if is_root_path(path) {
+            // The mount root always exists; creating it would PUT an empty
+            // (or prefix-only) key the server rejects (#60).
+            anyhow::bail!("directory / already exists");
+        }
         self.invalidate_stat(path);
         let dir = if path.ends_with('/') {
             path.to_string()
@@ -2844,6 +2933,11 @@ impl ObjectFs {
     /// Delete a single object.
     pub async fn delete(&self, path: &str) -> Result<()> {
         self.ensure_writable()?;
+        if is_root_path(path) {
+            // `key_for("/")` is empty; a DELETE against the bucket URL would
+            // attempt to delete the bucket itself (#60).
+            anyhow::bail!("cannot delete the mount root /");
+        }
         let _permit = self.acquire().await?;
         self.delete_impl(path).await
     }
@@ -2903,13 +2997,9 @@ impl ObjectFs {
                         .context("s3 delete object")?;
                 }
             }
-            if resp.is_truncated() == Some(true) {
-                token = resp.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
             }
         }
         // Remove the marker itself (it is included in the prefix listing).
@@ -3022,13 +3112,9 @@ impl ObjectFs {
                     "directory exceeds rename-dir-limit {limit} ({count} entries so far)"
                 );
             }
-            if resp.is_truncated() == Some(true) {
-                token = resp.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
             }
         }
         Ok(count)
@@ -3061,13 +3147,9 @@ impl ObjectFs {
                         .context("s3 copy")?;
                 }
             }
-            if resp.is_truncated() == Some(true) {
-                token = resp.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
             }
         }
         // Copy the dir marker.
@@ -3093,6 +3175,27 @@ fn is_s3_not_found(
     match e {
         aws_sdk_s3::error::SdkError::ServiceError(err) => err.raw().status().as_u16() == 404,
         _ => false,
+    }
+}
+
+/// Next continuation token of a paginated ListObjectsV2 response.
+///
+/// A response that reports `IsTruncated` without a `NextContinuationToken`
+/// cannot be paged any further. Returning the partial result as success would
+/// silently drop the rest of the listing — missing readdir entries, or
+/// objects left behind by a "successful" recursive delete — so it is
+/// surfaced as an error instead (#60).
+fn next_page_token(
+    resp: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+) -> Result<Option<String>> {
+    if resp.is_truncated() != Some(true) {
+        return Ok(None);
+    }
+    match resp.next_continuation_token() {
+        Some(tok) => Ok(Some(tok.to_string())),
+        None => anyhow::bail!(
+            "s3 list truncated without a continuation token; refusing to return a partial listing"
+        ),
     }
 }
 
@@ -3137,9 +3240,21 @@ fn dir_object_prefix(key: &str) -> String {
     format!("{base}/")
 }
 
-/// Strip the leading slash from a normalized path; `"/"` -> `""`.
+/// Strip the leading slashes from a normalized path; `"/"` -> `""`.
+///
+/// Only leading `/` are stripped: a trailing slash is significant (directory
+/// markers live at `path + "/"`) and leading/trailing whitespace is a legal
+/// part of a POSIX file name, so trimming it here would map `"a"` and `"a "`
+/// to the same object key (silent mutual overwrite).
 pub fn rel_key(path: &str) -> String {
-    path.trim().trim_start_matches('/').to_string()
+    path.trim_start_matches('/').to_string()
+}
+
+/// True when `path` denotes the mount root (`"/"`, `"//"`, `""`): everything
+/// that reduces to the empty relative key. The root has no object of its
+/// own, so key-producing mutations on it are rejected by the callers (#60).
+fn is_root_path(path: &str) -> bool {
+    path.trim_start_matches('/').is_empty()
 }
 
 /// Build an S3 `x-amz-copy-source` header value (`/bucket/key`) with the key
@@ -3222,6 +3337,18 @@ mod tests {
         assert_eq!(rel_key("/a/b.txt"), "a/b.txt");
         assert_eq!(rel_key("/a/"), "a/");
         assert_eq!(rel_key("//a//b"), "a//b");
+    }
+
+    #[test]
+    fn rel_key_preserves_significant_whitespace() {
+        // Regression (#60): `trim()` used to collapse `"a "` and `"a"` (and
+        // ` /a` vs `/a`) onto the same object key, silently overwriting one
+        // with the other. Whitespace is a legal POSIX name character.
+        assert_eq!(rel_key("/a "), "a ");
+        assert_eq!(rel_key("/ a"), " a");
+        assert_eq!(rel_key("/a\n"), "a\n");
+        assert_eq!(rel_key(" /a"), " /a");
+        assert_eq!(rel_key("/ a/"), " a/");
     }
 
     #[test]
@@ -4137,9 +4264,16 @@ mod s3_mock_tests {
         pub(crate) head_count: Arc<AtomicUsize>,
         pub(crate) crc64: Mutex<u64>,
         pub(crate) head_etag: Mutex<String>,
+        /// When non-zero, every HEAD answers with this status (used to
+        /// simulate 403/5xx bucket checks; 0 = normal object lookup).
+        pub(crate) head_status: std::sync::atomic::AtomicU16,
         /// When set, CompleteMultipartUpload answers 404 NoSuchUpload —
         /// simulating a retry racing an already-completed upload.
         pub(crate) complete_no_such_upload: std::sync::atomic::AtomicBool,
+        /// When set, ListObjectsV2 answers `IsTruncated=true` without a
+        /// `NextContinuationToken` — the unpaggable partial listing the
+        /// client must refuse (#60).
+        pub(crate) list_truncated_no_token: std::sync::atomic::AtomicBool,
     }
 
     impl MockS3 {
@@ -4173,7 +4307,9 @@ mod s3_mock_tests {
                 entries: Arc::new(Mutex::new(entries)),
                 crc64: Mutex::new(0),
                 head_etag: Mutex::new("mock-etag".to_string()),
+                head_status: std::sync::atomic::AtomicU16::new(0),
                 complete_no_such_upload: std::sync::atomic::AtomicBool::new(false),
+                list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -4284,7 +4420,8 @@ mod s3_mock_tests {
         let mut get_body: Option<Vec<u8>> = None;
         let response = if query.contains("list-type=2") {
             let entries = mock.entries.lock().unwrap().clone();
-            let body = list_xml(&entries);
+            let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
+            let body = list_xml(&entries, truncated);
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
@@ -4360,22 +4497,29 @@ mod s3_mock_tests {
             }
         } else if method == "HEAD" {
             mock.head_count.fetch_add(1, Ordering::SeqCst);
-            let path = target.split('?').next().unwrap_or(&target);
-            let key = path
-                .trim_start_matches('/')
-                .split_once('/')
-                .map(|(_, k)| k.to_string())
-                .unwrap_or_default();
-            let objects = mock.objects.lock().unwrap();
-            if let Some(obj) = objects.get(&key) {
-                let etag = mock.head_etag.lock().unwrap().clone();
+            let forced = mock.head_status.load(Ordering::SeqCst);
+            if forced != 0 {
                 format!(
-                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    obj.len()
+                    "HTTP/1.1 {forced} Forced\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
             } else {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string()
+                let path = target.split('?').next().unwrap_or(&target);
+                let key = path
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .map(|(_, k)| k.to_string())
+                    .unwrap_or_default();
+                let objects = mock.objects.lock().unwrap();
+                if let Some(obj) = objects.get(&key) {
+                    let etag = mock.head_etag.lock().unwrap().clone();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        obj.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                }
             }
         } else {
             // Plain PutObject / DeleteObject / ...
@@ -4411,13 +4555,15 @@ mod s3_mock_tests {
             .to_string()
     }
 
-    fn list_xml(entries: &[(String, bool)]) -> String {
+    fn list_xml(entries: &[(String, bool)], truncated_no_token: bool) -> String {
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
         body.push_str("<Name>bucket</Name><Prefix></Prefix><KeyCount>");
         body.push_str(&entries.len().to_string());
-        body.push_str("</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>");
+        body.push_str("</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>");
+        body.push_str(if truncated_no_token { "true" } else { "false" });
+        body.push_str("</IsTruncated>");
         for (key, is_dir) in entries {
             if *is_dir {
                 body.push_str(&format!(
@@ -4696,6 +4842,231 @@ mod s3_mock_tests {
         let got = fs.stat("/nope").await.expect("stat");
         assert!(got.is_none(), "missing path must be None");
         assert!(!mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stat_trailing_slash_finds_implied_dir() {
+        // Regression (#60): `stat("/a")` found an implied directory while
+        // `stat("/a/")` — the same directory — returned None.
+        let (_mock, port) = MockS3::start(
+            vec![("implied/f.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+        let got = fs.stat("/implied/").await.expect("stat");
+        let entry = got.expect("trailing-slash stat must find the implied dir");
+        assert!(entry.is_dir);
+        assert_eq!(entry.name, "implied");
+    }
+
+    #[tokio::test]
+    async fn stat_counts_each_issued_request() {
+        // Regression (#60): a miss that falls through to the marker HEAD and
+        // the prefix probe used to count a single HEAD.
+        let (_mock, port) = MockS3::start(
+            vec![("implied/f.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+        assert!(fs.stat("/").await.expect("stat root").is_some());
+        let m = fs.metrics();
+        assert_eq!(m.s3_heads, 0, "root stat is local and issues no request");
+
+        let entry = fs
+            .stat("/implied")
+            .await
+            .expect("stat")
+            .expect("implied dir");
+        assert!(entry.is_dir);
+        let m = fs.metrics();
+        assert_eq!(m.s3_heads, 2, "initial HEAD + marker HEAD");
+        assert_eq!(m.s3_stat_heads, 2);
+        assert_eq!(m.s3_lists, 1, "prefix probe counts as a list");
+    }
+
+    #[tokio::test]
+    async fn list_truncated_without_continuation_token_errors() {
+        // Regression (#60): a truncated listing without a continuation token
+        // was returned as a successful partial result (silent missing
+        // readdir entries).
+        let (mock, port) =
+            MockS3::start(vec![("a.txt".into(), false)], Duration::from_millis(1)).await;
+        mock.list_truncated_no_token.store(true, Ordering::SeqCst);
+        let fs = test_fs(port, 32);
+        let err = fs.list("/").await.unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_dir_recursive_truncated_without_token_errors() {
+        // Regression (#60): a partial delete must not report success while
+        // objects remain under the prefix.
+        let (mock, port) =
+            MockS3::start(vec![("dir/a.txt".into(), false)], Duration::from_millis(1)).await;
+        mock.list_truncated_no_token.store(true, Ordering::SeqCst);
+        let fs = test_fs(port, 32);
+        let err = fs.delete_dir_recursive("/dir").await.unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn next_page_token_requires_token_when_truncated() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        let complete = ListObjectsV2Output::builder().build();
+        assert_eq!(next_page_token(&complete).unwrap(), None);
+        let paged = ListObjectsV2Output::builder()
+            .is_truncated(true)
+            .next_continuation_token("tok")
+            .build();
+        assert_eq!(next_page_token(&paged).unwrap().as_deref(), Some("tok"));
+        let dangling = ListObjectsV2Output::builder().is_truncated(true).build();
+        assert!(next_page_token(&dangling).is_err());
+    }
+
+    #[tokio::test]
+    async fn mkdir_and_delete_reject_mount_root() {
+        // Regression (#60): `mkdir("/")` PUT and `delete("/")` DELETE targeted
+        // an empty key (the bucket itself) instead of failing locally.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let err = fs.mkdir("/").await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        let err = fs.delete("/").await.unwrap_err();
+        assert!(err.to_string().contains("mount root"), "got: {err}");
+        let err = fs.delete("//").await.unwrap_err();
+        assert!(err.to_string().contains("mount root"), "got: {err}");
+        assert!(
+            mock.requests.lock().unwrap().is_empty(),
+            "rejected root operations must not reach S3"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_write_is_not_counted() {
+        // Regression (#60): a read-only-rejected write used to increment the
+        // write/put/byte counters without issuing any request.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.read_only = true;
+        assert!(fs.write("/a.bin", &[1, 2, 3]).await.is_err());
+        let m = fs.metrics();
+        assert_eq!(m.writes, 0);
+        assert_eq!(m.s3_puts, 0);
+        assert_eq!(m.upload_bytes_total, 0);
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bucket_existence_check_distinguishes_missing_bucket() {
+        // Regression (#60): mounting a nonexistent bucket used to look like an
+        // empty drive because every 404 is treated as "missing object".
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let err = fs.ensure_bucket_exists().await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
+        // The bucket-level HEAD target ("/<bucket>") maps to the empty key in
+        // the mock; an object stored there makes HeadBucket succeed.
+        mock.set_object("", Vec::new());
+        fs.ensure_bucket_exists().await.expect("bucket exists");
+    }
+
+    #[tokio::test]
+    async fn bucket_check_forbidden_or_5xx_continues_mount() {
+        // Review B1: 403 (credentials valid but lacking s3:ListBucket) and
+        // 5xx (transient) must not fail the mount — only a definitive 404
+        // means the bucket is missing.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        mock.head_status.store(403, Ordering::SeqCst);
+        fs.ensure_bucket_exists()
+            .await
+            .expect("403 must not fail mount");
+
+        mock.head_status.store(500, Ordering::SeqCst);
+        fs.ensure_bucket_exists()
+            .await
+            .expect("5xx must not fail mount");
+
+        mock.head_status.store(404, Ordering::SeqCst);
+        let err = fs.ensure_bucket_exists().await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "404 must still be definitive: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_memory_budgets_nan_ratio_falls_back_to_default() {
+        // Regression (#60): NaN.clamp(0.01, 0.99) stays NaN, `(total * NaN)
+        // as usize` collapses to 0, silently zeroing the read-cache budget.
+        let (upload, dirty, read) =
+            effective_memory_budgets(Some(64 * 1024 * 1024), f64::NAN, None, None, None);
+        assert_eq!(read, 32 * 1024 * 1024);
+        assert_eq!(upload, Some(16 * 1024 * 1024));
+        assert_eq!(dirty, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn disk_cache_overwrite_tracks_size_delta() {
+        // Regression (#60): overwriting a cached block only added the new
+        // size, so `used` grew monotonically and evicted live blocks early.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            4 * 1024 * 1024,
+            0,
+            None,
+        )
+        .expect("cache");
+        cache.write_block("k", 0, &[1, 2, 3, 4]).expect("write");
+        let first = cache.used.load(Ordering::Relaxed);
+        cache.write_block("k", 0, &[1, 2]).expect("overwrite");
+        let second = cache.used.load(Ordering::Relaxed);
+        assert_eq!(
+            first - second,
+            2,
+            "shrinking overwrite must shrink `used` by the size delta"
+        );
+        cache
+            .write_block("k", 0, &[1, 2, 3, 4, 5, 6])
+            .expect("grow");
+        assert_eq!(
+            cache.used.load(Ordering::Relaxed) - second,
+            4,
+            "growing overwrite must grow `used` by the size delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_is_counted() {
+        // Regression (#60): streaming uploads were invisible to the write /
+        // put / byte counters.
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+        let mut upload = fs
+            .begin_streaming_upload("/large.bin")
+            .await
+            .expect("begin");
+        assert_eq!(fs.metrics().writes, 1, "begin counts one write");
+        assert_eq!(fs.metrics().s3_puts, 0, "nothing completed yet");
+        upload.write(&[7u8; 100]).await.expect("feed");
+        upload.finish().await.expect("finish");
+        let m = fs.metrics();
+        assert_eq!(m.s3_puts, 1);
+        assert_eq!(m.upload_bytes_total, 100);
     }
 
     #[tokio::test]
@@ -5290,6 +5661,10 @@ mod s3_mock_tests {
         fs.read_range("/t.bin", 0, 1024).await.expect("read");
         fs.read_range("/t.bin", 0, 1024).await.expect("hit");
         assert_eq!(mock.head_count.load(Ordering::SeqCst), 1);
+        // Regression (#60): the TTL-suppressed second check must not count as
+        // an issued HEAD either.
+        assert_eq!(fs.metrics().s3_etag_heads, 1);
+        assert_eq!(fs.metrics().s3_heads, 1);
     }
 
     #[tokio::test]

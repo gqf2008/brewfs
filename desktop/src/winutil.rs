@@ -228,9 +228,48 @@ pub fn set_dock_visible(visible: bool) {
 #[cfg(not(target_os = "macos"))]
 pub fn set_dock_visible(_visible: bool) {}
 
-/// Terminate a process tree. On Windows uses `taskkill /T /F`; the ossmount
-/// WinFsp volume is torn down by the kernel when the owning process exits.
-/// On other platforms falls back to `kill`.
+/// Ask the mount process to shut down gracefully so it can flush its
+/// whole-file write buffers and unmount cleanly. Unix sends SIGTERM, which
+/// `ossmount` handles by unmounting; Windows console mount processes have no
+/// message pump or control handler to receive a soft signal, so there is no
+/// graceful path and the caller must fall back to [`terminate_process`].
+/// Returns whether a graceful shutdown was requested.
+pub fn request_graceful_shutdown(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Poll `pid` until it exits or `timeout` elapses. Returns whether the
+/// process exited within the window (zombies count as exited).
+pub fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            reap_child(pid);
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Forcefully terminate a process tree. On Windows uses `taskkill /T /F`; the
+/// ossmount WinFsp volume is torn down by the kernel when the owning process
+/// exits. On other platforms sends SIGKILL. Callers should try
+/// [`request_graceful_shutdown`] first so in-flight write buffers can flush.
 pub fn terminate_process(pid: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -254,9 +293,10 @@ pub fn terminate_process(pid: u32) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {
         let output = std::process::Command::new("kill")
-            .arg(pid.to_string())
+            .args(["-9", &pid.to_string()])
             .output()?;
         if output.status.success() {
+            reap_child(pid);
             return Ok(());
         }
         // Idempotency: the process already exited (e.g. stale record, mount

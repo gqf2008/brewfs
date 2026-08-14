@@ -385,7 +385,10 @@ export component MainWindow inherits Window {
             y: 0px;
             width: parent.width;
             height: parent.height;
-            background: #66000000;
+            // Slint colors are #RRGGBBAA (alpha last): this must be black at
+            // 40% alpha. The previous #66000000 was alpha 0x00 — a fully
+            // transparent dark-red that still blocked clicks (#61).
+            background: #00000066;
             TouchArea {
                 clicked => {}
             }
