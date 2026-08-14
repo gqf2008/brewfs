@@ -95,12 +95,30 @@ struct GuardState {
     /// Auto-restarts already spent per drive since the mount was last seen
     /// healthy; bounded by [`MAX_AUTO_RESTARTS`] (#61).
     restarts: std::collections::HashMap<String, u32>,
+    /// When each desired drive was first observed alive at a refresh tick.
+    /// A drive continuously alive for [`STABLE_ALIVE_RESET`] is presumed
+    /// healthy and its restart budget is replenished (review B2).
+    alive_since: std::collections::HashMap<String, Instant>,
 }
 
 /// Maximum auto-restart attempts before the guard gives up on a drive and
 /// leaves it for the user to remount manually. A mount that crashes ~every
 /// 30s would otherwise be respawned forever (#61).
 const MAX_AUTO_RESTARTS: u32 = 5;
+
+/// How long a drive must stay alive before its restart budget is
+/// replenished. Without this, a mount that crashes just slower than the 2s
+/// refresh tick (e.g. every 30s) would have its budget cleared on every
+/// alive tick and the [`MAX_AUTO_RESTARTS`] cap would be dead code
+/// (review B2).
+const STABLE_ALIVE_RESET: Duration = Duration::from_secs(60);
+
+/// Whether a drive that has been continuously alive for `alive` may have
+/// its restart budget replenished (see [`STABLE_ALIVE_RESET`]). Extracted
+/// for unit testing.
+fn budget_resets(alive: Duration) -> bool {
+    alive >= STABLE_ALIVE_RESET
+}
 
 /// Decision extracted from [`auto_restart`] so the backoff / give-up policy
 /// is unit-testable without a UI (#61).
@@ -170,11 +188,24 @@ fn auto_restart(
     for drive in g.desired.clone() {
         if mounts.iter().any(|m| m.alive && m.drive == drive) {
             g.failed.remove(&drive);
-            // Healthy again: the restart budget replenishes for the next
-            // lifetime (#61).
-            g.restarts.remove(&drive);
+            // Replenish the restart budget only after the mount has stayed
+            // alive for a while — a mount that dies every ~30s must not get
+            // its budget cleared on every 2s alive tick (review B2).
+            let stable_elapsed = g.alive_since.get(&drive).map(|t| t.elapsed());
+            match stable_elapsed {
+                None => {
+                    g.alive_since.insert(drive.clone(), Instant::now());
+                }
+                Some(elapsed) if budget_resets(elapsed) => {
+                    g.restarts.remove(&drive);
+                    g.alive_since.insert(drive.clone(), Instant::now());
+                }
+                Some(_) => {}
+            }
             continue;
         }
+        // Not alive: the stable-alive clock resets with the mount.
+        g.alive_since.remove(&drive);
         if g.failed.contains(&drive) {
             continue;
         }
@@ -596,7 +627,14 @@ fn wire_callbacks(
                     );
                     // Ask the guard to auto-restart this mount if it dies.
                     if started {
-                        guard().desired.insert(drive);
+                        let mut g = guard();
+                        g.desired.insert(drive.clone());
+                        // A manual mount starts a new lifetime: clear any
+                        // accumulated restart budget and fast-fail marks so
+                        // the fresh mount gets a full budget (review B2).
+                        g.failed.remove(&drive);
+                        g.restarts.remove(&drive);
+                        g.alive_since.remove(&drive);
                     }
                 }
             }
@@ -1199,12 +1237,22 @@ fn form_to_profile(edit: &EditDialog) -> model::Profile {
 /// Show the Slint modal confirm dialog and run `on_yes` when the user
 /// confirms. The dialog is a separate always-shown-on-top window, so it is
 /// never hidden behind other windows (unlike the old Win32 MessageBox).
+///
+/// The dialog is a single shared slot: if another confirmation is already
+/// pending (e.g. the tray "quit" fires while an unmount/delete dialog is
+/// open), the new request is refused instead of silently replacing the
+/// pending action — confirming the visible dialog must never execute a
+/// different action than the one shown (review B3).
 fn ask_confirm(
     ui: &MainWindow,
     pending: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
     message: &str,
     on_yes: impl FnOnce() + 'static,
 ) {
+    if pending.borrow().is_some() {
+        ui.set_status_text("请先完成当前确认操作".into());
+        return;
+    }
     ui.set_dlg_message(message.into());
     ui.set_dlg_visible(true);
     *pending.borrow_mut() = Some(Box::new(on_yes));
@@ -1228,12 +1276,18 @@ const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 /// immediate, as before.
 fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
     guard().desired.remove(&m.drive);
+    guard().alive_since.remove(&m.drive);
     let ui_weak = ui.as_weak();
     let m = m.clone();
     std::thread::spawn(move || {
         let graceful = winutil::request_graceful_shutdown(m.pid);
         if !(graceful && winutil::wait_for_exit(m.pid, GRACEFUL_UNMOUNT_TIMEOUT)) {
             if let Err(e) = winutil::terminate_process(m.pid) {
+                // The unmount failed and the drive is no longer supervised:
+                // re-arm the auto-restart guard so the (possibly still
+                // running) mount stays watched, instead of silently losing
+                // supervision with a stale runtime record (review B4).
+                guard().desired.insert(m.drive.clone());
                 let msg = format!("卸载 {} 失败：{e}", m.drive);
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                     ui.set_status_text(msg.into());
@@ -1827,6 +1881,18 @@ mod tests {
             restart_decision(Duration::from_secs(1), MAX_AUTO_RESTARTS - 1),
             RestartDecision::WaitForBackoff
         );
+    }
+
+    #[test]
+    fn restart_budget_resets_only_after_stable_alive() {
+        // Review B2: without a stable-alive window the budget would be
+        // cleared on every 2s alive tick and the MAX_AUTO_RESTARTS cap would
+        // be dead code for mounts that crash slower than the tick (the exact
+        // "crash every ~30s, respawned forever" case #61 fixes).
+        assert!(!budget_resets(Duration::from_secs(29)));
+        assert!(!budget_resets(Duration::from_secs(59)));
+        assert!(budget_resets(Duration::from_secs(60)));
+        assert!(budget_resets(Duration::from_secs(61)));
     }
 
     #[test]

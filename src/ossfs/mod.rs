@@ -1689,10 +1689,19 @@ impl ObjectFs {
                     self.bucket
                 );
             }
-            Err(e) => Err(e).context(format!(
-                "verify bucket `{}` (check endpoint/region/credentials)",
-                self.bucket
-            )),
+            Err(e) => {
+                // 403 (valid credentials lacking s3:ListBucket on an existing
+                // bucket) and 5xx (transient) must not fail the mount — the
+                // bucket very likely exists and later operations will surface
+                // real permission problems (review B1).
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    error = ?e,
+                    "head-bucket check failed (not a 404); continuing — the bucket may exist \
+                     but the credentials may lack s3:ListBucket, or the endpoint is transiently down"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -4255,6 +4264,9 @@ mod s3_mock_tests {
         pub(crate) head_count: Arc<AtomicUsize>,
         pub(crate) crc64: Mutex<u64>,
         pub(crate) head_etag: Mutex<String>,
+        /// When non-zero, every HEAD answers with this status (used to
+        /// simulate 403/5xx bucket checks; 0 = normal object lookup).
+        pub(crate) head_status: std::sync::atomic::AtomicU16,
         /// When set, CompleteMultipartUpload answers 404 NoSuchUpload —
         /// simulating a retry racing an already-completed upload.
         pub(crate) complete_no_such_upload: std::sync::atomic::AtomicBool,
@@ -4295,6 +4307,7 @@ mod s3_mock_tests {
                 entries: Arc::new(Mutex::new(entries)),
                 crc64: Mutex::new(0),
                 head_etag: Mutex::new("mock-etag".to_string()),
+                head_status: std::sync::atomic::AtomicU16::new(0),
                 complete_no_such_upload: std::sync::atomic::AtomicBool::new(false),
                 list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
             });
@@ -4484,22 +4497,29 @@ mod s3_mock_tests {
             }
         } else if method == "HEAD" {
             mock.head_count.fetch_add(1, Ordering::SeqCst);
-            let path = target.split('?').next().unwrap_or(&target);
-            let key = path
-                .trim_start_matches('/')
-                .split_once('/')
-                .map(|(_, k)| k.to_string())
-                .unwrap_or_default();
-            let objects = mock.objects.lock().unwrap();
-            if let Some(obj) = objects.get(&key) {
-                let etag = mock.head_etag.lock().unwrap().clone();
+            let forced = mock.head_status.load(Ordering::SeqCst);
+            if forced != 0 {
                 format!(
-                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    obj.len()
+                    "HTTP/1.1 {forced} Forced\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
             } else {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string()
+                let path = target.split('?').next().unwrap_or(&target);
+                let key = path
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .map(|(_, k)| k.to_string())
+                    .unwrap_or_default();
+                let objects = mock.objects.lock().unwrap();
+                if let Some(obj) = objects.get(&key) {
+                    let etag = mock.head_etag.lock().unwrap().clone();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        obj.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                }
             }
         } else {
             // Plain PutObject / DeleteObject / ...
@@ -4959,6 +4979,32 @@ mod s3_mock_tests {
         // the mock; an object stored there makes HeadBucket succeed.
         mock.set_object("", Vec::new());
         fs.ensure_bucket_exists().await.expect("bucket exists");
+    }
+
+    #[tokio::test]
+    async fn bucket_check_forbidden_or_5xx_continues_mount() {
+        // Review B1: 403 (credentials valid but lacking s3:ListBucket) and
+        // 5xx (transient) must not fail the mount — only a definitive 404
+        // means the bucket is missing.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        mock.head_status.store(403, Ordering::SeqCst);
+        fs.ensure_bucket_exists()
+            .await
+            .expect("403 must not fail mount");
+
+        mock.head_status.store(500, Ordering::SeqCst);
+        fs.ensure_bucket_exists()
+            .await
+            .expect("5xx must not fail mount");
+
+        mock.head_status.store(404, Ordering::SeqCst);
+        let err = fs.ensure_bucket_exists().await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "404 must still be definitive: {err}"
+        );
     }
 
     #[test]

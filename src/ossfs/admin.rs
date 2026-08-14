@@ -70,7 +70,7 @@ pub async fn serve_metrics_with_read_timeout(
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_string()
             };
-            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = tokio::time::timeout(read_timeout, stream.write_all(response.as_bytes())).await;
             let _ = stream.shutdown().await;
         });
     }
