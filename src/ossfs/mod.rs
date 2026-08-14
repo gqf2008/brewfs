@@ -105,10 +105,12 @@ pub struct OssConfig {
     /// AWS credential-process JSON. Takes precedence over env/profile creds.
     pub credential_process: Option<String>,
     /// Socket connect timeout in seconds (mirrors aliyun/ossfs
-    /// `connect_timeout`). `None` keeps the SDK default.
+    /// `connect_timeout`). `None` uses [`DEFAULT_CONNECT_TIMEOUT_SECS`].
     pub connect_timeout_secs: Option<u64>,
     /// Read timeout in seconds (mirrors aliyun/ossfs `readwrite_timeout`).
-    /// `None` keeps the SDK default.
+    /// Bounds each S3 request — including the time to send its body — so a
+    /// stalled connection errors out and retries instead of hanging the
+    /// mount. `None` uses [`DEFAULT_READWRITE_TIMEOUT_SECS`].
     pub readwrite_timeout_secs: Option<u64>,
     /// Additional retry attempts after the initial request (mirrors
     /// aliyun/ossfs `retries`). `None` keeps the SDK default.
@@ -334,6 +336,20 @@ impl OssConfig {
         if !self.prefix.is_empty() && !self.prefix.ends_with('/') {
             self.prefix.push('/');
         }
+        // Timeouts default ON. The SDK ships only a 3.1s connect timeout and
+        // NO read timeout, so a silently-stalled connection (NAT/firewall
+        // drop, OSS throttling) parks the request forever. A wedged request
+        // holds an S3 limiter permit — and, for multipart parts, a part slot
+        // plus the write feeder's stream lock — which froze Explorer copies
+        // mid-file and silently swallowed deferred-close uploads under heavy
+        // multi-file copy load. `Some(0)` is treated as unset so the CLI's
+        // `--*-timeout 0` keeps meaning "use the default".
+        if self.connect_timeout_secs.unwrap_or(0) == 0 {
+            self.connect_timeout_secs = Some(DEFAULT_CONNECT_TIMEOUT_SECS);
+        }
+        if self.readwrite_timeout_secs.unwrap_or(0) == 0 {
+            self.readwrite_timeout_secs = Some(DEFAULT_READWRITE_TIMEOUT_SECS);
+        }
         self
     }
 }
@@ -368,6 +384,19 @@ const MAX_NEGATIVE_ENTRIES: usize = 4096;
 /// during I/O storms such as `find /` recursing into the mounted network
 /// drive; without it the process can OOM-abort (0xc0000409).
 const MAX_CONCURRENT_S3_REQUESTS: usize = 32;
+/// Default socket connect timeout (mirrors aliyun/ossfs `connect_timeout`).
+/// See [`OssConfig::normalize`] for why a default is applied at all: the SDK
+/// default is 3.1s connect / no read timeout, and a request that hangs on a
+/// silently-stalled connection parks its limiter permit (and multipart part
+/// slot) forever, wedging the mount's write path.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Default request read timeout. The smithy "read timeout" bounds the whole
+/// request/response-head exchange — including sending the request body — so
+/// it must tolerate an 8 MiB multipart part over a slow uplink: 600 s keeps
+/// the minimum effective per-request upload rate at ~14 KB/s while
+/// guaranteeing a stalled request errors out (and the SDK retries) instead
+/// of hanging the mount forever.
+const DEFAULT_READWRITE_TIMEOUT_SECS: u64 = 600;
 /// Above this size, `write` uploads via S3 multipart (bounded-concurrency
 /// parts) instead of a single PUT. A single PUT is capped at 5 GiB by OSS/S3
 /// and is more sensitive to timeouts / retries on large objects.
@@ -3455,6 +3484,86 @@ mod tests {
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
         let _ = request_timeout();
+    }
+
+    #[test]
+    fn normalize_defaults_request_timeouts() {
+        // Regression: the SDK ships no read timeout, so a silently-stalled
+        // connection held its limiter permit / part slot forever and froze
+        // writes under heavy copy load. Unset (and explicit 0, which the CLI
+        // maps to None) must fall back to real defaults, while an explicit
+        // value is preserved.
+        let base = || OssConfig {
+            bucket: "b".into(),
+            region: "cn-shanghai".into(),
+            endpoint: None,
+            force_path_style: false,
+            prefix: String::new(),
+            max_concurrent_requests: None,
+            list_rate_limit: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
+            multipart_size: None,
+            multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            credential_process: None,
+        };
+        let cfg = base().normalize();
+        assert_eq!(cfg.connect_timeout_secs, Some(DEFAULT_CONNECT_TIMEOUT_SECS));
+        assert_eq!(
+            cfg.readwrite_timeout_secs,
+            Some(DEFAULT_READWRITE_TIMEOUT_SECS)
+        );
+
+        let mut cfg = base();
+        cfg.connect_timeout_secs = Some(0);
+        cfg.readwrite_timeout_secs = Some(0);
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.connect_timeout_secs, Some(DEFAULT_CONNECT_TIMEOUT_SECS));
+        assert_eq!(
+            cfg.readwrite_timeout_secs,
+            Some(DEFAULT_READWRITE_TIMEOUT_SECS)
+        );
+
+        let mut cfg = base();
+        cfg.connect_timeout_secs = Some(3);
+        cfg.readwrite_timeout_secs = Some(120);
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.connect_timeout_secs, Some(3));
+        assert_eq!(cfg.readwrite_timeout_secs, Some(120));
     }
 
     #[tokio::test]
