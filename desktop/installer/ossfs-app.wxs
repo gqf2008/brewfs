@@ -20,6 +20,7 @@
     <!-- App binaries: tray + ossmount in the same folder. -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="OSSFS">
+        <Directory Id="LicenseDir" Name="LICENSES" />
         <Component Id="C_TrayExe" Directory="INSTALLFOLDER">
           <File Id="F_TrayExe" Source="$(var.TrayPath)" KeyPath="yes" />
         </Component>
@@ -28,6 +29,16 @@
         </Component>
         <Component Id="C_Readme" Directory="INSTALLFOLDER">
           <File Id="F_Readme" Source="$(var.ReadmePath)" KeyPath="yes" />
+        </Component>
+        <!-- Third-party license attribution. The WinFsp installer MSI is
+             redistributed by the bundle (ossfs-bundle.wxs); WinFsp is GPLv3
+             with a FLOSS exception whose terms require the copyright notice
+             and repository link to accompany redistribution. -->
+        <Component Id="C_LicensesReadme" Directory="LicenseDir">
+          <File Id="F_LicensesReadme" Source="$(var.LicensesReadmePath)" KeyPath="yes" />
+        </Component>
+        <Component Id="C_WinfspLicense" Directory="LicenseDir">
+          <File Id="F_WinfspLicense" Source="$(var.WinfspLicensePath)" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
@@ -42,7 +53,11 @@
                     Target="[#F_TrayExe]"
                     WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="R_RemoveOSSFSMenuFolder" On="uninstall" />
-          <RegistryValue Root="HKCU" Key="Software\OSSFS" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+          <!-- perMachine package: the KeyPath must be machine state (HKLM),
+               not HKCU — a per-user hive key under a per-machine install
+               fails ICE38/ICE43 checks and leaves the shortcut repairable
+               only under the account that ran the installer. -->
+          <RegistryValue Root="HKLM" Key="Software\OSSFS" Name="startMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
@@ -55,7 +70,7 @@
                   Description="OSSFS：OSS/S3 直挂为本地磁盘"
                   Target="[#F_TrayExe]"
                   WorkingDirectory="INSTALLFOLDER" />
-        <RegistryValue Root="HKCU" Key="Software\OSSFS" Name="desktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\OSSFS" Name="desktopShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
 
@@ -63,6 +78,8 @@
       <ComponentRef Id="C_TrayExe" />
       <ComponentRef Id="C_OssmountExe" />
       <ComponentRef Id="C_Readme" />
+      <ComponentRef Id="C_LicensesReadme" />
+      <ComponentRef Id="C_WinfspLicense" />
       <ComponentRef Id="C_StartMenuShortcut" />
       <ComponentRef Id="C_DesktopShortcut" />
     </Feature>

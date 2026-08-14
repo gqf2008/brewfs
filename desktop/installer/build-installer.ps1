@@ -58,6 +58,8 @@ wix extension list -g
 
 $appMsi = Join-Path $buildDir "ossfs-app.msi"
 $readme = Join-Path $installerDir "README.txt"
+$licensesReadme = Join-Path $installerDir "LICENSES\README.txt"
+$winfspLicense = Join-Path $installerDir "LICENSES\WinFsp-License.txt"
 $icon = Join-Path $installerDir "..\assets\ossfs.ico"
 
 # 显式指定 4.0.6 扩展 DLL，避免 wix build 解析到预置的 7.x 扩展目录（WIX0144）
@@ -72,6 +74,8 @@ Write-Host "==> Building app MSI..." -ForegroundColor Cyan
     -d "TrayPath=$trayExe" `
     -d "OssmountPath=$ossmountExe" `
     -d "ReadmePath=$readme" `
+    -d "LicensesReadmePath=$licensesReadme" `
+    -d "WinfspLicensePath=$winfspLicense" `
     -o $appMsi
 if ($LASTEXITCODE -ne 0) { throw "wix build app MSI failed" }
 

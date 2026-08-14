@@ -14,6 +14,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod model;
+mod secrets;
 mod winutil;
 
 use std::cell::{Cell, RefCell};
@@ -206,10 +207,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let edit = EditDialog::new()?;
     let tray = Tray::new()?;
 
-    let state = Rc::new(RefCell::new(model::load_profiles()));
+    let loaded = model::load_profiles();
+    let state = Rc::new(RefCell::new(loaded.file));
     let recent = Rc::new(RefCell::new(Vec::<RecentSpawn>::new()));
     let hold = Rc::new(StatusHold::default());
     let ossmount = Rc::new(model::find_ossmount());
+
+    // Surface profile-storage problems (corrupt file recovered, secure
+    // store unavailable, ...) to the user instead of failing silently.
+    if !loaded.warnings.is_empty() {
+        hold_status(&ui, &hold, format!("⚠️ {}", loaded.warnings.join("；")), 30);
+    }
 
     // Drive letters are a Windows concept; macOS/Linux use mount directories.
     edit.set_show_free_drives(cfg!(windows));
@@ -362,11 +370,21 @@ fn wire_callbacks(
             {
                 let mut file = state.borrow_mut();
                 upsert_profile(&mut file, &p);
-                if let Err(e) = model::save_profiles(&file) {
-                    let msg = format!("保存失败：{e}");
-                    edit.set_form_error(msg.clone().into());
-                    ui.set_status_text(msg.into());
-                    return;
+                match model::save_profiles(&file) {
+                    Ok(res) => {
+                        if let Some(w) = res.warnings.first() {
+                            let msg = format!("已保存，但 ⚠️ {w}");
+                            edit.set_form_error(msg.clone().into());
+                            ui.set_status_text(msg.into());
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("保存失败：{e}");
+                        edit.set_form_error(msg.clone().into());
+                        ui.set_status_text(msg.into());
+                        return;
+                    }
                 }
             }
             edit.set_form_error(String::new().into());
@@ -566,11 +584,20 @@ fn wire_callbacks(
                         if index >= 0 && (index as usize) < file.profiles.len() {
                             file.profiles.remove(index as usize);
                         }
-                        if let Err(e) = model::save_profiles(&file) {
-                            if let Some(ui) = ui_weak2.upgrade() {
-                                ui.set_status_text(format!("删除失败：{e}").into());
+                        match model::save_profiles(&file) {
+                            Ok(res) => {
+                                if let Some(w) = res.warnings.first() {
+                                    if let Some(ui) = ui_weak2.upgrade() {
+                                        ui.set_status_text(format!("⚠️ {w}").into());
+                                    }
+                                }
                             }
-                            return;
+                            Err(e) => {
+                                if let Some(ui) = ui_weak2.upgrade() {
+                                    ui.set_status_text(format!("删除失败：{e}").into());
+                                }
+                                return;
+                            }
                         }
                     }
                     if let (Some(ui), Some(tray)) = (ui_weak2.upgrade(), tray_weak2.upgrade()) {
@@ -617,9 +644,17 @@ fn wire_callbacks(
                 let mut p = p;
                 p.name = unique_import_name(&file.profiles, &p.name);
                 file.profiles.push(p);
-                if let Err(e) = model::save_profiles(&file) {
-                    ui.set_status_text(format!("导入失败：{e}").into());
-                    return;
+                match model::save_profiles(&file) {
+                    Ok(res) => {
+                        if let Some(w) = res.warnings.first() {
+                            ui.set_status_text(format!("已导入配置，但 ⚠️ {w}").into());
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        ui.set_status_text(format!("导入失败：{e}").into());
+                        return;
+                    }
                 }
             }
             if let Some(tray) = tray_weak.upgrade() {
@@ -655,7 +690,13 @@ fn wire_callbacks(
                 ui.set_status_text(format!("导出失败：{e}").into());
                 return;
             }
-            ui.set_status_text(format!("已导出配置到 {}", path.display()).into());
+            ui.set_status_text(
+                format!(
+                    "已导出配置到 {}（⚠️ 文件内含明文 AccessKey/SecretKey，请妥善保管）",
+                    path.display()
+                )
+                .into(),
+            );
         }
     });
 
@@ -860,7 +901,16 @@ fn mount_profile(
 fn upsert_profile(file: &mut model::ProfilesFile, p: &model::Profile) {
     let pos = file.profiles.iter().position(|x| x.name == p.name);
     match pos {
-        Some(i) => file.profiles[i] = p.clone(),
+        Some(i) => {
+            let mut p = p.clone();
+            // The edit form has no field for it: keep the secure-store key of
+            // the profile being replaced so the credentials are updated in
+            // place instead of orphaning the old entry.
+            if p.secret_ref.is_none() {
+                p.secret_ref = file.profiles[i].secret_ref.clone();
+            }
+            file.profiles[i] = p;
+        }
         None => file.profiles.push(p.clone()),
     }
 }
@@ -1070,6 +1120,8 @@ fn form_to_profile(edit: &EditDialog) -> model::Profile {
         prefix: edit.get_cfg_prefix().to_string(),
         access_key: edit.get_cfg_s3_access_key().to_string(),
         secret_key: edit.get_cfg_s3_secret_key().to_string(),
+        // Preserved from the replaced profile by `upsert_profile`.
+        secret_ref: None,
     }
 }
 
@@ -1416,6 +1468,9 @@ fn update_drive_options(edit: &EditDialog) {
 /// window: no taskbar button, always above its owner, and the owner is
 /// disabled so the dialog is genuinely modal (mouse/keyboard can only reach
 /// the dialog).
+// `ui` is only dereferenced on Windows (modal Win32 ownership); the macOS
+// build would otherwise warn on the new macOS CI job.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn open_edit_dialog(ui: &MainWindow, edit: &EditDialog, title: String) {
     edit.set_form_error(String::new().into());
     edit.set_edit_title(title.into());

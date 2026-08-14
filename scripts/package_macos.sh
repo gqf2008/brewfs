@@ -26,7 +26,9 @@ cd "$(git rev-parse --show-toplevel)"
 # ---- config ----
 IDENTITY="${IDENTITY:-Developer ID Application: qingfeng gao (XFXU84HVK3)}"
 BUNDLE_ID="${BUNDLE_ID:-ai.ossfs.tray}"
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+# 版本号来自 `cargo metadata`（单一受校验来源），避免对 Cargo.toml 做
+# "取第一个 version =" 的脆弱文本提取（与 release-desktop.yml 同一来源）。
+VERSION="${VERSION:-"$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="ossfs"))')"}"
 APP_NAME="OSSFS"
 MACFUSE_PREFIX="${MACFUSE_PREFIX:-$HOME/ossfs-deps/macfuse-5.3.3}"
 # FUSE-T prefix layout: $FUSE_T_PREFIX/{include/fuse,lib,lib/pkgconfig}.

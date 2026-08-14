@@ -73,6 +73,10 @@ Windows 上运行托盘应用会直接以无控制台窗口方式启动（`windo
    - 目标机已装 WinFsp（内核服务 `WinFsp` 存在）→ 跳过
    - 未装 → 静默安装；卸载 OSSFS 时**保留** WinFsp（共享系统组件）
 3. 把两个 exe 装到 `%ProgramFiles%\OSSFS`，并创建「OSSFS 托盘」开始菜单快捷方式
+4. 随包再分发 **WinFsp 官方安装器**（GPLv3 + FLOSS 例外，许可归属见
+   `desktop/installer/LICENSES/`，随安装包落到 `%ProgramFiles%\OSSFS\LICENSES\`）：
+   WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos，
+   源码 https://github.com/winfsp/winfsp
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File desktop\installer\build-installer.ps1 -Version 0.1.0

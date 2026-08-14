@@ -1,6 +1,6 @@
 [package]
 name = "ossfs-tray"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Windows system-tray manager for OSSFS (Slint 1.17 UI)"
 license = "MIT"
@@ -13,6 +13,10 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 dirs = { workspace = true }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Credentials go to the OS secure store (Credential Manager / Keychain).
+# The two native features are no-ops outside their platform; on Linux the
+# crate is compiled but unused (see src/secrets.rs `system_store`).
+keyring = { version = "3.6.2", default-features = false, features = ["windows-native", "apple-native"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

@@ -1,0 +1,10 @@
+# Pin the toolchain so local dev, CI (.github/workflows/ci.yml) and the
+# release workflows all build with the same compiler instead of tracking
+# whatever `stable` happens to be on the runner.
+#
+# Edition 2024 needs >= 1.85, but the current dependency tree (slint 1.17)
+# requires >= 1.92; 1.97 is the stable line current when this pin was added.
+# Keep this in sync with the `dtolnay/rust-toolchain@` refs in the workflows,
+# and bump all of them together when a dependency update needs a newer rustc.
+[toolchain]
+channel = "1.97"
