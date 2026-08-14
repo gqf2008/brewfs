@@ -1165,9 +1165,10 @@ impl AsyncFileSystemContext for OssMountContext {
                     .unwrap_or(0);
                 self.reserve_dirty(context, remote_size).await?;
             }
+            let lazy_path = context.path.lock().unwrap().clone();
             let data = self
                 .fs
-                .read_range(&context.path.lock().unwrap().clone(), 0, usize::MAX)
+                .read_range(&lazy_path, 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             // The object may have grown since stat; top up the reservation.
@@ -1201,9 +1202,10 @@ impl AsyncFileSystemContext for OssMountContext {
         if new_size > WRITE_SPOOL_THRESHOLD {
             self.reserve_dirty(context, new_size).await?;
             let existing = context.write_buf.lock().unwrap().clone();
+            let stream_path = context.path.lock().unwrap().clone();
             let mut up = self
                 .fs
-                .begin_streaming_upload(&context.path.lock().unwrap().clone())
+                .begin_streaming_upload(&stream_path)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
             if let Some(existing) = &existing
