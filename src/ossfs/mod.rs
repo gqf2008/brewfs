@@ -25,7 +25,6 @@ pub mod winfsp;
 
 use anyhow::{Context as _, Result};
 use aws_config::credential_process::CredentialProcessProvider;
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
@@ -421,8 +420,11 @@ const READ_BODY_BUDGET_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// headers; the body stream is otherwise protected solely by the SDK's
 /// StalledStreamProtection (fully-stalled, <1 B/s). A response trickling
 /// faster than that could otherwise pin the read's limiter permit
-/// indefinitely. The budget scales with the expected length so a slow but
-/// healthy link always fits.
+/// indefinitely. The budget scales with the expected length up to a cap, so
+/// the bounded read-ahead/cache reads always fit; the unbounded whole-object
+/// lazy-load (`usize::MAX`) is capped at 64 MiB of budget (8192 s) — large
+/// objects on a slow link can be cut mid-read there, which is acceptable
+/// because the whole-object lazy load is itself the pathological case.
 fn read_body_budget(expected_len: usize) -> Duration {
     let expected = (expected_len as u64).min(READ_BODY_BUDGET_CAP_BYTES);
     let by_throughput = (expected as f64 / READ_BODY_MIN_THROUGHPUT_BPS) as u64;
@@ -1325,11 +1327,10 @@ impl StreamingUpload {
             return Err(e);
         }
         self.parts.sort_by_key(|p| p.0);
-        // Captured before `hasher.finalize()` partially moves `self`: the
-        // completion builder and the NoSuchUpload verify path below still
-        // need them afterwards.
+        // `hasher.finalize()` below moves only `self.hasher`, so client /
+        // bucket / key remain borrowable for the completion builder and (on
+        // the rare error branch) the HEAD verify — no eager clone needed.
         let parts = std::mem::take(&mut self.parts);
-        let head = (self.client.clone(), self.bucket.clone(), self.key.clone());
         let expected_crc = self.verify_crc64.then(|| self.hasher.finalize());
         let crc_slot = Arc::new(Mutex::new(None));
         let mut complete = self
@@ -1357,22 +1358,26 @@ impl StreamingUpload {
             });
         }
         if let Err(e) = complete.send().await {
-            // A retried CompleteMultipartUpload racing the first attempt
-            // can fail with NoSuchUpload after the object was already
-            // completed server-side; aborting would then target a consumed
-            // upload (a no-op) and the caller would wrongly see failure.
-            // HEAD-verify: when the key exists with exactly the fed byte
-            // count the write succeeded.
-            let code = e
-                .as_service_error()
-                .and_then(|se| se.code())
-                .map(str::to_string);
-            if code.as_deref() == Some("NoSuchUpload")
-                && matches!(
-                    head_reports_size(&head.0, &head.1, &head.2, self.total_bytes).await,
-                    Some(true)
+            // A failed CompleteMultipartUpload may still have completed the
+            // object server-side: a retried complete racing the first attempt
+            // reports NoSuchUpload, and a timeout / 5xx / connection reset can
+            // land after the request was issued. Aborting would then target a
+            // consumed upload (a no-op) and the caller would wrongly see
+            // failure. HEAD-verify: when the key exists with exactly the fed
+            // byte count the write succeeded (the complete response never
+            // arrived, so the whole-object CRC64 header cannot be captured —
+            // size-verified success is the best guarantee for this path).
+            if matches!(
+                head_reports_size(
+                    &self.client,
+                    &self.bucket,
+                    &self.key,
+                    self.total_bytes,
+                    &self.metrics
                 )
-            {
+                .await,
+                Some(true)
+            ) {
                 return Ok(());
             }
             let _ = self
@@ -1396,13 +1401,17 @@ impl StreamingUpload {
 /// `expected_bytes`. Used to confirm a multipart upload that completed
 /// server-side before a racing CompleteMultipartUpload failed (e.g. with
 /// NoSuchUpload), so the caller treats the write as success instead of
-/// aborting or erroring on a possibly-complete object.
+/// aborting or erroring on a possibly-complete object. `metrics`, when
+/// provided, counts the HEAD against `s3_heads` (it is invisible to the
+/// adapters' other HEAD paths otherwise).
 async fn head_reports_size(
     client: &Client,
     bucket: &str,
     key: &str,
     expected_bytes: u64,
+    metrics: &Metrics,
 ) -> Option<bool> {
+    metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
     let resp = client
         .head_object()
         .bucket(bucket)
@@ -2125,6 +2134,7 @@ impl ObjectFs {
                         }
                     }
                     let Ok(_permit) = limiter.clone().acquire_owned().await else {
+                        inflight.lock().unwrap().remove(&(key.clone(), block));
                         return;
                     };
                     let start = block * cache.block_size;
@@ -2152,6 +2162,7 @@ impl ObjectFs {
                         Ok(c) => c,
                         Err(_) => {
                             metrics.prefetch_failed.fetch_add(1, Ordering::Relaxed);
+                            metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
                             inflight.lock().unwrap().remove(&(key.clone(), block));
                             return;
                         }
@@ -2178,7 +2189,14 @@ impl ObjectFs {
     /// HEAD `key`; return `Some(true)` when it exists with exactly
     /// `expected_bytes` (see [`head_reports_size`] for the rationale).
     async fn verify_completed_object(&self, key: &str, expected_bytes: u64) -> Option<bool> {
-        head_reports_size(&self.client, &self.bucket, key, expected_bytes).await
+        head_reports_size(
+            &self.client,
+            &self.bucket,
+            key,
+            expected_bytes,
+            &self.metrics,
+        )
+        .await
     }
 
     async fn verify_disk_cache_etag(&self, key: &str) {
@@ -2246,15 +2264,22 @@ impl ObjectFs {
                 return Err(e).context("s3 get");
             }
         };
-        let bytes = tokio::time::timeout(read_body_budget(len), resp.body.collect())
-            .await
-            .map_err(|_| {
+        let body = tokio::time::timeout(read_body_budget(len), resp.body.collect()).await;
+        let bytes = match body {
+            Ok(Ok(collected)) => collected.to_vec(),
+            Ok(Err(e)) => {
+                // Mid-body stream error (reset, hyper I/O, the SDK's own
+                // StalledStreamProtection) — same counters as the budget miss.
                 self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
                 self.metrics.s3_get_errors.fetch_add(1, Ordering::Relaxed);
-                anyhow::anyhow!("s3 get body stalled past its budget ({len} bytes requested)")
-            })?
-            .context("s3 get body")?
-            .to_vec();
+                return Err(e).context("s3 get body");
+            }
+            Err(_) => {
+                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                self.metrics.s3_get_errors.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("s3 get body stalled past its budget ({len} bytes requested)");
+            }
+        };
         self.metrics
             .download_bytes_total
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -2528,21 +2553,13 @@ impl ObjectFs {
             });
         }
         if let Err(e) = complete.send().await {
-            // NoSuchUpload after a racing completion: verify the object
-            // landed intact before aborting/erroring (see StreamingUpload).
-            let code = e
-                .as_service_error()
-                .and_then(|se| se.code())
-                .map(str::to_string);
-            if code.as_deref() == Some("NoSuchUpload")
-                && matches!(
-                    self.verify_completed_object(&key, data.len() as u64).await,
-                    Some(true)
-                )
-            {
-                if let Some(expected) = expected_crc {
-                    check_crc64_response(crc_slot, expected, &self.metrics)?;
-                }
+            // Any failed CompleteMultipartUpload may have completed server-side
+            // (NoSuchUpload race, timeout, 5xx, reset). HEAD-verify before
+            // aborting/erroring (see StreamingUpload::finish).
+            if matches!(
+                self.verify_completed_object(&key, data.len() as u64).await,
+                Some(true)
+            ) {
                 return Ok(());
             }
             let _ = self
@@ -2721,16 +2738,9 @@ impl ObjectFs {
             });
         }
         if let Err(e) = complete.send().await {
-            let code = e
-                .as_service_error()
-                .and_then(|se| se.code())
-                .map(str::to_string);
-            if code.as_deref() == Some("NoSuchUpload")
-                && matches!(self.verify_completed_object(&key, size).await, Some(true))
-            {
-                if let Some(expected) = expected_crc {
-                    check_crc64_response(crc_slot, expected, &self.metrics)?;
-                }
+            // Any failed CompleteMultipartUpload may have completed server-side
+            // (see StreamingUpload::finish). HEAD-verify before aborting.
+            if matches!(self.verify_completed_object(&key, size).await, Some(true)) {
                 return Ok(());
             }
             let _ = self
@@ -4890,6 +4900,48 @@ mod s3_mock_tests {
             res.is_err(),
             "genuinely-missing upload must surface an error"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_multipart_complete_failure_with_crc64_and_intact_object_succeeds() {
+        // Regression: write_multipart/_from_file's complete-failure recovery
+        // used to call check_crc64_response, but the complete response never
+        // arrived so the crc slot was empty → check_crc64_response bailed
+        // ("header missing"), turning a recovered success into an error. This
+        // only manifested with verify_crc64=true (tests default it off).
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+        mock.complete_no_such_upload.store(true, Ordering::SeqCst);
+        // > MULTIPART_THRESHOLD (16 MiB) routes through write_multipart.
+        let data: Vec<u8> = vec![0x33u8; 16 * 1024 * 1024 + 1];
+        mock.set_object("large.bin", data.clone());
+
+        fs.write("/large.bin", &data)
+            .await
+            .expect("complete failure with an intact object must recover to success");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_from_file_complete_failure_recovers_on_intact_object() {
+        // Same recovery contract as the buffered write path, through the
+        // spool-file multipart implementation.
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+        mock.complete_no_such_upload.store(true, Ordering::SeqCst);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("large.bin");
+        let data: Vec<u8> = (0..20 * 1024 * 1024usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&src, &data).expect("write spool");
+        mock.set_object("large.bin", data);
+
+        fs.write_from_file("/large.bin", &src)
+            .await
+            .expect("complete failure with an intact object must recover to success");
     }
 
     #[test]
