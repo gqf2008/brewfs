@@ -92,20 +92,71 @@ struct GuardState {
     /// Drives that fast-failed (e.g. bad config) and must be retried only by
     /// the user manually.
     failed: std::collections::HashSet<String>,
+    /// Auto-restarts already spent per drive since the mount was last seen
+    /// healthy; bounded by [`MAX_AUTO_RESTARTS`] (#61).
+    restarts: std::collections::HashMap<String, u32>,
+}
+
+/// Maximum auto-restart attempts before the guard gives up on a drive and
+/// leaves it for the user to remount manually. A mount that crashes ~every
+/// 30s would otherwise be respawned forever (#61).
+const MAX_AUTO_RESTARTS: u32 = 5;
+
+/// Decision extracted from [`auto_restart`] so the backoff / give-up policy
+/// is unit-testable without a UI (#61).
+#[derive(Debug, PartialEq, Eq)]
+enum RestartDecision {
+    /// Backoff window since the last spawn has not elapsed yet.
+    WaitForBackoff,
+    /// Restart budget exhausted: stop auto-restarting this drive.
+    GiveUp,
+    /// Safe to spawn a replacement now.
+    Proceed,
+}
+
+fn restart_decision(elapsed_since_spawn: Duration, restarts_spent: u32) -> RestartDecision {
+    if elapsed_since_spawn < Duration::from_secs(30) {
+        return RestartDecision::WaitForBackoff;
+    }
+    if restarts_spent >= MAX_AUTO_RESTARTS {
+        return RestartDecision::GiveUp;
+    }
+    RestartDecision::Proceed
 }
 
 static MOUNT_GUARD: std::sync::OnceLock<std::sync::Mutex<GuardState>> = std::sync::OnceLock::new();
 
+/// Snapshot of the drive names shown in the tray menu, in menu order. The
+/// menu callback only receives an index; re-reading the mount list at click
+/// time could resolve the index against a differently-ordered list (menu
+/// open → 2s refresh reorders → click opens the wrong drive, #61).
+static TRAY_MENU_DRIVES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn tray_menu_drives() -> std::sync::MutexGuard<'static, Vec<String>> {
+    TRAY_MENU_DRIVES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn guard() -> std::sync::MutexGuard<'static, GuardState> {
     MOUNT_GUARD
         .get_or_init(|| std::sync::Mutex::new(GuardState::default()))
+        // A panic while holding the guard (e.g. inside the 2s timer) must
+        // not cascade into a panic on every later callback, killing the
+        // Slint event loop: the GuardState invariants are simple enough that
+        // recovering the (possibly mid-update) state is strictly better than
+        // dying (#61).
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Monitor desired mounts and auto-restart any whose process died without a
-/// user-initiated unmount. Backs off 30s between attempts and stops retrying
-/// after a fast failure (config error) until the user mounts manually.
+/// user-initiated unmount. Backs off 30s between attempts, stops retrying
+/// after a fast failure (config error) until the user mounts manually, and
+/// gives up after [`MAX_AUTO_RESTARTS`] consecutive restarts so a
+/// crash-looping mount cannot be respawned forever (#61).
 fn auto_restart(
     ui: &MainWindow,
     hold: &StatusHold,
@@ -119,6 +170,9 @@ fn auto_restart(
     for drive in g.desired.clone() {
         if mounts.iter().any(|m| m.alive && m.drive == drive) {
             g.failed.remove(&drive);
+            // Healthy again: the restart budget replenishes for the next
+            // lifetime (#61).
+            g.restarts.remove(&drive);
             continue;
         }
         if g.failed.contains(&drive) {
@@ -129,8 +183,22 @@ fn auto_restart(
             .get(&drive)
             .map(|t| t.elapsed())
             .unwrap_or(Duration::from_secs(60));
-        if since < Duration::from_secs(30) {
-            continue;
+        let spent = *g.restarts.get(&drive).unwrap_or(&0);
+        match restart_decision(since, spent) {
+            RestartDecision::WaitForBackoff => continue,
+            RestartDecision::GiveUp => {
+                g.failed.insert(drive.clone());
+                hold_status(
+                    ui,
+                    hold,
+                    format!(
+                        "{drive} 多次自动重启后仍退出（已达 {MAX_AUTO_RESTARTS} 次上限），已停止自动重启，请手动重挂或查看日志"
+                    ),
+                    30,
+                );
+                continue;
+            }
+            RestartDecision::Proceed => {}
         }
         let Some(p) = profiles
             .iter()
@@ -151,6 +219,10 @@ fn auto_restart(
         match spawned {
             Some(Ok((pid, log))) => {
                 g.last_spawn.insert(drive.clone(), Instant::now());
+                g.restarts
+                    .entry(drive.clone())
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
                 recent.borrow_mut().push(RecentSpawn {
                     drive: drive.clone(),
                     pid,
@@ -501,7 +573,8 @@ fn wire_callbacks(
                     &pending,
                     &format!("确定要卸载 {drive} 吗？"),
                     move || {
-                        guard().desired.remove(&m.drive);
+                        // graceful_or_kill takes the drive out of the
+                        // auto-restart desired set itself.
                         // 卸载已发起：立刻从“挂载中”跟踪里摘掉这条，避免进程还在
                         // 优雅退出期间被误判为“挂载中”而把挂载按钮一直置灰。
                         recent2.borrow_mut().retain(|r| r.pid != m.pid);
@@ -543,13 +616,24 @@ fn wire_callbacks(
         let hold = Rc::clone(&hold);
         move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let name = {
+            let (name, mounted) = {
                 let profiles = state.borrow();
                 let Some(p) = profiles.profiles.get(index as usize) else {
                     ui.set_status_text("记录不存在".into());
                     return;
                 };
-                p.name.clone()
+                let drive = model::normalize_mount_point(&p.drive);
+                let mounted = model::read_mounts(&profiles.profiles)
+                    .iter()
+                    .any(|m| m.alive && m.drive == drive);
+                (p.name.clone(), mounted)
+            };
+            // Regression (#61): deleting a config never checked whether its
+            // drive is currently mounted.
+            let mount_note = if mounted {
+                "\n⚠️ 该配置的挂载点当前已挂载：删除配置不会卸载它。".to_string()
+            } else {
+                String::new()
             };
             let state2 = state.clone();
             let recent2 = recent.clone();
@@ -559,7 +643,7 @@ fn wire_callbacks(
             ask_confirm(
                 &ui,
                 &pending,
-                &format!("确定要删除配置「{name}」吗？"),
+                &format!("确定要删除配置「{name}」吗？{mount_note}"),
                 move || {
                     {
                         let mut file = state2.borrow_mut();
@@ -661,15 +745,15 @@ fn wire_callbacks(
 
     // --- select a record -> load into the form ---
     // --- tray: open a mounted drive ---
-    {
-        let state = state.clone();
-        tray.on_open_mount(move |index| {
-            let mounts = model::read_mounts(&state.borrow().profiles);
-            if let Some(m) = mounts.get(index as usize) {
-                open_in_explorer(&m.drive);
-            }
-        });
-    }
+    // The index identifies a row of the menu as it was rendered; resolve it
+    // against the snapshot taken when the menu was last populated instead of
+    // re-reading the (possibly reordered) mount list (#61).
+    tray.on_open_mount(move |index| {
+        let drive = tray_menu_drives().get(index as usize).cloned();
+        if let Some(drive) = drive {
+            open_in_explorer(&drive);
+        }
+    });
 
     // --- window close -> hide to tray (进程保留，双击托盘图标重新打开) ---
     ui.window().on_close_requested({
@@ -725,13 +809,50 @@ fn wire_callbacks(
 
     // 退出：先显式移除托盘图标（避免任何情况下残留），再退出事件循环。
     // Slint 的 SystemTrayIcon 在组件 drop 时也会 NIM_DELETE，这里 double-check。
+    // Regression (#61): quitting used to ignore live mounts entirely — no
+    // hint and no choice. Now quitting with live mounts asks for
+    // confirmation first (they stay mounted but lose auto-restart
+    // supervision once the tray is gone).
     let tray_for_quit = tray_weak.clone();
+    let ui_for_quit = ui.as_weak();
+    let state_for_quit = state.clone();
+    let pending_for_quit = Rc::clone(&pending);
     let do_quit = move || {
-        if let Some(tray) = tray_for_quit.upgrade() {
-            // 先移除托盘图标（Slint 组件 drop 时也会 NIM_DELETE，双保险）。
-            let _ = tray.hide();
+        let mounts = model::read_mounts(&state_for_quit.borrow().profiles);
+        let live: Vec<String> = mounts
+            .iter()
+            .filter(|m| m.alive)
+            .map(|m| m.drive.clone())
+            .collect();
+        let tray_weak_now = tray_for_quit.clone();
+        let quit_now = move || {
+            if let Some(tray) = tray_weak_now.upgrade() {
+                // 先移除托盘图标（Slint 组件 drop 时也会 NIM_DELETE，双保险）。
+                let _ = tray.hide();
+            }
+            quit_app();
+        };
+        if live.is_empty() {
+            quit_now();
+            return;
         }
-        quit_app();
+        if let Some(ui) = ui_for_quit.upgrade() {
+            // The confirm dialog lives in the main window; make sure it is
+            // visible even when quitting from the tray menu.
+            let _ = ui.show();
+            ask_confirm(
+                &ui,
+                &pending_for_quit,
+                &format!(
+                    "仍有 {} 个挂载在运行（{}）。\n退出托盘不会卸载它们，但退出后它们不再被自动重启看护。确定退出吗？",
+                    live.len(),
+                    live.join("、")
+                ),
+                quit_now,
+            );
+        } else {
+            quit_now();
+        }
     };
     ui.on_quit_app(do_quit.clone());
     tray.on_quit_app(do_quit);
@@ -953,7 +1074,8 @@ fn refresh(
         .collect();
     ui.set_records(ModelRc::new(Rc::new(VecModel::from(records))));
 
-    // Tray menu: only live mounts.
+    // Tray menu: only live mounts. Keep a same-order snapshot of the drives
+    // so the menu callback's index resolves against what the user saw (#61).
     let tray_rows: Vec<MountInfo> = mounts
         .iter()
         .filter(|m| m.alive)
@@ -965,6 +1087,7 @@ fn refresh(
             alive: m.alive,
         })
         .collect();
+    *tray_menu_drives() = tray_rows.iter().map(|m| m.drive.to_string()).collect();
     tray.set_mounts(ModelRc::new(Rc::new(VecModel::from(tray_rows))));
 
     let live: Vec<&model::MountStatus> = mounts.iter().filter(|m| m.alive).collect();
@@ -1087,21 +1210,47 @@ fn ask_confirm(
     *pending.borrow_mut() = Some(Box::new(on_yes));
 }
 
-/// Unmount an OSS mount. `ossmount` instances have no control plane to shut
-/// down gracefully; data is flushed on close, so terminating is safe.
+/// How long a mount gets to flush its whole-file write buffers and unmount
+/// after SIGTERM before it is force-killed (#61). In-flight buffered writes
+/// are lost on a force kill, so the graceful window matters.
+const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Unmount an OSS mount.
+///
+/// Writes are whole-file buffered and pushed on close, so force-killing the
+/// process can lose the entire in-flight buffer of a large file. The
+/// sequence is therefore: ask for a graceful shutdown (SIGTERM on Unix —
+/// `ossmount` unmounts cleanly on it), wait up to
+/// [`GRACEFUL_UNMOUNT_TIMEOUT`] for the process to exit, and only then
+/// force-terminate. Windows console mount processes have no mechanism to
+/// receive a soft shutdown request yet (needs an ossmount control handler /
+/// control-plane stop — tracked in #61), so there the force path is
+/// immediate, as before.
 fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
-    match winutil::terminate_process(m.pid) {
-        Ok(()) => {
-            guard().desired.remove(&m.drive);
-            // Drop the stale drive icon from "This PC" right away.
-            winutil::notify_drive_removed(&m.drive);
-            // Remove the runtime record so the row can't linger as a stale
-            // "not mounted" entry (idempotent: missing file is fine).
-            let _ = std::fs::remove_file(model::oss_records_dir().join(format!("{}.json", m.pid)));
-            ui.set_status_text(format!("已卸载 {}", m.drive).into());
+    guard().desired.remove(&m.drive);
+    let ui_weak = ui.as_weak();
+    let m = m.clone();
+    std::thread::spawn(move || {
+        let graceful = winutil::request_graceful_shutdown(m.pid);
+        if !(graceful && winutil::wait_for_exit(m.pid, GRACEFUL_UNMOUNT_TIMEOUT)) {
+            if let Err(e) = winutil::terminate_process(m.pid) {
+                let msg = format!("卸载 {} 失败：{e}", m.drive);
+                let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_status_text(msg.into());
+                });
+                return;
+            }
         }
-        Err(e) => ui.set_status_text(format!("卸载 {} 失败：{e}", m.drive).into()),
-    }
+        // Drop the stale drive icon from "This PC" right away.
+        winutil::notify_drive_removed(&m.drive);
+        // Remove the runtime record so the row can't linger as a stale
+        // "not mounted" entry (idempotent: missing file is fine).
+        let _ = std::fs::remove_file(model::oss_records_dir().join(format!("{}.json", m.pid)));
+        let msg = format!("已卸载 {}", m.drive);
+        let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+            ui.set_status_text(msg.into());
+        });
+    });
 }
 
 fn open_in_explorer(target: &str) {
@@ -1651,5 +1800,98 @@ mod tests {
             unique_import_name(&[profile("导入配置"), profile("导入配置 2")], "导入配置"),
             "导入配置 3"
         );
+    }
+
+    #[test]
+    fn restart_decision_backs_off_then_gives_up() {
+        // Regression (#61): the auto-restart guard had only a 30s backoff and
+        // would respawn a crash-looping mount forever.
+        assert_eq!(
+            restart_decision(Duration::from_secs(5), 0),
+            RestartDecision::WaitForBackoff
+        );
+        assert_eq!(
+            restart_decision(Duration::from_secs(31), 0),
+            RestartDecision::Proceed
+        );
+        assert_eq!(
+            restart_decision(Duration::from_secs(31), MAX_AUTO_RESTARTS),
+            RestartDecision::GiveUp
+        );
+        assert_eq!(
+            restart_decision(Duration::from_secs(31), MAX_AUTO_RESTARTS + 10),
+            RestartDecision::GiveUp
+        );
+        // The backoff still applies even with budget left.
+        assert_eq!(
+            restart_decision(Duration::from_secs(1), MAX_AUTO_RESTARTS - 1),
+            RestartDecision::WaitForBackoff
+        );
+    }
+
+    #[test]
+    fn guard_recovers_from_poisoned_mutex() {
+        // Regression (#61): any panic while holding the guard made every
+        // later timer callback panic too, killing the Slint event loop.
+        let drive = format!("poison-test-{}", std::process::id());
+        std::thread::scope(|s| {
+            let d = drive.clone();
+            s.spawn(move || {
+                let mut g = guard();
+                // Mutate state, then panic while still holding the lock.
+                g.desired.insert(d);
+                panic!("poison the guard mutex");
+            })
+            .join()
+            .unwrap_err();
+        });
+        // Must not panic; the recovered state is still usable.
+        let mut g = guard();
+        g.desired.remove(&drive);
+        drop(g);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_observes_short_lived_process() {
+        // A SIGTERM'd `sleep` exits promptly: the graceful window must
+        // observe it (and not report a timeout that would force-kill).
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as u32;
+        assert!(winutil::request_graceful_shutdown(pid));
+        assert!(
+            winutil::wait_for_exit(pid, Duration::from_secs(10)),
+            "graceful shutdown must be observed within the window"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_times_out_on_still_running_process() {
+        // A long-running process that outlives the window must make
+        // wait_for_exit report a timeout (the caller then falls back to
+        // terminate_process). No signal semantics involved — the process is
+        // simply still alive after the window.
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as u32;
+        assert!(
+            !winutil::wait_for_exit(pid, Duration::from_secs(2)),
+            "a still-running process must exhaust the graceful window"
+        );
+        winutil::terminate_process(pid).expect("force kill");
+        let _ = child.wait();
     }
 }
