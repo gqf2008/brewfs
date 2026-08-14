@@ -1395,6 +1395,21 @@ impl StreamingUpload {
         }
         Ok(())
     }
+
+    /// Abort the multipart upload and discard any uploaded parts, keeping
+    /// the object's previous content (or absence). Used when a truncate /
+    /// overwrite invalidates the in-flight stream (#47).
+    pub async fn abort(mut self) {
+        self.tasks.abort_all();
+        let _ = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await;
+    }
 }
 
 /// HEAD `key`; return `Some(true)` when it exists with exactly
@@ -3139,6 +3154,20 @@ fn s3_copy_source(bucket: &str, key: &str) -> String {
         }
     }
     out
+}
+
+static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Unique temp-file path for a streaming write handle's read-back spool
+/// (#47): while a multipart upload is in flight the parts are invisible to
+/// reads, so the handle spills the bytes written so far to a temp file and
+/// serves reads from it until the upload completes.
+fn spool_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "ossfs-spool-{}-{}",
+        std::process::id(),
+        SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// Last path component of a normalized POSIX path. `/` stays `/`.

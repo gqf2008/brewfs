@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use super::{
     DirEntry, DirtyBudget, DirtyPermit, MountAttr, ObjectFs, StreamingUpload, effective_mode,
-    effective_owner,
+    effective_owner, spool_file_path,
 };
 
 /// Attribute/entry cache lifetime. Object storage has no change notifications,
@@ -114,6 +114,10 @@ struct OpenFile {
     /// open. POSIX keeps the handle usable but the bytes must be discarded on
     /// close — flushing would resurrect the deleted object (#46).
     unlinked: bool,
+    /// Read-back spool for streaming handles (#47): while a multipart upload
+    /// is in flight the parts are invisible to reads, so the bytes written so
+    /// far are spilled here and reads are served from it.
+    spool_path: Option<PathBuf>,
     /// Current logical file size (set by setattr/truncate and write).
     logical_size: u64,
 }
@@ -519,6 +523,13 @@ impl Filesystem for OssFs {
                         && open.path == path
                         && open.write_buf.is_some()
                     {
+                        // #47: a truncate invalidates any in-flight stream —
+                        // bytes written afterwards must not append to it.
+                        let stream_arc = open.stream.clone();
+                        let stream = self.block_on(async { stream_arc.lock().await.take() });
+                        if let Some(up) = stream {
+                            self.block_on(up.abort());
+                        }
                         open.logical_size = new_size;
                         open.dirty = true;
                         handled = true;
@@ -798,6 +809,7 @@ impl Filesystem for OssFs {
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
                 unlinked: false,
+                spool_path: None,
                 logical_size: 0,
             },
         );
@@ -882,6 +894,7 @@ impl Filesystem for OssFs {
                 stream: Arc::new(tokio::sync::Mutex::new(None)),
                 stream_failed: Arc::new(AtomicBool::new(false)),
                 unlinked: false,
+                spool_path: None,
                 logical_size: 0,
             },
         );
@@ -910,6 +923,29 @@ impl Filesystem for OssFs {
             reply.error(Errno::EBADF);
             return;
         };
+        // #47: a streaming handle's in-flight bytes are only visible through
+        // the read-back spool (the multipart parts are invisible until the
+        // upload completes) — serve reads from it when present.
+        if let Some(path) = open.spool_path.clone() {
+            let data = match self.block_on(async {
+                let mut f = tokio::fs::File::open(&path).await?;
+                tokio::io::AsyncSeekExt::seek(&mut f, std::io::SeekFrom::Start(offset)).await?;
+                let mut buf = vec![0u8; size as usize];
+                let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+                buf.truncate(n);
+                anyhow::Ok(buf)
+            }) {
+                Ok(d) => {
+                    reply.data(&d);
+                    return;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), offset = offset, error = ?e, "ossfs spool read failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+        }
         if let Some(buf) = open.write_buf
             && open.loaded
         {
@@ -1012,6 +1048,36 @@ impl Filesystem for OssFs {
         {
             let mut guard = self.block_on(async { open_snapshot.stream.lock().await });
             if let Some(up) = guard.as_mut() {
+                // #47: the streaming upload is append-only; a write anchored
+                // anywhere but the current end silently corrupts the object.
+                if offset != open_snapshot.logical_size {
+                    warn!(
+                        path = %path,
+                        offset, logical_size = open_snapshot.logical_size,
+                        "ossfs stream write out of order"
+                    );
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                // Keep the read-back spool in sync with the stream (#47).
+                if let Some(path) = open_snapshot.spool_path.clone() {
+                    let mut f = match self
+                        .block_on(tokio::fs::OpenOptions::new().append(true).open(&path))
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!(path = %path.display(), error = ?e, "ossfs spool append open failed");
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    };
+                    if let Err(e) = self.block_on(tokio::io::AsyncWriteExt::write_all(&mut f, data))
+                    {
+                        warn!(path = %path.display(), error = ?e, "ossfs spool append failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                }
                 if let Err(e) = self.block_on(up.write(data)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
                     reply.error(Errno::EIO);
@@ -1058,12 +1124,41 @@ impl Filesystem for OssFs {
             }
             let stream = open_snapshot.stream.clone();
             self.block_on(async move { *stream.lock().await = Some(up) });
+            // #47: spill everything written so far to a temp file so reads on
+            // this handle see the bytes (multipart parts are invisible until
+            // the upload completes). read() serves from the spool.
+            let spool = spool_file_path();
+            {
+                let mut f = match self.block_on(tokio::fs::File::create(&spool)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(path = %path, error = ?e, "ossfs spool create failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                if let Some(existing) = &existing {
+                    if let Err(e) =
+                        self.block_on(tokio::io::AsyncWriteExt::write_all(&mut f, existing))
+                    {
+                        warn!(path = %path, error = ?e, "ossfs spool write failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                }
+                if let Err(e) = self.block_on(tokio::io::AsyncWriteExt::write_all(&mut f, data)) {
+                    warn!(path = %path, error = ?e, "ossfs spool write failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
             let mut files = self.files.lock().unwrap();
             if let Some(o) = files.get_mut(&fh.0) {
                 o.write_buf = Some(Vec::new());
                 o.loaded = true;
                 o.logical_size = new_size as u64;
                 o.dirty = true;
+                o.spool_path = Some(spool);
             }
             reply.written(data.len() as u32);
             return;
@@ -1111,6 +1206,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
+            // The upload completed; the read-back spool is stale (#47).
+            if let Some(path) = o.spool_path.take() {
+                let _ = std::fs::remove_file(&path);
+            }
             if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;
@@ -1135,6 +1234,9 @@ impl Filesystem for OssFs {
             // Errors on release are not surfaced to the caller; log them.
             if let Err(e) = self.flush_open(&open) {
                 warn!(path = %open.path, error = ?e, "ossfs release flush failed");
+            }
+            if let Some(path) = open.spool_path.clone() {
+                let _ = std::fs::remove_file(&path);
             }
             self.files.lock().unwrap().remove(&fh.0);
         }
@@ -1165,6 +1267,10 @@ impl Filesystem for OssFs {
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
             o.dirty = false;
+            // The upload completed; the read-back spool is stale (#47).
+            if let Some(path) = o.spool_path.take() {
+                let _ = std::fs::remove_file(&path);
+            }
             if o.write_buf.is_some() {
                 o.write_buf = Some(Vec::new());
                 o.loaded = false;

@@ -23,7 +23,7 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, U16CStr};
 
-use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs, StreamingUpload};
+use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs, StreamingUpload, spool_file_path};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
@@ -345,6 +345,11 @@ impl OssMountContext {
                 ctx.stream_failed.store(true, Ordering::Release);
                 return Err(FspError::from(IoError::other(e.to_string())));
             }
+            // The upload is complete; drop the read-back spool (#47).
+            if let Some(path) = ctx.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+            }
+            ctx.spool_size.store(0, Ordering::Release);
             ctx.logical_size.store(0, Ordering::Release);
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
@@ -843,6 +848,15 @@ impl FileSystemContext for OssMountContext {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
         }
+        // #47: an in-flight streaming upload must be aborted or the bytes
+        // written after the overwrite would append to the old stream and the
+        // object would end up containing pre-overwrite content.
+        {
+            let mut stream_guard = self.block_on(async { context.stream.lock().await });
+            if let Some(up) = stream_guard.take() {
+                self.block_on(up.abort());
+            }
+        }
         if let Some(path) = context.spool_path.lock().unwrap().take() {
             let _ = std::fs::remove_file(&path);
             context.spool_size.store(0, Ordering::Release);
@@ -958,7 +972,15 @@ impl FileSystemContext for OssMountContext {
         }
 
         if new_size == 0 {
-            // Truncate to zero: discard spool and clear the buffer.
+            // Truncate to zero: abort any in-flight stream (bytes written
+            // after the truncate would otherwise append to it), discard the
+            // spool and clear the buffer (#47).
+            {
+                let mut stream_guard = self.block_on(async { context.stream.lock().await });
+                if let Some(up) = stream_guard.take() {
+                    self.block_on(up.abort());
+                }
+            }
             if let Some(path) = context.spool_path.lock().unwrap().take() {
                 let _ = std::fs::remove_file(&path);
                 context.spool_size.store(0, Ordering::Release);
@@ -1077,14 +1099,37 @@ impl AsyncFileSystemContext for OssMountContext {
         {
             let mut stream_guard = context.stream.lock().await;
             if let Some(up) = stream_guard.as_mut() {
-                up.write(buffer)
-                    .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                // #47: the streaming upload is append-only. A write anchored
+                // anywhere but the current end (or past it) would silently
+                // corrupt the object — reject it explicitly.
                 let base = if write_to_eof {
                     context.logical_size.load(Ordering::Acquire)
                 } else {
                     offset
                 };
+                let cur = context.logical_size.load(Ordering::Acquire);
+                if base != cur {
+                    return Err(FspError::from(IoError::other(format!(
+                        "streaming write at offset {base} while current size is {cur}"
+                    ))));
+                }
+                // Keep the read-back spool in sync with the stream (#47).
+                if let Some(path) = context.spool_path.lock().unwrap().clone() {
+                    let mut f = tokio::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    tokio::io::AsyncWriteExt::write_all(&mut f, buffer)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
+                context
+                    .spool_size
+                    .fetch_add(buffer.len() as u64, Ordering::Release);
+                up.write(buffer)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
                 let end = base.saturating_add(buffer.len() as u64);
                 let cur = context.logical_size.load(Ordering::Acquire);
                 if end > cur {
@@ -1171,6 +1216,25 @@ impl AsyncFileSystemContext for OssMountContext {
             up.write(buffer)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            // #47: spill everything written so far to a temp file so reads on
+            // this handle see the bytes (multipart parts are invisible until
+            // the upload completes). read_async serves from the spool.
+            let spool = spool_file_path();
+            {
+                let mut f = tokio::fs::File::create(&spool)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                if let Some(existing) = &existing {
+                    tokio::io::AsyncWriteExt::write_all(&mut f, existing)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut f, buffer)
+                    .await
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            }
+            *context.spool_path.lock().unwrap() = Some(spool);
+            context.spool_size.store(new_size as u64, Ordering::Release);
             *context.write_buf.lock().unwrap() = Some(Vec::new());
             context.loaded.store(true, Ordering::Release);
             *context.stream.lock().await = Some(up);
@@ -1669,6 +1733,103 @@ mod tests {
             *file.path.lock().unwrap(),
             "/b",
             "handle must be retargeted to the new path"
+        );
+    }
+
+    /// Data larger than WRITE_SPOOL_THRESHOLD with a distinguishable byte
+    /// pattern for read-back verification.
+    fn big_data() -> Vec<u8> {
+        (0..(WRITE_SPOOL_THRESHOLD + 1024 * 1024))
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streaming_write_out_of_order_rejected() {
+        // #47: once streaming, a write anchored anywhere but the current end
+        // must fail instead of silently corrupting the object.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        let big = big_data();
+        let n = ctx
+            .write_async(file, &big, 0, false, false, &mut fi)
+            .await
+            .expect("first write");
+        assert_eq!(n as usize, big.len());
+
+        let err = ctx
+            .write_async(file, b"xx", 0, false, false, &mut fi)
+            .await
+            .expect_err("out-of-order write must fail");
+        assert!(
+            err.to_string().contains("streaming write at offset"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            2,
+            "only initiate + first part upload; the rejected write must not upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_zero_aborts_inflight_stream() {
+        // #47: truncate-to-zero must abort the in-flight stream or bytes
+        // written after it would append to the old upload.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, &big_data(), 0, false, false, &mut fi)
+            .await
+            .expect("write");
+
+        ctx.set_file_size(file, 0, false, &mut fi)
+            .expect("truncate to zero");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.to_lowercase().contains("uploadid")),
+            "in-flight stream must be aborted on truncate-to-zero"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|r| r.method == "POST" && r.target.to_lowercase().contains("uploadid")),
+            "no multipart completion after truncate"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_handle_reads_back_spooled_bytes() {
+        // #47: while a multipart upload is in flight the parts are invisible
+        // to reads — the handle must serve the bytes written so far from its
+        // read-back spool instead of reporting EOF.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        let big = big_data();
+        ctx.write_async(file, &big, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+
+        let mut head = vec![0u8; 4096];
+        let n = ctx.read_async(file, &mut head, 0).await.expect("read");
+        assert_eq!(n as usize, 4096);
+        assert_eq!(&head[..], &big[..4096], "head read-back must match");
+
+        let mut mid = vec![0u8; 4096];
+        let n2 = ctx.read_async(file, &mut mid, 1024).await.expect("read");
+        assert_eq!(
+            &mid[..],
+            &big[1024..1024 + 4096],
+            "mid read-back must match"
         );
     }
 }
