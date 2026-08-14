@@ -46,7 +46,8 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 [features]
-default = []
+default = ["fuse"]
+fuse = ["dep:fuser"]
 fuse-winfsp = []
 
 [dev-dependencies]
@@ -65,7 +66,9 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 winfsp = { workspace = true, features = ["delayload"] }
 
 [target.'cfg(not(windows))'.dependencies]
-fuser = { version = "0.17", features = ["fuse-t"] }
+# Optional so `--no-default-features` builds the metadata-store core without
+# the FUSE adapter (CI macOS runners have no pkg-config fuse library).
+fuser = { version = "0.17", features = ["fuse-t"], optional = true }
 libc = { workspace = true }
 
 # Patch fuser: add a `fuse-t` feature so the macOS FUSE ABI layout matches

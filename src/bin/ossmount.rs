@@ -682,9 +682,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = refresh_secs;
         ossfs::winfsp::mount_oss_winfsp(fs, &mount_point).await
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), feature = "fuse"))]
     {
         ossfs::fuse::mount_oss_fuse(fs, &mount_point, refresh_secs).await
+    }
+    #[cfg(all(not(windows), not(feature = "fuse")))]
+    {
+        let _ = (fs, &mount_point, refresh_secs);
+        anyhow::bail!("this build was compiled without the FUSE adapter (feature \"fuse\")")
     }
 }
 

@@ -18,7 +18,7 @@
 
 pub mod admin;
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "fuse"))]
 pub mod fuse;
 #[cfg(windows)]
 pub mod winfsp;
