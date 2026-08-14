@@ -1573,6 +1573,7 @@ mod tests {
             .await
             .expect("write");
         assert_eq!(written as usize, big.len());
+        eprintln!("[testdbg] write_async done");
 
         ctx.upload_dirty(file).await.expect("flush");
         assert!(
@@ -1589,13 +1590,18 @@ mod tests {
         );
         // The object was delivered via multipart completion, never as an
         // empty whole-object PUT. (`uploadId` arrives camelCase from the SDK.)
-        let recorded = mock.recorded.lock().unwrap();
-        assert!(
-            recorded
-                .iter()
-                .any(|r| r.method == "POST" && r.target.to_lowercase().contains("uploadid")),
-            "multipart upload must be completed"
-        );
+        // NOTE: scope the guard — `plain_put_count` locks the same std Mutex,
+        // which is not reentrant; holding the guard across that call
+        // deadlocks the test (this exact bug hung the first Windows CI run).
+        {
+            let recorded = mock.recorded.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|r| r.method == "POST" && r.target.to_lowercase().contains("uploadid")),
+                "multipart upload must be completed"
+            );
+        }
         assert_eq!(
             plain_put_count(&mock),
             0,
