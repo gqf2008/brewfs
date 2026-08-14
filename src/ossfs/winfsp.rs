@@ -157,6 +157,11 @@ pub struct OssFileContext {
     spool_size: AtomicU64,
     /// Streaming multipart upload for large files (write-while-upload).
     stream: tokio::sync::Mutex<Option<StreamingUpload>>,
+    /// Set when a streaming multipart completion failed. `upload_dirty` then
+    /// refuses to fall back to the whole-buffer PUT: the buffer was emptied
+    /// into the stream, so that PUT would upload an empty object over the
+    /// previous content.
+    stream_failed: AtomicBool,
     /// Logical size reported while a streaming upload is in flight.
     logical_size: AtomicU64,
 }
@@ -308,17 +313,32 @@ impl OssMountContext {
 
     /// Upload the handle's dirty content, streaming from the spool file when
     /// one was created so large files are never held whole in memory.
+    ///
+    /// On success the handle is no longer dirty: WinFsp fires both `flush`
+    /// and `cleanup` when a modified handle closes, and a second upload would
+    /// be wrong — for the stream/spool branches the buffers are reset here,
+    /// so a repeat call would PUT an empty object over the one just written.
     async fn upload_dirty(&self, ctx: &OssFileContext) -> winfsp::Result<()> {
         if !ctx.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
+        if ctx.stream_failed.load(Ordering::Acquire) {
+            return Err(FspError::from(IoError::other(
+                "streaming upload previously failed; refusing to overwrite the object with partial data",
+            )));
+        }
         if let Some(up) = ctx.stream.lock().await.take() {
-            up.finish()
-                .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            if let Err(e) = up.finish().await {
+                // The buffer was emptied into the stream, so a later retry
+                // through the buffer path would PUT an empty object over the
+                // previous content; remember that and refuse.
+                ctx.stream_failed.store(true, Ordering::Release);
+                return Err(FspError::from(IoError::other(e.to_string())));
+            }
             ctx.logical_size.store(0, Ordering::Release);
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
+            ctx.dirty.store(false, Ordering::Release);
             return Ok(());
         }
         let spool = ctx.spool_path.lock().unwrap().clone();
@@ -334,6 +354,7 @@ impl OssMountContext {
             // prefix so a later read on this handle re-fetches from S3.
             *ctx.write_buf.lock().unwrap() = Some(Vec::new());
             ctx.loaded.store(false, Ordering::Release);
+            ctx.dirty.store(false, Ordering::Release);
             return Ok(());
         }
         let data = ctx.write_buf.lock().unwrap().clone();
@@ -343,6 +364,9 @@ impl OssMountContext {
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         }
+        // Small-buffer path keeps the buffer (later reads serve from it), so
+        // only the flag needs clearing.
+        ctx.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -651,6 +675,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
             logical_size: AtomicU64::new(0),
         })
     }
@@ -697,6 +722,7 @@ impl FileSystemContext for OssMountContext {
             spool_path: Mutex::new(None),
             spool_size: AtomicU64::new(0),
             stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
             logical_size: AtomicU64::new(0),
         })
     }
@@ -1057,14 +1083,33 @@ impl AsyncFileSystemContext for OssMountContext {
             }
         }
 
-        // Lazy load the original content (for overwrite handles).
+        // Lazy load the original content (for overwrite handles). Reserve the
+        // dirty-buffer budget from the stat'd size BEFORE downloading: the
+        // download itself allocates the whole object, so a post-hoc reserve
+        // cannot stop an oversized object from exhausting process memory.
+        // Only meaningful when the mount has a budget configured (without one
+        // the stat would be dead work).
         if !context.loaded.load(Ordering::Acquire) {
+            if self.dirty_budget.is_some() {
+                let remote_size = self
+                    .fs
+                    .stat(&context.path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| e.size as usize)
+                    .unwrap_or(0);
+                self.reserve_dirty(context, remote_size).await?;
+            }
             let data = self
                 .fs
                 .read_range(&context.path, 0, usize::MAX)
                 .await
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-            self.reserve_dirty(context, data.len()).await?;
+            // The object may have grown since stat; top up the reservation.
+            if self.dirty_budget.is_some() {
+                self.reserve_dirty(context, data.len()).await?;
+            }
             let mut guard = context.write_buf.lock().unwrap();
             let Some(buf) = guard.as_mut() else {
                 return Err(FspError::from(IoError::from_raw_os_error(
@@ -1308,6 +1353,8 @@ fn ensure_winfsp_dll_discoverable() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ossfs::{MockS3, test_fs_with_budget};
+    use std::time::Duration;
 
     fn entry(name: &str) -> DirEntry {
         DirEntry {
@@ -1403,5 +1450,184 @@ mod tests {
         assert!(!state.dirs.contains(&"/d0".to_string()));
         assert!(!state.snapshots.contains_key("/d0"));
         assert!(state.dirs.contains(&"/".to_string()));
+    }
+
+    // -------------------------------------------------------------------
+    // Large-file write / flush regression tests (in-process S3 mock)
+    // -------------------------------------------------------------------
+
+    /// Mount context for adapter-level upload tests, mirroring what
+    /// `mount_oss_winfsp` wires up (including the dirty budget).
+    fn test_mount(fs: ObjectFs) -> (Arc<ObjectFs>, OssMountContext) {
+        let fs = Arc::new(fs);
+        let ctx = OssMountContext {
+            fs: Arc::clone(&fs),
+            rt: Handle::current(),
+            mount_point: PathBuf::from("Z:"),
+            refresh: Mutex::new(RefreshState::new()),
+            dirty_budget: fs.dirty_budget(),
+        };
+        (fs, ctx)
+    }
+
+    /// Leaked file handle. `DirBuffer`'s `Drop` calls
+    /// `FspFileSystemDeleteDirectoryBuffer`, a delay-loaded `winfsp-x64.dll`
+    /// import: dropping it on a machine without WinFsp installed raises
+    /// 0xC06D007E (MOD_NOT_FOUND) and aborts the whole test binary. Leaking
+    /// the handle keeps that drop out of the test (tiny allocation per test;
+    /// same approach as the existing `w()` helper).
+    fn test_file_with(path: &str, loaded: bool) -> &'static OssFileContext {
+        Box::leak(Box::new(OssFileContext {
+            path: path.to_string(),
+            is_dir: false,
+            write_buf: Mutex::new(Some(Vec::new())),
+            loaded: AtomicBool::new(loaded),
+            dirty: AtomicBool::new(false),
+            delete_on_close: AtomicBool::new(false),
+            dir_buffer: DirBuffer::new(),
+            budget_units: AtomicUsize::new(0),
+            budget_permits: Mutex::new(Vec::new()),
+            spool_path: Mutex::new(None),
+            spool_size: AtomicU64::new(0),
+            stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
+            logical_size: AtomicU64::new(0),
+        }))
+    }
+
+    fn test_file(path: &str) -> &'static OssFileContext {
+        test_file_with(path, true)
+    }
+
+    /// Whole-object PUTs. The AWS SDK appends `?ln=<Operation>` to every
+    /// request and multipart parts carry `partNumber`/`uploadId` (camelCase),
+    /// so classify by the lowercase query rather than by the presence of `?`.
+    fn plain_put_count(mock: &MockS3) -> usize {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_then_cleanup_uploads_small_buffer_exactly_once() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/f");
+        let mut fi = FileInfo::default();
+        let data = b"hello ossfs".to_vec();
+        let written = ctx
+            .write_async(file, &data, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        assert_eq!(written as usize, data.len());
+        assert!(file.dirty.load(Ordering::Acquire));
+
+        // WinFsp fires both `flush` (FlushFileBuffers) and `cleanup` when a
+        // modified handle closes; the second must be a no-op. Regression:
+        // upload_dirty never cleared dirty, so cleanup re-uploaded the whole
+        // buffer (and, after a finished stream, PUT an empty object over it).
+        ctx.upload_dirty(file).await.expect("flush");
+        assert_eq!(plain_put_count(&mock), 1, "flush uploads once");
+        assert!(
+            !file.dirty.load(Ordering::Acquire),
+            "dirty must be cleared after a successful flush"
+        );
+        ctx.upload_dirty(file).await.expect("cleanup");
+        assert_eq!(
+            plain_put_count(&mock),
+            1,
+            "cleanup must not re-upload after a successful flush"
+        );
+
+        let recorded = mock.recorded.lock().unwrap();
+        let put = recorded
+            .iter()
+            .find(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .expect("one plain PUT");
+        assert_eq!(put.body, data, "uploaded body matches the written data");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_then_cleanup_after_streaming_does_not_put_empty_object() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file("/big");
+        let mut fi = FileInfo::default();
+        // Above WRITE_SPOOL_THRESHOLD the handle switches to streaming multipart.
+        let big = vec![0xABu8; WRITE_SPOOL_THRESHOLD + 1024 * 1024];
+        let written = ctx
+            .write_async(file, &big, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        assert_eq!(written as usize, big.len());
+        eprintln!("[testdbg] write_async done");
+
+        ctx.upload_dirty(file).await.expect("flush");
+        assert!(
+            !file.dirty.load(Ordering::Acquire),
+            "dirty must be cleared after the multipart finishes"
+        );
+        let after_flush = mock.recorded.lock().unwrap().len();
+        ctx.upload_dirty(file).await.expect("cleanup");
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            after_flush,
+            "cleanup after a finished stream must not upload anything \
+             (a repeat would PUT an empty object over the completed multipart)"
+        );
+        // The object was delivered via multipart completion, never as an
+        // empty whole-object PUT. (`uploadId` arrives camelCase from the SDK.)
+        // NOTE: scope the guard — `plain_put_count` locks the same std Mutex,
+        // which is not reentrant; holding the guard across that call
+        // deadlocks the test (this exact bug hung the first Windows CI run).
+        {
+            let recorded = mock.recorded.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|r| r.method == "POST" && r.target.to_lowercase().contains("uploadid")),
+                "multipart upload must be completed"
+            );
+        }
+        assert_eq!(
+            plain_put_count(&mock),
+            0,
+            "streamed file must never be PUT as a whole object"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overwrite_lazy_load_rejects_oversized_object_before_download() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        // 10 MiB existing object under a 1 MiB dirty budget: the lazy-load
+        // download must be rejected up front, not after allocating 10 MiB.
+        mock.set_object("f", vec![0u8; 10 * 1024 * 1024]);
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, Some(1 << 20)));
+        let file = test_file_with("/f", false); // overwrite handle, not yet loaded
+        let mut fi = FileInfo::default();
+        assert!(
+            ctx.write_async(file, b"x", 0, false, false, &mut fi)
+                .await
+                .is_err(),
+            "oversized lazy-load must fail instead of downloading the object"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "oversized lazy-load must not download the object"
+        );
     }
 }
