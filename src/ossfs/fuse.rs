@@ -879,7 +879,7 @@ impl Filesystem for OssFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (Some(parent_path), Some(newparent_path)) =
@@ -894,7 +894,19 @@ impl Filesystem for OssFs {
         };
         let old = join_path(&parent_path, name);
         let new = join_path(&newparent_path, newname);
-        if let Err(e) = self.block_on(self.fs.rename(&old, &new)) {
+        // RENAME_NOREPLACE only exists on Linux (renameat2); macOS rename
+        // always replaces the target.
+        let replace_if_exists = {
+            #[cfg(target_os = "linux")]
+            {
+                !flags.contains(RenameFlags::RENAME_NOREPLACE)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        };
+        if let Err(e) = self.block_on(self.fs.rename(&old, &new, replace_if_exists)) {
             warn!(old = %old, new = %new, error = ?e, "ossfs rename failed");
             reply.error(self.errno_for(&e, true));
             return;
