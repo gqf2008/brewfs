@@ -38,6 +38,13 @@ const ROOT_INODE: u64 = 1;
 /// Upper bound on the number of directories tracked for periodic kernel-cache
 /// invalidation. Browsing a huge tree cannot grow this set without limit.
 const MAX_TRACKED_DIRS: usize = 8192;
+/// Hard upper bound on tracked inodes. FORGET normally releases entries as
+/// the kernel drops its references, but accounting can drift (a READDIRPLUS
+/// entry the kernel failed to link, a FUSE backend that counts lookups
+/// differently), so the map also has a capacity ceiling like `dirs` — an
+/// I/O storm such as `find /` over a million-object bucket must never grow
+/// it without limit.
+const MAX_TRACKED_INODES: usize = 65536;
 /// Maximum supported path component length (POSIX NAME_MAX).
 const NAME_MAX: u32 = 255;
 
@@ -114,13 +121,26 @@ struct OpenFile {
     logical_size: u64,
 }
 
+/// A tracked inode: its POSIX path plus how many lookup references the
+/// kernel holds on it. Every entry-out reply (LOOKUP, MKNOD, MKDIR, CREATE
+/// and each READDIRPLUS child) takes exactly one reference — mirroring the
+/// kernel's `fi->nlookup++` — and FORGET releases them. Plain READDIR
+/// entries and the "."/".." entries of READDIRPLUS are *not* counted by
+/// the kernel (fs/fuse/readdir.c returns early for dots and never touches
+/// `fi->nlookup` in the plain path), so they are registered reference-free
+/// and stay evictable.
+struct InodeRecord {
+    path: String,
+    nlookup: u64,
+}
+
 /// FUSE filesystem bridging kernel requests to [`ObjectFs`].
 pub struct OssFs {
     fs: Arc<ObjectFs>,
     /// Tokio handle used to drive the async S3 client from FUSE threads.
     rt: Handle,
-    /// inode -> POSIX path (root is always `ROOT_INODE`).
-    inodes: Mutex<HashMap<u64, String>>,
+    /// inode -> tracked record (root is always `ROOT_INODE`).
+    inodes: Mutex<HashMap<u64, InodeRecord>>,
     /// inodes of directories that have been listed; the periodic refresh task
     /// invalidates their kernel caches so remote changes show up.
     dirs: Arc<Mutex<HashSet<u64>>>,
@@ -141,7 +161,13 @@ pub struct OssFs {
 impl OssFs {
     pub fn new(fs: Arc<ObjectFs>, rt: Handle, dirs: Arc<Mutex<HashSet<u64>>>) -> Self {
         let mut inodes = HashMap::new();
-        inodes.insert(ROOT_INODE, "/".to_string());
+        inodes.insert(
+            ROOT_INODE,
+            InodeRecord {
+                path: "/".to_string(),
+                nlookup: 0,
+            },
+        );
         dirs.lock().unwrap().insert(ROOT_INODE);
         let mount_attr = fs.mount_attr();
         let uid = effective_owner(mount_attr.uid, unsafe { libc::getuid() });
@@ -197,16 +223,116 @@ impl OssFs {
         if ino.0 == ROOT_INODE {
             return Some("/".to_string());
         }
-        self.inodes.lock().unwrap().get(&ino.0).cloned()
+        self.inodes
+            .lock()
+            .unwrap()
+            .get(&ino.0)
+            .map(|rec| rec.path.clone())
     }
 
+    /// Track `path` under its inode and take one lookup reference, matching
+    /// the kernel's accounting for entry-out replies (LOOKUP / MKNOD / MKDIR
+    /// / CREATE and READDIRPLUS children each count exactly one). FORGET
+    /// later releases them.
     fn register_inode(&self, path: &str) -> u64 {
         let ino = inode_for_path(path);
-        self.inodes.lock().unwrap().insert(ino, path.to_string());
+        let mut inodes = self.inodes.lock().unwrap();
+        inodes
+            .entry(ino)
+            .and_modify(|rec| rec.nlookup += 1)
+            .or_insert(InodeRecord {
+                path: path.to_string(),
+                nlookup: 1,
+            });
+        Self::enforce_inode_budget(&mut inodes);
         ino
     }
 
-    fn attr_of(&self, path: &str, entry: &DirEntry) -> FileAttr {
+    /// Track `path` without taking a lookup reference: plain READDIR
+    /// entries and the "."/".." of READDIRPLUS. The kernel never sends
+    /// FORGET for those, so they must not hold a reference; the mapping
+    /// only serves name resolution until the capacity ceiling evicts it.
+    fn note_inode(&self, path: &str) -> u64 {
+        let ino = inode_for_path(path);
+        let mut inodes = self.inodes.lock().unwrap();
+        inodes.entry(ino).or_insert(InodeRecord {
+            path: path.to_string(),
+            nlookup: 0,
+        });
+        Self::enforce_inode_budget(&mut inodes);
+        ino
+    }
+
+    /// Release `nlookup` kernel references on `ino` and drop the record once
+    /// none remain (the kernel sends FORGET when it evicts the inode from
+    /// its dentry/inode caches, so this is what keeps the map from growing
+    /// for the lifetime of the mount). An underflow — or a forget for an
+    /// inode we never counted or already evicted — simply drops the record.
+    fn forget_inode(&self, ino: u64, nlookup: u64) {
+        if ino == ROOT_INODE {
+            // The root inode is pinned for the mount's lifetime; the kernel
+            // never forgets it (and path_of resolves it without the map).
+            return;
+        }
+        let mut inodes = self.inodes.lock().unwrap();
+        match inodes.get_mut(&ino) {
+            Some(rec) if rec.nlookup > nlookup => rec.nlookup -= nlookup,
+            Some(_) => {
+                inodes.remove(&ino);
+            }
+            None => {}
+        }
+    }
+
+    /// Keep the inode map at its capacity ceiling. Reference-free records
+    /// (pure name associations) are evicted first — the kernel holds nothing
+    /// on them, so dropping them is always safe. If every record is still
+    /// referenced, reset to just the root, the same escape hatch `dirs` uses
+    /// at [`MAX_TRACKED_DIRS`]; a later LOOKUP re-registers evicted paths.
+    fn enforce_inode_budget(inodes: &mut HashMap<u64, InodeRecord>) {
+        if inodes.len() <= MAX_TRACKED_INODES {
+            return;
+        }
+        inodes.retain(|ino, rec| *ino == ROOT_INODE || rec.nlookup > 0);
+        if inodes.len() > MAX_TRACKED_INODES {
+            inodes.clear();
+            inodes.insert(
+                ROOT_INODE,
+                InodeRecord {
+                    path: "/".to_string(),
+                    nlookup: 0,
+                },
+            );
+        }
+    }
+
+    /// Move an inode's path association after a rename. The kernel keeps the
+    /// dentry (and thus the inode number) across the rename, so the old
+    /// inode must resolve to the *new* path or every later getattr on the
+    /// moved file stats a path that no longer exists; its lookup count
+    /// carries over. The new path's own inode is registered reference-free
+    /// (the kernel LOOKUPs it when it needs it).
+    fn rename_inode(&self, old: &str, new: &str) {
+        let old_ino = inode_for_path(old);
+        let new_ino = inode_for_path(new);
+        if old_ino == new_ino {
+            // Same path (or a 64-bit hash collision): nothing to move.
+            return;
+        }
+        let mut inodes = self.inodes.lock().unwrap();
+        if let Some(rec) = inodes.get_mut(&old_ino) {
+            rec.path = new.to_string();
+        }
+        inodes.entry(new_ino).or_insert(InodeRecord {
+            path: new.to_string(),
+            nlookup: 0,
+        });
+        Self::enforce_inode_budget(&mut inodes);
+    }
+
+    /// FileAttr for `entry` under a caller-supplied inode, without touching
+    /// the inode map.
+    fn attr_for(&self, entry: &DirEntry, ino: u64) -> FileAttr {
         let (kind, perm, nlink) = if entry.is_dir {
             (
                 FileType::Directory,
@@ -232,7 +358,7 @@ impl OssFs {
         };
         let size = entry.size;
         FileAttr {
-            ino: INodeNo(self.register_inode(path)),
+            ino: INodeNo(ino),
             size,
             blocks: size.saturating_add(511) / 512,
             atime: epoch(entry.mtime_secs),
@@ -250,8 +376,18 @@ impl OssFs {
         }
     }
 
+    /// `attr_for` with the inode freshly registered (+1 lookup reference).
+    /// Only for entry-out replies, which is what the kernel counts.
+    fn attr_of(&self, path: &str, entry: &DirEntry) -> FileAttr {
+        let ino = self.register_inode(path);
+        self.attr_for(entry, ino)
+    }
+
     /// Attr for `path`, preferring an in-flight write buffer size when an open
     /// write handle exists (so fstat after write sees the new size).
+    ///
+    /// Takes no lookup reference: getattr replies do not add one kernel-side,
+    /// so registering here would leak the count.
     fn effective_attr(&self, path: &str, entry: &DirEntry) -> FileAttr {
         let mut entry = entry.clone();
         let buf_len = {
@@ -271,7 +407,7 @@ impl OssFs {
         if let Some(len) = buf_len {
             entry.size = len;
         }
-        self.attr_of(path, &entry)
+        self.attr_for(&entry, inode_for_path(path))
     }
 
     /// Flush a dirty open file to the object store. A streaming handle
@@ -344,6 +480,38 @@ impl OssFs {
             anyhow::anyhow!("truncate read-modify-write of {bytes} bytes: dirty-buffer budget busy")
         })
     }
+
+    /// Map an [`ObjectFs`] failure to the errno closest to its meaning
+    /// instead of a blanket `EIO`:
+    ///
+    /// - on a read-only mount, mutating operations fail with `EROFS`
+    ///   (POSIX requires writes to a read-only filesystem to fail EROFS;
+    ///   `ObjectFs::ensure_writable` is what rejects them);
+    /// - S3 permission errors (`AccessDenied`, `SignatureDoesNotMatch`, ...)
+    ///   map to `EACCES`;
+    /// - everything else stays `EIO`.
+    fn errno_for(&self, e: &anyhow::Error, mutation: bool) -> Errno {
+        if mutation && self.fs.read_only() {
+            return Errno::EROFS;
+        }
+        let mut text = e.to_string();
+        for cause in e.chain().skip(1) {
+            text.push(' ');
+            text.push_str(&cause.to_string());
+        }
+        let text = text.to_ascii_lowercase();
+        const ACCESS_DENIED_MARKERS: [&str; 5] = [
+            "accessdenied",
+            "access denied",
+            "forbidden",
+            "invalidaccesskeyid",
+            "signaturedoesnotmatch",
+        ];
+        if ACCESS_DENIED_MARKERS.iter().any(|m| text.contains(m)) {
+            return Errno::EACCES;
+        }
+        Errno::EIO
+    }
 }
 
 impl Filesystem for OssFs {
@@ -365,9 +533,19 @@ impl Filesystem for OssFs {
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs lookup failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
             }
         }
+    }
+
+    /// Release kernel lookup references on an inode. Without this the inode
+    /// map only ever grows — `find /` over a large bucket would accumulate
+    /// one record per visited path for the mount's lifetime. The kernel
+    /// sends FORGET exactly when it stops holding the references it gained
+    /// from entry-out replies, so releasing them here keeps the map in
+    /// lockstep with the kernel's own (memory-bounded) inode cache.
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.forget_inode(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -383,7 +561,7 @@ impl Filesystem for OssFs {
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs getattr failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
             }
         }
     }
@@ -453,7 +631,7 @@ impl Filesystem for OssFs {
                             && let Err(e) = self.block_on(self.reserve_dirty(&open, remote_size))
                         {
                             warn!(path = %path, error = ?e, "ossfs setattr dirty budget failed");
-                            reply.error(Errno::EIO);
+                            reply.error(self.errno_for(&e, true));
                             return;
                         }
                     }
@@ -461,7 +639,7 @@ impl Filesystem for OssFs {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(path = %path, error = ?e, "ossfs setattr lazy-load failed");
-                            reply.error(Errno::EIO);
+                            reply.error(self.errno_for(&e, true));
                             return;
                         }
                     };
@@ -501,7 +679,7 @@ impl Filesystem for OssFs {
                     && let Err(e) = self.block_on(self.reserve_dirty(&open, new_size as usize))
                 {
                     warn!(path = %path, error = ?e, "ossfs setattr dirty budget failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
                 {
@@ -518,7 +696,7 @@ impl Filesystem for OssFs {
             }
             if !handled && let Err(e) = self.truncate_unopened(&path, new_size) {
                 warn!(path = %path, error = ?e, "ossfs setattr truncate failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, true));
                 return;
             }
         }
@@ -531,7 +709,7 @@ impl Filesystem for OssFs {
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs setattr stat failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
             }
         }
     }
@@ -566,13 +744,13 @@ impl Filesystem for OssFs {
             Ok(None) => false,
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs mknod stat failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         };
         if !exists && let Err(e) = self.block_on(self.fs.write(&path, &[])) {
             warn!(path = %path, error = ?e, "ossfs mknod failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         let attr = self.attr_of(
@@ -607,7 +785,7 @@ impl Filesystem for OssFs {
         let path = join_path(&parent_path, name);
         if let Err(e) = self.block_on(self.fs.mkdir(&path)) {
             warn!(path = %path, error = ?e, "ossfs mkdir failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         let attr = self.attr_of(
@@ -645,13 +823,13 @@ impl Filesystem for OssFs {
             }
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs unlink stat failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         }
         if let Err(e) = self.block_on(self.fs.delete(&path)) {
             warn!(path = %path, error = ?e, "ossfs unlink failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         reply.ok();
@@ -672,7 +850,7 @@ impl Filesystem for OssFs {
         // work even when the kernel cannot empty the dir first.
         if let Err(e) = self.block_on(self.fs.delete_dir_recursive(&path)) {
             warn!(path = %path, error = ?e, "ossfs rmdir failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         reply.ok();
@@ -702,12 +880,15 @@ impl Filesystem for OssFs {
         let new = join_path(&newparent_path, newname);
         if let Err(e) = self.block_on(self.fs.rename(&old, &new)) {
             warn!(old = %old, new = %new, error = ?e, "ossfs rename failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
-        // The kernel re-looks-up the new name; keep the map consistent for the
-        // moved path in case it is referenced by its old inode until forget.
-        self.register_inode(&new);
+        // The kernel keeps the dentry (and its inode number) across the
+        // rename; repoint that inode to the new path so later getattr on the
+        // moved file resolves correctly, and register the new path's own
+        // inode. Neither takes a lookup reference: RENAME replies carry no
+        // entry-out.
+        self.rename_inode(&old, &new);
         reply.ok();
     }
 
@@ -724,7 +905,7 @@ impl Filesystem for OssFs {
             }
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs open stat failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         };
@@ -732,6 +913,14 @@ impl Filesystem for OssFs {
             flags.acc_mode(),
             OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
         );
+        // POSIX: opening for write on a read-only filesystem fails with
+        // EROFS at open time, not later on flush. The kernel enforces this
+        // itself when mounted with `MountOption::RO`; keep the explicit
+        // check so backends that do not honor RO (FUSE-T) behave the same.
+        if write && self.fs.read_only() {
+            reply.error(Errno::EROFS);
+            return;
+        }
         let write_buf = if !entry.is_dir && write {
             // Lazy: existing content is fetched on the first write/truncate
             // that needs it, so opening for write never downloads the object.
@@ -777,12 +966,17 @@ impl Filesystem for OssFs {
             return;
         };
         let path = join_path(&parent_path, name);
+        if self.fs.read_only() {
+            // create is always a write intent; reject up front with EROFS.
+            reply.error(Errno::EROFS);
+            return;
+        }
         let truncate = flags & libc::O_TRUNC != 0;
         let existing = match self.block_on(self.fs.stat(&path)) {
             Ok(e) => e,
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs create stat failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         };
@@ -800,7 +994,7 @@ impl Filesystem for OssFs {
             && let Err(e) = self.block_on(self.fs.write(&path, &[]))
         {
             warn!(path = %path, error = ?e, "ossfs create initial put failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         let write_buf = Some(Vec::new());
@@ -875,7 +1069,7 @@ impl Filesystem for OssFs {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 warn!(path = %open.path, offset = offset, error = ?e, "ossfs read failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
             }
         }
     }
@@ -922,7 +1116,7 @@ impl Filesystem for OssFs {
                     .unwrap_or(0);
                 if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, remote_size)) {
                     warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
             }
@@ -930,7 +1124,7 @@ impl Filesystem for OssFs {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(path = %path, error = ?e, "ossfs write lazy-load failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
             };
@@ -939,7 +1133,7 @@ impl Filesystem for OssFs {
                 && let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, data.len()))
             {
                 warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, true));
                 return;
             }
             let mut guard = self.files.lock().unwrap();
@@ -957,7 +1151,7 @@ impl Filesystem for OssFs {
         let new_size = (offset as usize).saturating_add(data.len());
         if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, new_size)) {
             warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
 
@@ -967,7 +1161,7 @@ impl Filesystem for OssFs {
             if let Some(up) = guard.as_mut() {
                 if let Err(e) = self.block_on(up.write(data)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
                 let end = offset.saturating_add(data.len() as u64);
@@ -991,7 +1185,7 @@ impl Filesystem for OssFs {
                 Ok(u) => u,
                 Err(e) => {
                     warn!(path = %path, error = ?e, "ossfs begin streaming failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
             };
@@ -1000,13 +1194,13 @@ impl Filesystem for OssFs {
             {
                 if let Err(e) = self.block_on(up.write(existing)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
-                    reply.error(Errno::EIO);
+                    reply.error(self.errno_for(&e, true));
                     return;
                 }
             }
             if let Err(e) = self.block_on(up.write(data)) {
                 warn!(path = %path, error = ?e, "ossfs stream write failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, true));
                 return;
             }
             let stream = open_snapshot.stream.clone();
@@ -1059,7 +1253,7 @@ impl Filesystem for OssFs {
         };
         if let Err(e) = self.flush_open(&open) {
             warn!(path = %open.path, error = ?e, "ossfs flush failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
@@ -1113,7 +1307,7 @@ impl Filesystem for OssFs {
         };
         if let Err(e) = self.flush_open(&open) {
             warn!(path = %open.path, error = ?e, "ossfs fsync failed");
-            reply.error(Errno::EIO);
+            reply.error(self.errno_for(&e, true));
             return;
         }
         if let Some(o) = self.files.lock().unwrap().get_mut(&fh.0) {
@@ -1143,7 +1337,7 @@ impl Filesystem for OssFs {
             Ok(e) => e,
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs readdir failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         };
@@ -1160,14 +1354,17 @@ impl Filesystem for OssFs {
             }
         }
         // "." and ".." first (Finder expects them), then children sorted by
-        // name for a stable readdir cursor.
+        // name for a stable readdir cursor. Plain READDIR entries carry no
+        // kernel lookup reference (fs/fuse/readdir.c never bumps nlookup on
+        // this path), so register them reference-free: they resolve paths
+        // but stay evictable and are never "forgotten".
         let mut items: Vec<(String, u64, FileType)> = Vec::with_capacity(entries.len() + 2);
         items.push((".".to_string(), ino.0, FileType::Directory));
         let parent_ino = if ino.0 == ROOT_INODE {
             ROOT_INODE
         } else {
             let parent = super::parent_path(&path);
-            self.register_inode(&parent)
+            self.note_inode(&parent)
         };
         items.push(("..".to_string(), parent_ino, FileType::Directory));
         for entry in entries {
@@ -1177,7 +1374,7 @@ impl Filesystem for OssFs {
             } else {
                 FileType::RegularFile
             };
-            items.push((entry.name, self.register_inode(&child), kind));
+            items.push((entry.name, self.note_inode(&child), kind));
         }
         items.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1205,7 +1402,7 @@ impl Filesystem for OssFs {
             Ok(e) => e,
             Err(e) => {
                 warn!(path = %path, error = ?e, "ossfs readdirplus failed");
-                reply.error(Errno::EIO);
+                reply.error(self.errno_for(&e, false));
                 return;
             }
         };
@@ -1225,23 +1422,30 @@ impl Filesystem for OssFs {
         } else {
             super::parent_path(&path)
         };
-        let dot_attr = self.attr_of(
-            &path,
+        // READDIRPLUS children each take one lookup reference (the kernel
+        // links them into the dentry cache and bumps fi->nlookup), but the
+        // "." and ".." entries are explicitly skipped by the kernel
+        // (fuse_direntplus_link returns early for dots), so they are
+        // registered reference-free.
+        let dot_ino = self.note_inode(&path);
+        let dot_attr = self.attr_for(
             &DirEntry {
                 name: ".".to_string(),
                 is_dir: true,
                 size: 0,
                 mtime_secs: 0,
             },
+            dot_ino,
         );
-        let parent_attr = self.attr_of(
-            &parent_path,
+        let parent_ino = self.note_inode(&parent_path);
+        let parent_attr = self.attr_for(
             &DirEntry {
                 name: "..".to_string(),
                 is_dir: true,
                 size: 0,
                 mtime_secs: 0,
             },
+            parent_ino,
         );
 
         let mut items: Vec<(String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
@@ -1360,9 +1564,15 @@ fn macos_fuse_backend() -> Option<&'static str> {
     }
 }
 
-fn build_config(allow_other: bool) -> Config {
+fn build_config(allow_other: bool, read_only: bool) -> Config {
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("OSSFS-OSS".to_string())];
+    if read_only {
+        // Mount the kernel volume read-only so open-for-write fails with
+        // EROFS up front instead of every mutation failing late; without it
+        // the kernel treats a --read-only mount as read-write.
+        cfg.mount_options.push(MountOption::RO);
+    }
     if allow_other {
         cfg.mount_options
             .push(MountOption::CUSTOM("allow_other".to_string()));
@@ -1505,11 +1715,13 @@ pub async fn mount_oss_fuse(
     }
 
     let allow_other = fs.allow_other();
+    let read_only = fs.read_only();
     let handle = Handle::current();
     let dirs = Arc::new(Mutex::new(HashSet::new()));
     let oss_fs = OssFs::new(fs, handle, Arc::clone(&dirs));
-    let session = fuser::spawn_mount2(oss_fs, mount_point, &build_config(allow_other))
-        .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e}", mount_point.display()))?;
+    let session =
+        fuser::spawn_mount2(oss_fs, mount_point, &build_config(allow_other, read_only))
+            .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e}", mount_point.display()))?;
 
     // FUSE-T performs the real NFS mount asynchronously after the FUSE
     // session is negotiated. Poll until the mount actually shows up in the
@@ -1695,6 +1907,15 @@ mod tests {
         OssFs::new(fs, Handle::current(), Arc::new(Mutex::new(HashSet::new())))
     }
 
+    /// OssFs over a caller-built [`ObjectFs`] (e.g. with `read_only` set).
+    fn test_oss_with(fs: ObjectFs) -> OssFs {
+        OssFs::new(
+            Arc::new(fs),
+            Handle::current(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn truncate_unopened_rejects_oversized_rmw_before_download() {
         let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
@@ -1732,5 +1953,169 @@ mod tests {
             1,
             "one PUT"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Inode tracking: FORGET reference decay + bounded map (#51)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forget_releases_lookup_references() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        // One LOOKUP reply = one kernel lookup reference.
+        let ino = oss.register_inode("/docs/a.txt");
+        assert_eq!(oss.path_of(INodeNo(ino)).as_deref(), Some("/docs/a.txt"));
+        // The kernel sends FORGET(1) when it drops the dentry.
+        oss.forget_inode(ino, 1);
+        assert!(
+            oss.path_of(INodeNo(ino)).is_none(),
+            "FORGET must drop the record once its references are gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_lookups_need_repeated_forgets() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let ino = oss.register_inode("/f");
+        let ino2 = oss.register_inode("/f");
+        assert_eq!(ino, ino2, "same path maps to the same inode");
+        oss.forget_inode(ino, 1);
+        assert!(
+            oss.path_of(INodeNo(ino)).is_some(),
+            "one reference must remain after one FORGET"
+        );
+        oss.forget_inode(ino, 1);
+        assert!(oss.path_of(INodeNo(ino)).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forget_underflow_or_unknown_inode_is_tolerated() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let ino = oss.register_inode("/f"); // count 1
+        // Kernel accounting drift: forget more than we tracked -> drop.
+        oss.forget_inode(ino, 5);
+        assert!(oss.path_of(INodeNo(ino)).is_none());
+        // Forgetting an inode we never tracked must not panic.
+        oss.forget_inode(999_999, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn note_inode_takes_no_reference() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        // Plain READDIR / dot-dot entries are never counted by the kernel.
+        let ino = oss.note_inode("/dir/child");
+        assert_eq!(oss.path_of(INodeNo(ino)).as_deref(), Some("/dir/child"));
+        // A later registered lookup still balances against one forget.
+        oss.register_inode("/dir/child");
+        oss.forget_inode(ino, 1);
+        assert!(oss.path_of(INodeNo(ino)).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inode_map_stays_bounded_under_lookup_storm() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        // Simulates `find /` walking far more paths than the ceiling.
+        for i in 0..(MAX_TRACKED_INODES + 8192) {
+            oss.note_inode(&format!("/deep/f{i}"));
+        }
+        let len = oss.inodes.lock().unwrap().len();
+        assert!(
+            len <= MAX_TRACKED_INODES,
+            "inode map must stay bounded, has {len} records"
+        );
+        // The root always survives eviction.
+        assert!(oss.path_of(INodeNo(ROOT_INODE)).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_repoints_inode_to_new_path() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        // The kernel holds a lookup on the file being renamed.
+        let ino = oss.register_inode("/old.txt");
+        oss.rename_inode("/old.txt", "/new.txt");
+        assert_eq!(
+            oss.path_of(INodeNo(ino)).as_deref(),
+            Some("/new.txt"),
+            "the moved inode must resolve to the new path, not the stale one"
+        );
+        // Its reference survives the rename and is still FORGET-releasable.
+        oss.forget_inode(ino, 1);
+        assert!(oss.path_of(INodeNo(ino)).is_none());
+        // The new path's own inode also resolves.
+        let new_ino = inode_for_path("/new.txt");
+        assert_eq!(oss.path_of(INodeNo(new_ino)).as_deref(), Some("/new.txt"));
+    }
+
+    // -------------------------------------------------------------------
+    // Error-code mapping: EROFS / EACCES instead of a blanket EIO (#54)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errno_for_read_only_mutation_is_erofs() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        fs.read_only = true;
+        let oss = test_oss_with(fs);
+        // ensure_writable()'s rejection on a mutating op must be EROFS.
+        let err = anyhow::anyhow!("filesystem is mounted read-only");
+        assert_eq!(
+            i32::from(oss.errno_for(&err, true)),
+            i32::from(Errno::EROFS)
+        );
+        // Read operations keep EIO — the mount itself is fine.
+        assert_eq!(i32::from(oss.errno_for(&err, false)), i32::from(Errno::EIO));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errno_for_access_denied_is_eacces() {
+        use anyhow::Context as _;
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let err = anyhow::anyhow!("service error: PutObject: AccessDenied (400)");
+        assert_eq!(
+            i32::from(oss.errno_for(&err, false)),
+            i32::from(Errno::EACCES)
+        );
+        assert_eq!(
+            i32::from(oss.errno_for(&err, true)),
+            i32::from(Errno::EACCES)
+        );
+        // Nested causes are searched too (AWS SDK wraps the service error).
+        let wrapped = anyhow::anyhow!("upload failed").context(err);
+        assert_eq!(
+            i32::from(oss.errno_for(&wrapped, true)),
+            i32::from(Errno::EACCES)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errno_for_other_errors_stay_eio() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        assert_eq!(
+            i32::from(oss.errno_for(&anyhow::anyhow!("connection reset by peer"), true)),
+            i32::from(Errno::EIO)
+        );
+        assert_eq!(
+            i32::from(oss.errno_for(&anyhow::anyhow!("timeout"), false)),
+            i32::from(Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn build_config_mounts_ro_when_read_only() {
+        let ro = build_config(false, true);
+        assert!(
+            ro.mount_options.contains(&MountOption::RO),
+            "--read-only must mount the kernel volume RO"
+        );
+        let rw = build_config(false, false);
+        assert!(!rw.mount_options.contains(&MountOption::RO));
     }
 }

@@ -700,6 +700,20 @@ impl FileSystemContext for OssMountContext {
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        } else {
+            // #50: materialize the object for a brand-new file so it still
+            // exists after the handle closes (a never-PUT path would 404 on
+            // the next stat and the file would "vanish"). An existing file
+            // keeps its content — overwrite semantics are handled by the
+            // `overwrite` callback.
+            let exists = self
+                .block_on(self.fs.stat(&posix))
+                .map_err(|e| FspError::from(IoError::other(e.to_string())))?
+                .is_some();
+            if !exists {
+                self.block_on(self.fs.write(&posix, &[]))
+                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            }
         }
         let entry = DirEntry {
             name: posix.clone(),
