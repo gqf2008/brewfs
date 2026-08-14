@@ -277,6 +277,12 @@ impl OssFs {
     /// Flush a dirty open file to the object store. A streaming handle
     /// completes its multipart upload; a small handle uploads its buffer.
     fn flush_open(&self, open: &OpenFile) -> anyhow::Result<()> {
+        self.block_on(self.flush_open_async(open))
+    }
+
+    /// Async core of [`Self::flush_open`] (kept separate so tests can drive
+    /// it without a FUSE dispatcher thread to block on).
+    async fn flush_open_async(&self, open: &OpenFile) -> anyhow::Result<()> {
         if !open.dirty {
             return Ok(());
         }
@@ -285,8 +291,8 @@ impl OssFs {
                 "streaming upload previously failed; refusing to overwrite the object with partial data"
             );
         }
-        if let Some(up) = self.block_on(async { open.stream.lock().await.take() }) {
-            if let Err(e) = self.block_on(up.finish()) {
+        if let Some(up) = open.stream.lock().await.take() {
+            if let Err(e) = up.finish().await {
                 // The buffer was emptied into the stream, so a later retry
                 // through the buffer path would PUT an empty object over the
                 // previous content; remember that and refuse.
@@ -296,7 +302,21 @@ impl OssFs {
             return Ok(());
         }
         if let Some(buf) = open.write_buf.as_ref() {
-            self.block_on(self.fs.write(&open.path, buf))?;
+            let mut data = buf.clone();
+            // #49: setattr truncate/extend on an open handle records
+            // `logical_size` without resizing the buffer, so a flush would
+            // upload the untruncated original bytes. Materialize the logical
+            // size here (truncate when longer, zero-fill when shorter); a
+            // lazily-loaded handle that never loaded must fetch the original
+            // object first (read-modify-write).
+            let logical = open.logical_size as usize;
+            if logical != data.len() {
+                if !open.loaded && logical > 0 {
+                    data = self.fs.read_range(&open.path, 0, usize::MAX).await?;
+                }
+                data.resize(logical, 0);
+            }
+            self.fs.write(&open.path, &data).await?;
         }
         Ok(())
     }
@@ -1693,6 +1713,97 @@ mod tests {
     fn test_oss(mock_port: u16, max_dirty_bytes: Option<usize>) -> OssFs {
         let fs = Arc::new(test_fs_with_budget(mock_port, 32, max_dirty_bytes));
         OssFs::new(fs, Handle::current(), Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    /// A dirty write handle with the given buffer/load state. `logical_size`
+    /// simulates a truncate/extend recorded by `setattr` without the buffer
+    /// being resized (#49).
+    fn test_open(path: &str, loaded: bool, buf: Vec<u8>, logical_size: u64) -> OpenFile {
+        OpenFile {
+            path: path.to_string(),
+            is_dir: false,
+            write_buf: Some(buf),
+            loaded,
+            dirty: true,
+            budget_units: Arc::new(AtomicUsize::new(0)),
+            budget_permits: Arc::new(Mutex::new(Vec::new())),
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            logical_size,
+        }
+    }
+
+    /// The single whole-object PUT body recorded by the mock, if any.
+    fn last_put_body(mock: &MockS3) -> Option<Vec<u8>> {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .last()
+            .map(|r| r.body.clone())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_truncates_buffer_to_logical_size() {
+        // #49: truncate(5) on an open loaded handle records logical_size=5
+        // without resizing the buffer; flush must upload only the first
+        // 5 bytes, not the untruncated original.
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let open = test_open("/f", true, b"hello world".to_vec(), 5);
+        oss.flush_open_async(&open).await.expect("flush");
+        assert_eq!(
+            last_put_body(&_mock).as_deref(),
+            Some(&b"hello"[..]),
+            "flush must upload the truncated prefix"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_extends_buffer_with_zeros() {
+        // #49: extend to 10 on a loaded handle uploads the original bytes
+        // zero-filled to the new length.
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        let open = test_open("/f", true, b"hello".to_vec(), 10);
+        oss.flush_open_async(&open).await.expect("flush");
+        let mut expected = b"hello".to_vec();
+        expected.resize(10, 0);
+        assert_eq!(
+            last_put_body(&_mock).as_deref(),
+            Some(expected.as_slice()),
+            "flush must upload the zero-extended content"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_unloaded_expand_fetches_original() {
+        // #49: an unloaded handle extended past the empty buffer must fetch
+        // the original object before uploading (read-modify-write), instead
+        // of PUTting an empty/zero-filled object over it.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let oss = test_oss(port, None);
+        let open = test_open("/f", false, Vec::new(), 10);
+        oss.flush_open_async(&open).await.expect("flush");
+        let mut expected = b"hello".to_vec();
+        expected.resize(10, 0);
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(expected.as_slice()),
+            "flush must fetch the original object and zero-extend it"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            1,
+            "exactly one GET for the original content"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

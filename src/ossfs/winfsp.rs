@@ -357,8 +357,24 @@ impl OssMountContext {
             ctx.dirty.store(false, Ordering::Release);
             return Ok(());
         }
-        let data = ctx.write_buf.lock().unwrap().clone();
-        if let Some(data) = data {
+        let mut data = ctx.write_buf.lock().unwrap().clone();
+        if let Some(mut data) = data {
+            // #48: SetEndOfFile/preallocation on a lazily-loaded write handle
+            // records only `logical_size`; uploading the still-empty buffer
+            // would PUT an empty object over the existing content. Fetch the
+            // original object and materialize the logical size (zero-fill
+            // extensions, truncate shrinks) before uploading.
+            let logical = ctx.logical_size.load(Ordering::Acquire) as usize;
+            if logical != data.len() {
+                if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
+                    data = self
+                        .fs
+                        .read_range(&ctx.path, 0, usize::MAX)
+                        .await
+                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                }
+                data.resize(logical, 0);
+            }
             self.fs
                 .write(&ctx.path, &data)
                 .await
@@ -1628,6 +1644,76 @@ mod tests {
             mock.get_count.load(Ordering::SeqCst),
             0,
             "oversized lazy-load must not download the object"
+        );
+    }
+
+    /// The single whole-object PUT body recorded by the mock, if any.
+    fn last_put_body(mock: &MockS3) -> Option<Vec<u8>> {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .last()
+            .map(|r| r.body.clone())
+    }
+
+    #[tokio::test]
+    async fn set_file_size_expand_on_unloaded_handle_preserves_content() {
+        // #48: SetEndOfFile(N) on an unloaded write handle records only the
+        // logical size; flushing must fetch the original object and
+        // zero-extend it — not PUT an empty object over the existing content.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, 10, false, &mut fi)
+            .expect("set_file_size");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        let mut expected = b"hello".to_vec();
+        expected.resize(10, 0);
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(expected.as_slice()),
+            "flush must fetch the original object and zero-extend it"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            1,
+            "exactly one GET for the original content"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_zero_on_unloaded_handle_still_truncates() {
+        // #48: SetEndOfFile(0) is a genuine truncate-to-zero — the empty PUT
+        // must keep working (set_file_size(0) marks the buffer loaded, so the
+        // new fetch guard must not interfere).
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, 0, false, &mut fi)
+            .expect("set_file_size(0)");
+        ctx.upload_dirty(file).await.expect("flush");
+
+        assert_eq!(
+            last_put_body(&mock).as_deref(),
+            Some(&[][..]),
+            "truncate-to-zero must still upload an empty object"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "truncate-to-zero needs no GET"
         );
     }
 }
