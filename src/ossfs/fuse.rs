@@ -1059,6 +1059,11 @@ impl Filesystem for OssFs {
                 buf.resize(start + data.len(), 0);
             }
             buf[start..start + data.len()].copy_from_slice(data);
+            // Keep `logical_size` authoritative for the small-buffer path too:
+            // flush_open materializes it on flush (#48/#49), so a write that
+            // only grows the buffer must be reflected here.
+            let end = (start + data.len()) as u64;
+            open.logical_size = open.logical_size.max(end);
             open.dirty = true;
         }
         reply.written(data.len() as u32);

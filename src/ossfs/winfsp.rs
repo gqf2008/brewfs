@@ -1205,6 +1205,11 @@ impl AsyncFileSystemContext for OssMountContext {
             }
             buf[start..start + buffer.len()].copy_from_slice(buffer);
         }
+        // Keep `logical_size` authoritative for the small-buffer path too:
+        // upload_dirty materializes it on flush (#48/#49), so a write that
+        // only grows the buffer must be reflected here.
+        let end = (new_size as u64).max(context.logical_size.load(Ordering::Acquire));
+        context.logical_size.store(end, Ordering::Release);
         context.dirty.store(true, Ordering::Release);
         let entry = DirEntry {
             name: context.path.clone(),
