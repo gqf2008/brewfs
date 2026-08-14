@@ -519,7 +519,7 @@ impl OssMountContext {
                 if !ctx.loaded.load(Ordering::Acquire) && logical > 0 {
                     let remote_size = self
                         .fs
-                        .stat(&ctx.path)
+                        .stat(&*ctx.path.lock().unwrap())
                         .await
                         .ok()
                         .flatten()
@@ -528,7 +528,7 @@ impl OssMountContext {
                     self.reserve_dirty(ctx, remote_size).await?;
                     data = self
                         .fs
-                        .read_range(&ctx.path, 0, usize::MAX)
+                        .read_range(&*ctx.path.lock().unwrap(), 0, usize::MAX)
                         .await
                         .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
                     self.reserve_dirty(ctx, data.len()).await?;
