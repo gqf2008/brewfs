@@ -36,6 +36,7 @@ fn usage_text() -> String {
                  [--read-ahead-bytes N] [--no-ignore-fsync] [--no-verify-crc64]\n\
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
+                 (timeouts default 10 / 600 seconds; 0 = default; retries 0 = no retry)\n\
                  [--notsup-compat-dir]\n\
                  [--disk-cache-reserve-diskfree N] [--disk-cache-free-space-ratio R]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\

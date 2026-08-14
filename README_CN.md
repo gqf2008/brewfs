@@ -96,14 +96,14 @@ ossmount mount --bucket my-bucket \
 | `--no-ignore-fsync` | 关闭默认的 fsync 忽略（FUSE fsync 时立即整文件 flush） |
 | `--max-dirty-bytes N` | 限制聚合的整文件写缓冲脏字节数（`0` = 不限制） |
 | `--credential-process CMD` | 外部凭据进程（标准 AWS credential_process JSON） |
-| `--connect-timeout N` | 套接字连接超时（秒，默认用 SDK 默认值） |
-| `--readwrite-timeout N` | 读超时（秒，默认用 SDK 默认值） |
-| `--retries N` | 首次请求后的额外重试次数（默认用 SDK 默认值） |
+| `--connect-timeout N` | 套接字连接超时（秒，默认 `10`，`0` = 默认值） |
+| `--readwrite-timeout N` | 读超时（秒），约束单个 S3 请求含上传体的总时长（默认 `600`，`0` = 默认值） |
+| `--retries N` | 首次请求后的额外重试次数（默认 SDK 默认 3 次尝试；`0` = 不重试） |
 | `--no-verify-crc64` | 关闭写路径 CRC64-ECMA 完整性校验（默认开启） |
 | `--content-md5` | 上传时设置 Content-MD5（跨 S3 兼容的完整性兜底） |
 | `--notsup-compat-dir` | 目录列举时跳过 `_$folder$` 旧目录标记对象 |
 | `--storage-class SC` | 新写对象的存储类型（如 `Standard`/`IA`/`Archive` 或 `STANDARD`/`GLACIER`） |
-| `--multipart-size N` | 分片上传每片大小（默认 `8388608`，最小钳制 `5242880`） |
+| `--multipart-size N` | 分片上传每片大小（默认 `8388608`，最小钳制 `5242880`；调大需同步调大 `--readwrite-timeout` —— 每片必须在读超时内传完） |
 | `--multipart-concurrency N` | 单次分片上传的并发片数（默认 `4`） |
 | `--disk-cache-dir PATH` | 对象区间本地磁盘缓存目录 |
 | `--disk-cache-max-bytes N` | 磁盘缓存字节上限；超出后 LRU 逐出 |
@@ -158,7 +158,8 @@ FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无�
 - `rename-dir-limit` / `max-upload-bytes` / `max-dirty-bytes` / `max-concurrent-requests` / `read-ahead-bytes` / `multipart-size` / `multipart-concurrency`：数字
 - `list-rate-limit`：数字，次/秒（`0` = 不限）
 - `storage-class` / `credential-process`：字符串
-- `connect-timeout` / `readwrite-timeout` / `retries`：数字（`0` = SDK 默认）
+- `connect-timeout` / `readwrite-timeout`：数字（`0` = 默认值 `10` / `600`）；`retries`：数字（`0` = 不重试）
+- 请求超时**不可禁用**——允许永久挂起的请求会冻结写入路径（复制冻结、上传静默丢失）；需近似旧的无限等待行为时可设一个足够大的值（如 `86400`）
 
 - 缓存：`stat-cache-ttl`（`3`）、`stat-cache-max-entries`（`4096`）、`negative-cache-ttl`（`5`）、`negative-cache-max-entries`（`4096`）、`read-cache-max-bytes`（`67108864`）、`total-mem-limit`（`0`）、`total-mem-read-ratio`（`0.5`）
 - 磁盘缓存：`disk-cache-dir`、`disk-cache-max-bytes`、`disk-cache-block-size`、`disk-cache-prefetch-blocks`、`disk-cache-prefetch-concurrency`、`disk-cache-etag-ttl`、`disk-cache-reserve-diskfree`、`disk-cache-free-space-ratio`

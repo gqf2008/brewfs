@@ -110,14 +110,14 @@ region / access key → *Save* → *Mount*.
 | `--no-ignore-fsync` | Disable the default fsync ignore (flush whole-file buffer on FUSE fsync) |
 | `--max-dirty-bytes N` | Cap aggregate dirty whole-file write buffers (`0` = unlimited) |
 | `--credential-process CMD` | External credential process (standard AWS credential_process JSON) |
-| `--connect-timeout N` | Socket connect timeout in seconds (default: SDK default) |
-| `--readwrite-timeout N` | Read timeout in seconds (default: SDK default) |
-| `--retries N` | Additional retry attempts after the initial request (default: SDK default) |
+| `--connect-timeout N` | Socket connect timeout in seconds (default `10`, `0` = default) |
+| `--readwrite-timeout N` | Read timeout in seconds, bounds each S3 request incl. its upload body (default `600`, `0` = default) |
+| `--retries N` | Additional retry attempts after the initial request (default: SDK default 3 attempts; `0` = no retry) |
 | `--no-verify-crc64` | Disable write-path CRC64-ECMA integrity verification (default on) |
 | `--content-md5` | Set Content-MD5 on uploads (cross-S3-compatible integrity fallback) |
 | `--notsup-compat-dir` | Skip legacy `_$folder$` directory-marker objects in listings |
 | `--storage-class SC` | Storage class for newly written objects (e.g. `Standard`/`IA`/`Archive` or `STANDARD`/`GLACIER`) |
-| `--multipart-size N` | Multipart part size, bytes (default `8388608`, clamped to `5242880` minimum) |
+| `--multipart-size N` | Multipart part size, bytes (default `8388608`, clamped to `5242880` minimum; raising it requires co-raising `--readwrite-timeout` — each part must upload within the read timeout) |
 | `--multipart-concurrency N` | Concurrent part uploads per multipart write (default `4`) |
 | `--disk-cache-dir PATH` | Local disk cache directory for object-range blocks |
 | `--disk-cache-max-bytes N` | Disk cache byte budget; evicts LRU blocks when exceeded |
@@ -173,7 +173,8 @@ attributes without extra stat round trips.
 - `rename-dir-limit` / `max-upload-bytes` / `max-dirty-bytes` / `max-concurrent-requests` / `read-ahead-bytes` / `multipart-size` / `multipart-concurrency`: number
 - `list-rate-limit`: number, calls/sec (`0` = unlimited)
 - `storage-class` / `credential-process`: string
-- `connect-timeout` / `readwrite-timeout` / `retries`: number (`0` = SDK default)
+- `connect-timeout` / `readwrite-timeout`: number (`0` = default `10` / `600`); `retries`: number (`0` = no retry)
+- Request timeouts cannot be disabled — a request that may hang forever can wedge the write path (frozen copies, silent upload loss). To approximate the old unbounded behavior, set a very large value (e.g. `86400`)
 
 - Caches: `stat-cache-ttl` (`3`), `stat-cache-max-entries` (`4096`), `negative-cache-ttl` (`5`), `negative-cache-max-entries` (`4096`), `read-cache-max-bytes` (`67108864`), `total-mem-limit` (`0`), `total-mem-read-ratio` (`0.5`)
 - Disk cache: `disk-cache-dir`, `disk-cache-max-bytes`, `disk-cache-block-size`, `disk-cache-prefetch-blocks`, `disk-cache-prefetch-concurrency`, `disk-cache-etag-ttl`, `disk-cache-reserve-diskfree`, `disk-cache-free-space-ratio`
