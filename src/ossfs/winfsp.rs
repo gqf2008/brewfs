@@ -357,7 +357,7 @@ impl OssMountContext {
             ctx.dirty.store(false, Ordering::Release);
             return Ok(());
         }
-        let mut data = ctx.write_buf.lock().unwrap().clone();
+        let data = ctx.write_buf.lock().unwrap().clone();
         if let Some(mut data) = data {
             // #48: SetEndOfFile/preallocation on a lazily-loaded write handle
             // records only `logical_size`; uploading the still-empty buffer
@@ -366,6 +366,17 @@ impl OssMountContext {
             // extensions, truncate shrinks) before uploading.
             let logical = ctx.logical_size.load(Ordering::Acquire) as usize;
             if logical != data.len() {
+                // Review 3 P1: on a budget-less (default) mount a
+                // SetEndOfFile(50 GB) with no writes would otherwise allocate
+                // 50 GB of zero-fill here and OOM the process. Refuse
+                // extensions past the in-memory threshold and keep the remote
+                // object intact; truncations are safe (no allocation).
+                if logical > data.len() && logical > WRITE_SPOOL_THRESHOLD {
+                    return Err(FspError::from(IoError::other(format!(
+                        "refusing to materialize a {logical}-byte extension past the {} MiB in-memory threshold",
+                        WRITE_SPOOL_THRESHOLD / (1024 * 1024)
+                    ))));
+                }
                 // Gate the flush-time read-modify-write against the dirty
                 // budget BEFORE downloading (same as write_async's lazy
                 // load), and refuse absurd SetEndOfFile preallocations
@@ -1780,6 +1791,34 @@ mod tests {
             last_put_body(&mock).as_deref(),
             Some(&b"XXXXX56789ABCDEFGHIJ"[..]),
             "partial overwrite must preserve the unmodified tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_size_beyond_threshold_fails_without_materializing() {
+        // Review 3 P1: on the default (budget-less) mount, a SetEndOfFile
+        // past WRITE_SPOOL_THRESHOLD must fail on flush instead of
+        // allocating the zero-fill extension and OOM-ing the process; the
+        // remote object stays intact.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"hello".to_vec());
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None)); // no budget
+        let file = test_file_with("/f", false);
+        let mut fi = FileInfo::default();
+        ctx.set_file_size(file, WRITE_SPOOL_THRESHOLD as u64 + 1024, false, &mut fi)
+            .expect("set_file_size");
+        let err = ctx
+            .upload_dirty(file)
+            .await
+            .expect_err("oversized extension must be refused on flush");
+        assert!(
+            err.to_string().contains("refusing to materialize"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "no GET for a refused extension"
         );
     }
 }

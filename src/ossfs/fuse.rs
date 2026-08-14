@@ -312,6 +312,16 @@ impl OssFs {
             if logical == buf.len() {
                 self.fs.write(&open.path, buf).await?;
             } else {
+                // Review 3 P1: on a budget-less (default) mount an extension
+                // past the in-memory threshold would allocate its zero-fill
+                // here and OOM the process. Refuse and keep the remote object
+                // intact; truncations are safe (no allocation).
+                if logical > buf.len() && logical > WRITE_SPOOL_THRESHOLD {
+                    anyhow::bail!(
+                        "refusing to materialize a {logical}-byte extension past the {} MiB in-memory threshold",
+                        WRITE_SPOOL_THRESHOLD / (1024 * 1024)
+                    );
+                }
                 let mut data = buf.clone();
                 if !open.loaded && logical > 0 {
                     let remote_size = self
@@ -1904,6 +1914,34 @@ mod tests {
             last_put_body(&_mock).as_deref(),
             Some(original.as_slice()),
             "flush must upload the full object when no truncate is pending"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_open_refuses_oversized_extension_without_materializing() {
+        // Review 3 P1: on a budget-less mount, an extension past
+        // WRITE_SPOOL_THRESHOLD must fail instead of allocating the
+        // zero-fill and OOM-ing.
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None); // no budget
+        let open = test_open(
+            "/f",
+            true,
+            b"hello".to_vec(),
+            WRITE_SPOOL_THRESHOLD as u64 + 1024,
+        );
+        let err = oss
+            .flush_open_async(&open)
+            .await
+            .expect_err("oversized extension must be refused on flush");
+        assert!(
+            err.to_string().contains("refusing to materialize"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            mock.get_count.load(Ordering::SeqCst),
+            0,
+            "no GET for a refused extension"
         );
     }
 }
