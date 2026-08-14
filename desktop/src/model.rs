@@ -251,11 +251,22 @@ pub fn load_profiles_from(store: Option<&dyn SecretStore>, path: &Path) -> LoadP
         }
         match p.secret_ref.as_deref() {
             Some(secret_ref) => match store {
-                None => warnings.push(format!(
-                    "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 以明文保存在 {}",
-                    p.name,
-                    path.display()
-                )),
+                None => {
+                    if p.access_key.is_empty() && p.secret_key.is_empty() {
+                        // The credentials live only in the (here unavailable)
+                        // secure store; there is no plaintext to fall back to.
+                        warnings.push(format!(
+                            "本平台无系统安全存储，配置「{}」的凭据仅保存在系统安全存储中，本次无法读取；挂载前请重新填写 AccessKey/SecretKey",
+                            p.name
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 以明文保存在 {}",
+                            p.name,
+                            path.display()
+                        ));
+                    }
+                }
                 Some(store) => match store.get(secret_ref) {
                     Ok(Some(creds)) => {
                         p.access_key = creds.access_key;
@@ -346,47 +357,64 @@ pub fn save_profiles_to(
     let mut new_refs: HashSet<String> = HashSet::new();
     for p in &file.profiles {
         let mut q = p.clone();
-        if q.secret_key.is_empty() && q.access_key.is_empty() {
+        let has_creds = !(q.secret_key.is_empty() && q.access_key.is_empty());
+        if !has_creds && q.secret_ref.as_deref().map_or(true, |r| r.is_empty()) {
+            // No credentials and no store entry: nothing to protect.
             sanitized.profiles.push(q);
             continue;
         }
-        if q.secret_ref.as_deref().map_or(true, |r| r.is_empty()) {
+        if has_creds && q.secret_ref.as_deref().map_or(true, |r| r.is_empty()) {
             q.secret_ref = Some(format!("profile-{}", new_secret_ref_suffix()));
         }
         let secret_ref = q.secret_ref.clone().unwrap_or_default();
-        let mut protected = false;
-        match store {
-            Some(store) => {
-                let creds = Credentials {
-                    access_key: q.access_key.clone(),
-                    secret_key: q.secret_key.clone(),
-                };
-                match store.put(&secret_ref, &creds) {
-                    Ok(()) => protected = true,
-                    Err(e) => warnings.push(format!(
-                        "写入配置「{}」的密钥到系统安全存储失败（{e}），AccessKey/SecretKey 将以明文保存在 {}",
-                        q.name,
-                        path.display()
-                    )),
+        // A profile that keeps its ref while its in-memory credentials are
+        // empty is one whose store entry could not be READ at load time
+        // (locked keychain, transient failure): the store entry is the only
+        // copy of the credentials, so it must be neither rewritten nor
+        // treated as an orphan below.
+        let mut protected = !has_creds;
+        if has_creds {
+            match store {
+                Some(store) => {
+                    let creds = Credentials {
+                        access_key: q.access_key.clone(),
+                        secret_key: q.secret_key.clone(),
+                    };
+                    match store.put(&secret_ref, &creds) {
+                        Ok(()) => protected = true,
+                        Err(e) => warnings.push(format!(
+                            "写入配置「{}」的密钥到系统安全存储失败（{e}），AccessKey/SecretKey 将以明文保存在 {}",
+                            q.name,
+                            path.display()
+                        )),
+                    }
                 }
+                None => warnings.push(format!(
+                    "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 将以明文保存在 {}",
+                    q.name,
+                    path.display()
+                )),
             }
-            None => warnings.push(format!(
-                "系统安全存储不可用，配置「{}」的 AccessKey/SecretKey 将以明文保存在 {}",
-                q.name,
-                path.display()
-            )),
         }
         if protected {
             q.access_key.clear();
             q.secret_key.clear();
+            new_refs.insert(secret_ref);
+        } else {
+            // Plaintext fallback: drop the ref as well. Invariant — a ref in
+            // the file exists exactly while the credentials are protected in
+            // the store. Keeping a ref next to (newer) plaintext would let a
+            // later load with a healthy store clobber that plaintext with the
+            // stale store entry, silently reverting the user's credentials.
+            q.secret_ref = None;
         }
-        new_refs.insert(secret_ref);
         sanitized.profiles.push(q);
     }
 
     write_profiles_atomic(path, &sanitized)?;
 
-    // Best-effort cleanup of secrets whose profiles no longer exist.
+    // Best-effort cleanup of secrets that the file no longer references
+    // (profile deleted, or ref dropped by the plaintext fallback above).
     if let Some(store) = store {
         for orphan in old_refs.difference(&new_refs) {
             let _ = store.delete(orphan);
@@ -940,6 +968,88 @@ mod tests {
         let a = new_secret_ref_suffix();
         let b = new_secret_ref_suffix();
         assert_ne!(a, b);
+    }
+
+    /// A store whose `put` always fails (simulates a locked keychain while
+    /// the entry itself remains readable).
+    struct PutFailStore(MemoryStore);
+
+    impl SecretStore for PutFailStore {
+        fn put(&self, _: &str, _: &Credentials) -> Result<(), crate::secrets::StoreError> {
+            Err(crate::secrets::StoreError::Failure(
+                "simulated keychain write failure".into(),
+            ))
+        }
+        fn get(&self, r: &str) -> Result<Option<Credentials>, crate::secrets::StoreError> {
+            self.0.get(r)
+        }
+        fn delete(&self, r: &str) -> Result<(), crate::secrets::StoreError> {
+            self.0.delete(r)
+        }
+    }
+
+    #[test]
+    fn save_keeps_store_entry_of_profile_with_unread_credentials() {
+        // Regression: a profile whose credentials could not be READ from the
+        // store at load time (locked keychain) keeps its ref with empty
+        // in-memory credentials. Saving in that state must NOT delete the
+        // store entry — it is the only remaining copy of the credentials.
+        let store = MemoryStore::new();
+        let path = temp_profiles_path("keep-unreadable-entry");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&store), &path, &file).unwrap();
+        assert_eq!(store.len(), 1);
+
+        let mut loaded = load_profiles_from(Some(&store), &path).file;
+        loaded.profiles[0].access_key.clear();
+        loaded.profiles[0].secret_key.clear();
+        save_profiles_to(Some(&store), &path, &loaded).unwrap();
+
+        assert_eq!(store.len(), 1, "store entry must survive the save");
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw.contains("secret_ref"),
+            "ref must stay in the file so the entry stays reachable: {raw}"
+        );
+        // And a healthy load still resolves the credentials.
+        let healthy = load_profiles_from(Some(&store), &path);
+        assert!(healthy.warnings.is_empty(), "{:?}", healthy.warnings);
+        assert_eq!(healthy.file.profiles[0].secret_key, "topsecret-456");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_store_write_drops_ref_next_to_plaintext() {
+        // Regression: when the store write fails, the plaintext fallback must
+        // also DROP the secret_ref. Keeping a ref next to (newer) plaintext
+        // would let the next load with a healthy store clobber that plaintext
+        // with the stale store entry, silently reverting the credentials.
+        let real = MemoryStore::new();
+        let path = temp_profiles_path("put-fail-drops-ref");
+        let file = ProfilesFile {
+            profiles: vec![credentialed_profile()],
+        };
+        save_profiles_to(Some(&real), &path, &file).unwrap();
+
+        // User rotates the secret; the next save hits a broken store.
+        let mut rotated = load_profiles_from(Some(&real), &path).file;
+        rotated.profiles[0].secret_key = "rotated-789".into();
+        let failing = PutFailStore(real);
+        let res = save_profiles_to(Some(&failing), &path, &rotated).unwrap();
+        assert!(!res.warnings.is_empty(), "fallback must be warned");
+
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw.contains("rotated-789"),
+            "plaintext fallback must keep the NEW secret: {raw}"
+        );
+        assert!(
+            !raw.contains("secret_ref"),
+            "ref must be dropped so a stale entry cannot clobber the plaintext: {raw}"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[cfg(not(windows))]

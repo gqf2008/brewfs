@@ -85,7 +85,12 @@ impl SecretStore for KeyringStore {
     fn get(&self, secret_ref: &str) -> Result<Option<Credentials>, StoreError> {
         let entry = keyring::Entry::new(SERVICE, secret_ref).map_err(keyring_err)?;
         match entry.get_password() {
-            Ok(payload) => Ok(serde_json::from_str(&payload).ok()),
+            Ok(payload) => serde_json::from_str(&payload).map(Some).map_err(|e| {
+                // A present-but-corrupt entry must not read as "missing":
+                // that would tell the user to re-enter credentials although
+                // the (damaged) entry is still there.
+                StoreError::Failure(format!("stored credential is not valid JSON: {e}"))
+            }),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(keyring_err(e)),
         }
@@ -166,6 +171,23 @@ pub(crate) mod memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    #[ignore = "touches the real system credential store; run locally with `cargo test -p ossfs-tray -- --ignored`"]
+    fn corrupt_store_entry_reads_as_failure_not_missing() {
+        // Regression: an entry whose payload is not the expected JSON must
+        // surface as Err (reported as a read failure), not as Ok(None)
+        // ("entry missing, re-enter credentials") — the entry is still there.
+        let store = system_store().expect("platform store must exist");
+        let secret_ref = "profile-test-corrupt-payload";
+        keyring::Entry::new(SERVICE, secret_ref)
+            .and_then(|e| e.set_password("this is not a JSON credential payload"))
+            .expect("seed corrupt entry");
+        let got = store.get(secret_ref);
+        assert!(got.is_err(), "corrupt entry must read as Err, got {got:?}");
+        store.delete(secret_ref).expect("cleanup");
+    }
 
     #[cfg(any(windows, target_os = "macos"))]
     #[test]

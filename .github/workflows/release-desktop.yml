@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -122,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo registry
         uses: actions/cache@v4
