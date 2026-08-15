@@ -356,6 +356,13 @@ impl OssConfig {
         if self.readwrite_timeout_secs.unwrap_or(0) == 0 {
             self.readwrite_timeout_secs = Some(DEFAULT_READWRITE_TIMEOUT_SECS);
         }
+        if self.retries.is_none() {
+            // Default to ONE retry (2 attempts): the SDK's default of 3
+            // attempts triples how long a wedged request parks its WinFsp
+            // callback / Explorer. Retries only help transient errors; the
+            // first attempt already distinguishes those from a dead link.
+            self.retries = Some(1);
+        }
         self
     }
 }
@@ -405,7 +412,14 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// `--multipart-size` beyond 8 MiB must co-raise this value (a part needs
 /// part_size / 600s of uplink). 600 s guarantees a stalled request errors
 /// out (and the SDK retries) instead of hanging the mount forever.
-const DEFAULT_READWRITE_TIMEOUT_SECS: u64 = 600;
+/// Response-HEAD idle timeout: how long a request may wait for ANY bytes
+/// from the peer. Slow-but-flowing transfers are NOT cut by this (response
+/// bodies are governed by StalledStreamProtection); only a fully silent
+/// peer is — and 60s of total silence is plenty on any network. Kept short
+/// because a wedged request parks its WinFsp callback — and with it
+/// Explorer — until it gives up (#43).
+const DEFAULT_READWRITE_TIMEOUT_SECS: u64 = 60;
+
 /// Overall budget floor for streaming one GET response body (see
 /// [`read_body_budget`]).
 const READ_BODY_MIN_TOTAL: Duration = Duration::from_secs(60);
@@ -1703,6 +1717,10 @@ impl ObjectFs {
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or the shared config
     /// file), which is how the desktop tray app spawns mounts.
     pub async fn connect(config: OssConfig) -> Result<Self> {
+        // Pre-normalize value: normalize() fills the default 600s, but the
+        // adapter-operation timeout wants its own (shorter) default when the
+        // user did not configure one.
+        let configured_readwrite = config.readwrite_timeout_secs;
         let config = config.normalize();
         let loader = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(config.region.clone()))
@@ -1815,9 +1833,7 @@ impl ObjectFs {
             metrics: Arc::new(Metrics::default()),
             dirty_budget,
             operation_timeout: std::time::Duration::from_secs(
-                config
-                    .readwrite_timeout_secs
-                    .unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
+                configured_readwrite.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
             ),
         };
         // Fail fast on a missing bucket: every later request would 404, which
@@ -4135,6 +4151,11 @@ mod tests {
         assert_eq!(
             cfg.readwrite_timeout_secs,
             Some(DEFAULT_READWRITE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            cfg.retries,
+            Some(1),
+            "default to one retry so a wedged request parks its callback at most 2x the read timeout"
         );
 
         let mut cfg = base();
