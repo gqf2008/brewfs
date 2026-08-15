@@ -437,6 +437,8 @@ const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
+/// S3's hard cap on the number of parts per multipart upload.
+const MAX_MULTIPART_PARTS: u64 = 10_000;
 /// Concurrent in-flight part uploads within a single multipart write. Each
 /// part also takes a global request-limit permit, so global in-flight stays
 /// bounded.
@@ -1249,8 +1251,8 @@ impl Metrics {
 }
 
 /// A streaming multipart upload handle. Bytes are fed via [`StreamingUpload::write`]
-/// and uploaded as [`MULTIPART_PART_SIZE`] parts in the background (bounded by
-/// `part_sem`), so upload overlaps with the local write and the process never
+/// and uploaded as [`StreamingUpload::part_size`] parts in the background (bounded
+/// by `part_sem`), so upload overlaps with the local write and the process never
 /// holds the whole object in memory.
 pub struct StreamingUpload {
     client: Client,
@@ -1270,6 +1272,23 @@ pub struct StreamingUpload {
     limiter: Arc<Semaphore>,
     tasks: tokio::task::JoinSet<anyhow::Result<(i32, String)>>,
     metrics: Arc<Metrics>,
+    /// Multipart part size in bytes (from `OssConfig::multipart_size`; the
+    /// default is [`MULTIPART_PART_SIZE`]). The user-visible knob was
+    /// previously ignored on this path (#55).
+    part_size: usize,
+    /// In-flight write-byte budget (MiB-unit semaphore); `None` = unlimited.
+    /// Permits are acquired incrementally in [`Self::write`] and released
+    /// when the upload finishes, aborts or drops.
+    budget_sem: Option<Arc<Semaphore>>,
+    /// MiB units of `budget_sem` currently held (high-water mark).
+    budget_units: usize,
+    /// RAII permits backing [`Self::budget_units`]; dropped together with the
+    /// handle (finish/abort/drop), releasing the budget.
+    budget_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    /// Set once the upload reached a terminal state (completed or aborted).
+    /// [`Drop`] then skips its best-effort abort — otherwise dropping a
+    /// finished handle would abort the very object it just completed.
+    aborted: bool,
 }
 
 impl StreamingUpload {
@@ -1283,11 +1302,46 @@ impl StreamingUpload {
     /// Feed `data` into the upload. Buffers until a full part is ready, then
     /// uploads it in the background.
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        let new_total = self.total_bytes.saturating_add(data.len() as u64);
+        // S3 caps multipart at 10,000 parts; fail before uploading a part
+        // that can never complete, instead of discovering it at
+        // CompleteMultipartUpload after the whole object was uploaded (#55).
+        let max_bytes = (self.part_size as u64).saturating_mul(MAX_MULTIPART_PARTS);
+        if new_total > max_bytes {
+            anyhow::bail!(
+                "streaming write exceeds S3 multipart limit of {MAX_MULTIPART_PARTS} parts \
+                 ({max_bytes} bytes at part size {})",
+                self.part_size
+            );
+        }
+        // Grow the upload-budget reservation for the newly fed bytes.
+        // try_acquire, not acquire: the FUSE adapter feeds stream writes on
+        // its single dispatcher thread, where a blocking wait could hang the
+        // whole mount (same reasoning as the dirty-budget fix, #53/#55).
+        if !data.is_empty() {
+            if let Some(sem) = &self.budget_sem {
+                let units = new_total.div_ceil(UPLOAD_BUDGET_UNIT as u64) as usize;
+                if units > self.budget_units {
+                    let permit = sem
+                        .clone()
+                        .try_acquire_many_owned((units - self.budget_units) as u32)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "write of {new_total} bytes exceeds max-upload-bytes budget"
+                            )
+                        })?;
+                    // Holding the permit(s) until finish/abort/drop bounds
+                    // total in-flight streaming bytes at max-upload-bytes.
+                    self.budget_units = units;
+                    self.budget_permits.push(permit);
+                }
+            }
+        }
         self.hasher.update(data);
-        self.total_bytes += data.len() as u64;
+        self.total_bytes = new_total;
         self.pending.extend_from_slice(data);
-        while self.pending.len() >= MULTIPART_PART_SIZE as usize {
-            let chunk: Vec<u8> = self.pending.drain(..MULTIPART_PART_SIZE as usize).collect();
+        while self.pending.len() >= self.part_size {
+            let chunk: Vec<u8> = self.pending.drain(..self.part_size).collect();
             self.upload_part(chunk).await?;
         }
         Ok(())
@@ -1336,6 +1390,8 @@ impl StreamingUpload {
         if !self.pending.is_empty() {
             let chunk = std::mem::take(&mut self.pending);
             self.upload_part(chunk).await?;
+            // upload_part error: self is dropped here — [`Drop`] aborts the
+            // upload so no multipart is left behind (#55).
         }
         let mut upload_error = None;
         while let Some(joined) = self.tasks.join_next().await {
@@ -1346,14 +1402,8 @@ impl StreamingUpload {
             }
         }
         if let Some(e) = upload_error {
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .send()
-                .await;
+            let _ = self.abort_send().await;
+            self.aborted = true;
             return Err(e);
         }
         self.parts.sort_by_key(|p| p.0);
@@ -1361,7 +1411,11 @@ impl StreamingUpload {
         // bucket / key remain borrowable for the completion builder and (on
         // the rare error branch) the HEAD verify — no eager clone needed.
         let parts = std::mem::take(&mut self.parts);
-        let expected_crc = self.verify_crc64.then(|| self.hasher.finalize());
+        // Replace, not move: `StreamingUpload` implements Drop, so a field
+        // may not be moved out of `self`; the finished hasher is swapped for
+        // a fresh no-op one (#55).
+        let hasher = std::mem::replace(&mut self.hasher, Crc64Ecma::new());
+        let expected_crc = self.verify_crc64.then(|| hasher.finalize());
         let crc_slot = Arc::new(Mutex::new(None));
         let mut complete = self
             .client
@@ -1387,6 +1441,12 @@ impl StreamingUpload {
                 slot: Arc::clone(&crc_slot),
             });
         }
+        let _permit = self
+            .limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
         if let Err(e) = complete.send().await {
             // A failed CompleteMultipartUpload may still have completed the
             // object server-side: a retried complete racing the first attempt
@@ -1397,13 +1457,15 @@ impl StreamingUpload {
             // byte count the write succeeded (the complete response never
             // arrived, so the whole-object CRC64 header cannot be captured —
             // size-verified success is the best guarantee for this path).
+            drop(_permit);
             if matches!(
                 head_reports_size(
                     &self.client,
                     &self.bucket,
                     &self.key,
                     self.total_bytes,
-                    &self.metrics
+                    &self.metrics,
+                    &self.limiter,
                 )
                 .await,
                 Some(true)
@@ -1415,16 +1477,11 @@ impl StreamingUpload {
                 self.metrics
                     .upload_bytes_total
                     .fetch_add(self.total_bytes, Ordering::Relaxed);
+                self.aborted = true;
                 return Ok(());
             }
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .send()
-                .await;
+            let _ = self.abort_send().await;
+            self.aborted = true;
             return Err(e).context("s3 complete multipart upload");
         }
         if let Some(expected) = expected_crc {
@@ -1437,22 +1494,75 @@ impl StreamingUpload {
         self.metrics
             .upload_bytes_total
             .fetch_add(self.total_bytes, Ordering::Relaxed);
+        self.aborted = true;
         Ok(())
+    }
+
+    /// Best-effort AbortMultipartUpload under a limiter permit. Callers use
+    /// it on their error paths and set `aborted` themselves.
+    async fn abort_send(&self) -> anyhow::Result<()> {
+        let _permit = self
+            .limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("s3 request limiter closed"))?;
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await
+            .map(|_| ())
+            .context("s3 abort multipart upload")
     }
 
     /// Abort the multipart upload and discard any uploaded parts, keeping
     /// the object's previous content (or absence). Used when a truncate /
     /// overwrite invalidates the in-flight stream (#47).
     pub async fn abort(mut self) {
+        self.aborted = true;
         self.tasks.abort_all();
-        let _ = self
-            .client
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&self.key)
-            .upload_id(&self.upload_id)
-            .send()
-            .await;
+        let _ = self.abort_send().await;
+    }
+}
+
+impl Drop for StreamingUpload {
+    /// Best-effort abort of an abandoned upload: adapter error paths and
+    /// dropped handles would otherwise orphan the multipart upload, leaving
+    /// uploaded parts billed as invisible storage until a bucket lifecycle
+    /// rule cleans them up (#55). Completed (`finish`) and explicitly aborted
+    /// (`abort`) handles set `aborted` and are untouched.
+    fn drop(&mut self) {
+        if self.aborted {
+            return;
+        }
+        self.aborted = true;
+        self.tasks.abort_all();
+        // Spawn outside the caller's async context: drop can run on a plain
+        // sync path (e.g. a FUSE callback erroring before any await).
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+        let limiter = self.limiter.clone();
+        handle.spawn(async move {
+            let _permit = match limiter.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        });
     }
 }
 
@@ -1462,15 +1572,18 @@ impl StreamingUpload {
 /// NoSuchUpload), so the caller treats the write as success instead of
 /// aborting or erroring on a possibly-complete object. `metrics`, when
 /// provided, counts the HEAD against `s3_heads` (it is invisible to the
-/// adapters' other HEAD paths otherwise).
+/// adapters' other HEAD paths otherwise). Takes a limiter permit so the
+/// verification HEAD stays inside `MAX_CONCURRENT_S3_REQUESTS` (#55).
 async fn head_reports_size(
     client: &Client,
     bucket: &str,
     key: &str,
     expected_bytes: u64,
     metrics: &Metrics,
+    limiter: &Arc<Semaphore>,
 ) -> Option<bool> {
     metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+    let _permit = limiter.clone().acquire_owned().await.ok()?;
     let resp = client
         .head_object()
         .bucket(bucket)
@@ -1776,8 +1889,12 @@ impl ObjectFs {
     /// S3-facing method takes exactly one permit for its whole body (mkdir
     /// takes one indirectly via write); internal `*_impl` helpers never
     /// acquire, so cross-calls cannot deadlock even when the pool is
-    /// saturated. Keep this invariant: public methods acquire, `*_impl`
-    /// helpers never do.
+    /// saturated. Helpers that issue their *own* S3 request (verification
+    /// HEADs, aborts — see `head_reports_size` / `abort_upload` /
+    /// `verify_disk_cache_etag`) acquire one permit for that request, so the
+    /// in-flight count never exceeds `MAX_CONCURRENT_S3_REQUESTS` even
+    /// stacked on a public method's permit (#55). Keep this invariant:
+    /// public methods acquire, `*_impl` helpers never do.
     async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
         self.limiter
             .clone()
@@ -2289,8 +2406,27 @@ impl ObjectFs {
             key,
             expected_bytes,
             &self.metrics,
+            &self.limiter,
         )
         .await
+    }
+
+    /// Best-effort AbortMultipartUpload under a limiter permit. The abort
+    /// request itself is an S3 request and must stay inside
+    /// `MAX_CONCURRENT_S3_REQUESTS` (#55); failures are swallowed on purpose
+    /// (the caller is already on an error path).
+    async fn abort_upload(&self, key: &str, upload_id: &str) {
+        let Ok(_permit) = self.acquire().await else {
+            return;
+        };
+        let _ = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
     }
 
     async fn verify_disk_cache_etag(&self, key: &str) {
@@ -2307,6 +2443,12 @@ impl ObjectFs {
         self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_etag_heads.fetch_add(1, Ordering::Relaxed);
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
+        // The verification HEAD is a second in-flight S3 request on top of
+        // the read_range that called us; bound it by the global limit like
+        // every other request (#55).
+        let Ok(_permit) = self.acquire().await else {
+            return;
+        };
         let Ok(resp) = self
             .client
             .head_object()
@@ -2537,18 +2679,23 @@ impl ObjectFs {
         if let Some(sc) = &self.storage_class {
             create = create.storage_class(sc.clone());
         }
-        let create = create
-            .send()
-            .await
-            .inspect_err(|_| {
-                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
-            })
-            .inspect_err(|_| {
-                self.metrics
-                    .s3_multipart_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            })
-            .context("s3 create multipart upload")?;
+        let create = {
+            // Scoped to the request: part uploads below need the pool's
+            // remaining permits (#55).
+            let _permit = self.acquire().await?;
+            create
+                .send()
+                .await
+                .inspect_err(|_| {
+                    self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .inspect_err(|_| {
+                    self.metrics
+                        .s3_multipart_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                })
+                .context("s3 create multipart upload")?
+        };
         let upload_id = create
             .upload_id()
             .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
@@ -2621,14 +2768,7 @@ impl ObjectFs {
         }
 
         if let Some(e) = upload_error {
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
+            self.abort_upload(&key, &upload_id).await;
             return Err(e);
         }
 
@@ -2650,7 +2790,12 @@ impl ObjectFs {
                 slot: Arc::clone(&crc_slot),
             });
         }
-        if let Err(e) = complete.send().await {
+        let complete_result = {
+            // Scoped to the request (#55).
+            let _permit = self.acquire().await?;
+            complete.send().await
+        };
+        if let Err(e) = complete_result {
             // Any failed CompleteMultipartUpload may have completed server-side
             // (NoSuchUpload race, timeout, 5xx, reset). HEAD-verify before
             // aborting/erroring (see StreamingUpload::finish).
@@ -2660,14 +2805,7 @@ impl ObjectFs {
             ) {
                 return Ok(());
             }
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
+            self.abort_upload(&key, &upload_id).await;
             return Err(e).context("s3 complete multipart upload");
         }
         if let Some(expected) = expected_crc {
@@ -2715,18 +2853,23 @@ impl ObjectFs {
         if let Some(sc) = &self.storage_class {
             create = create.storage_class(sc.clone());
         }
-        let create = create
-            .send()
-            .await
-            .inspect_err(|_| {
-                self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
-            })
-            .inspect_err(|_| {
-                self.metrics
-                    .s3_multipart_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            })
-            .context("s3 create multipart upload")?;
+        let create = {
+            // Scoped to the request: part uploads below need the pool's
+            // remaining permits (#55).
+            let _permit = self.acquire().await?;
+            create
+                .send()
+                .await
+                .inspect_err(|_| {
+                    self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .inspect_err(|_| {
+                    self.metrics
+                        .s3_multipart_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                })
+                .context("s3 create multipart upload")?
+        };
         let upload_id = create
             .upload_id()
             .ok_or_else(|| anyhow::anyhow!("s3 create multipart upload returned no upload id"))?
@@ -2806,14 +2949,7 @@ impl ObjectFs {
         }
 
         if let Some(e) = upload_error {
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
+            self.abort_upload(&key, &upload_id).await;
             return Err(e);
         }
 
@@ -2836,20 +2972,18 @@ impl ObjectFs {
                 slot: Arc::clone(&crc_slot),
             });
         }
-        if let Err(e) = complete.send().await {
+        let complete_result = {
+            // Scoped to the request (#55).
+            let _permit = self.acquire().await?;
+            complete.send().await
+        };
+        if let Err(e) = complete_result {
             // Any failed CompleteMultipartUpload may have completed server-side
             // (see StreamingUpload::finish). HEAD-verify before aborting.
             if matches!(self.verify_completed_object(&key, size).await, Some(true)) {
                 return Ok(());
             }
-            let _ = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
+            self.abort_upload(&key, &upload_id).await;
             return Err(e).context("s3 complete multipart upload");
         }
         if let Some(expected) = expected_crc {
@@ -2870,6 +3004,7 @@ impl ObjectFs {
         // final size is known, in [`StreamingUpload::finish`] (#60).
         self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         let key = self.key_for(path);
+        let _permit = self.acquire().await?;
         let mut create = self
             .client
             .create_multipart_upload()
@@ -2910,6 +3045,11 @@ impl ObjectFs {
             limiter: Arc::clone(&self.limiter),
             tasks: tokio::task::JoinSet::new(),
             metrics: Arc::clone(&self.metrics),
+            part_size: self.multipart_part_size,
+            budget_sem: self.upload_budget.clone(),
+            budget_units: 0,
+            budget_permits: Vec::new(),
+            aborted: false,
         })
     }
 
@@ -5449,6 +5589,227 @@ mod s3_mock_tests {
         assert!(
             res.is_err(),
             "genuinely-missing upload must surface an error"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // StreamingUpload hardening (#55): Drop abort, budget, part size,
+    // limiter coverage
+    // -------------------------------------------------------------------
+
+    /// A dropped (never-finished, never-aborted) streaming handle must abort
+    /// its multipart upload so uploaded parts are not orphaned on the bucket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_drop_without_finish_aborts_multipart() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        let mut up = fs
+            .begin_streaming_upload("/dropped.bin")
+            .await
+            .expect("begin");
+        up.write(&vec![0x42u8; MULTIPART_PART_SIZE as usize + 17])
+            .await
+            .expect("feed at least one full part");
+        // Drop without finish / abort: Drop must issue the abort itself.
+        drop(up);
+
+        // The abort is spawned best-effort; give it a moment to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        let aborts = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid"))
+            .count();
+        assert_eq!(
+            aborts, 1,
+            "dropping an unfinished streaming handle must abort the upload: {recorded:?}"
+        );
+        let completes = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploadid")
+                    && !lc(&r.target).contains("partnumber")
+            })
+            .count();
+        assert_eq!(completes, 0, "no complete for a dropped upload");
+    }
+
+    /// A read-only mount must refuse to begin a streaming upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_begin_rejects_read_only_mount() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.read_only = true;
+
+        let err = match fs.begin_streaming_upload("/ro.bin").await {
+            Err(e) => e,
+            Ok(_) => panic!("read-only mount must reject begin_streaming_upload"),
+        };
+        assert!(
+            err.to_string().contains("read-only"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            0,
+            "no S3 request may be issued for a rejected begin"
+        );
+    }
+
+    /// The upload-budget (max-upload-bytes) must bound streaming writes:
+    /// exceeding it fails the write, and a finish releases the budget for a
+    /// subsequent upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_write_enforces_upload_budget() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.upload_budget = Some(Arc::new(Semaphore::new(1)));
+        fs.upload_budget_units = 1; // 1 MiB budget
+
+        // A single write beyond the budget must fail fast (try_acquire),
+        // and the failed handle must not leave an upload behind.
+        let mut up = fs.begin_streaming_upload("/big.bin").await.expect("begin");
+        let err = up
+            .write(&vec![0x7Au8; (2 << 20) + 1])
+            .await
+            .expect_err("write beyond the upload budget must fail");
+        assert!(
+            err.to_string().contains("max-upload-bytes"),
+            "unexpected error: {err:?}"
+        );
+        drop(up);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let lc = |t: &str| t.to_lowercase();
+        assert!(
+            mock.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid")),
+            "failed budget write must abort its upload"
+        );
+
+        // Within budget: write 512 KiB, finish, and the budget must be free
+        // for the next upload (permit released with the handle).
+        let mut up = fs.begin_streaming_upload("/ok.bin").await.expect("begin");
+        up.write(&vec![0x11u8; 512 * 1024])
+            .await
+            .expect("write within budget");
+        up.finish().await.expect("finish within budget");
+        let mut up2 = fs
+            .begin_streaming_upload("/ok2.bin")
+            .await
+            .expect("second begin after finish must have budget available");
+        up2.write(&vec![0x22u8; 512 * 1024])
+            .await
+            .expect("write after finish must succeed");
+        up2.finish().await.expect("second finish");
+    }
+
+    /// Every S3 request of the streaming path must hold a limiter permit:
+    /// with a 1-permit pool a full upload (create → parts → complete → the
+    /// recovery HEAD) must serialize without deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_path_serializes_on_single_permit_limiter() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.limiter = Arc::new(Semaphore::new(1));
+        mock.complete_no_such_upload.store(true, Ordering::SeqCst);
+        let data: Vec<u8> = (0..(MULTIPART_PART_SIZE as usize + 31))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        mock.set_object("single.bin", data.clone());
+
+        let mut up = fs
+            .begin_streaming_upload("/single.bin")
+            .await
+            .expect("begin");
+        up.write(&data).await.expect("write");
+        // complete fails (NoSuchUpload) → the recovery HEAD must acquire the
+        // single permit without deadlocking (it is released before the HEAD).
+        up.finish()
+            .await
+            .expect("recovery HEAD under a 1-permit limiter must not deadlock");
+    }
+
+    /// Parts must be cut at the configured multipart size, not the hardcoded
+    /// default (#55).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_parts_follow_configured_part_size() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.multipart_part_size = 1024 * 1024; // 1 MiB parts
+
+        let mut up = fs
+            .begin_streaming_upload("/parts.bin")
+            .await
+            .expect("begin");
+        let data: Vec<u8> = vec![0x5Au8; 2 * 1024 * 1024 + 4096];
+        up.write(&data).await.expect("write");
+        up.finish().await.expect("finish");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        let mut parts: Vec<(i32, Vec<u8>)> = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && lc(&r.target).contains("partnumber"))
+            .map(|r| {
+                let query = r.target.split('?').nth(1).unwrap_or("");
+                let part_no = query
+                    .split('&')
+                    .find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        k.eq_ignore_ascii_case("partnumber")
+                            .then(|| v.parse::<i32>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                (part_no, r.body.clone())
+            })
+            .collect();
+        parts.sort_by_key(|(n, _)| *n);
+        assert!(parts.len() >= 3, "expected 3 parts, got {}", parts.len());
+        for (_, body) in &parts {
+            assert!(
+                body.len() <= 1024 * 1024,
+                "part of {} bytes exceeds the configured 1 MiB size",
+                body.len()
+            );
+        }
+        let reassembled: Vec<u8> = parts.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(reassembled, data, "parts must reassemble in order");
+    }
+
+    /// S3's 10000-part cap must be enforced while writing, not discovered at
+    /// CompleteMultipartUpload after the whole object was uploaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_write_rejects_more_than_10000_parts() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.multipart_part_size = 1024; // 10000 parts = 10 MiB
+
+        let mut up = fs.begin_streaming_upload("/huge.bin").await.expect("begin");
+        let over = 10_000 * 1024 + 1;
+        let err = up
+            .write(&vec![0x9Cu8; over])
+            .await
+            .expect_err("more than 10000 parts must be rejected while writing");
+        assert!(
+            err.to_string().contains("multipart limit"),
+            "unexpected error: {err:?}"
+        );
+        drop(up);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let lc = |t: &str| t.to_lowercase();
+        assert!(
+            mock.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid")),
+            "the rejected upload must still be aborted on drop"
         );
     }
 
