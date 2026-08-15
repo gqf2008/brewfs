@@ -803,7 +803,7 @@ fn unmount_event_name() -> String {
 /// remains the only graceful stop channel — a broken control plane must
 /// not break mounting (the tray falls back to force-terminate).
 async fn wait_unmount_event() {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 
     let name: Vec<u16> = unmount_event_name()
@@ -811,14 +811,25 @@ async fn wait_unmount_event() {
         .chain(std::iter::once(0))
         .collect();
     // SAFETY: valid NUL-terminated name; manual-reset, initially unset; no
-    // security attributes (per-session `Local\` object, same user).
+    // security attributes (per-session `Local\` object, same user). The
+    // default DACL keeps other users out; a same-session process could Set
+    // this event, but it could equally TerminateProcess the mount — no
+    // privilege is gained.
     let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+    if handle.is_null() {
+        // CreateEventW fails with NULL (never INVALID_HANDLE_VALUE). The
+        // pending future never resolves, so the event branch stays dormant
+        // and Ctrl+C remains the only graceful stop channel. (Do NOT use
+        // `return` here: an immediately-ready branch would race select!'s
+        // start order and could unmount right after mounting.)
         warn!("cannot create the unmount control event; Ctrl+C stays the only stop channel");
         std::future::pending::<()>().await;
     }
     // SAFETY: `handle` is a valid event handle owned by this call; the
-    // blocking wait runs off the async runtime.
+    // blocking wait runs off the async runtime. When select! cancels this
+    // branch (Ctrl+C path), the blocking thread keeps waiting until the
+    // process exits — the handle and thread are reclaimed by the OS at exit,
+    // so this is not a real leak.
     let _ = tokio::task::spawn_blocking(move || {
         unsafe { WaitForSingleObject(handle, INFINITE) };
         // SAFETY: valid handle, single owner, no other waiter afterwards.

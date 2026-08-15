@@ -203,12 +203,20 @@ pub fn load_desired(path: &Path) -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
-/// Persist the desired-mount set atomically (write tmp + rename), so a
-/// crash mid-write leaves either the old or the new file, never a torn one.
+/// Persist the desired-mount set atomically (write tmp + fsync + rename),
+/// matching the profiles.json convention: a crash mid-write leaves either
+/// the old or the new file, never a torn one (#61).
 pub fn save_desired(path: &Path, desired: &std::collections::HashSet<String>) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(desired)?;
     fs::write(&tmp, &bytes)?;
+    // Flush to disk before the rename so the rename never publishes a torn
+    // file after a power loss (load_desired tolerates corruption, but
+    // avoiding it costs nothing here).
+    fs::File::open(&tmp)?.sync_all()?;
     fs::rename(&tmp, path)
 }
 

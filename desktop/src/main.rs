@@ -163,7 +163,10 @@ fn tray_menu_drives() -> std::sync::MutexGuard<'static, Vec<String>> {
 /// crash re-arms the auto-restart supervision (#61). Best-effort: a failed
 /// state write only loses supervision across a restart, never blocks I/O.
 fn persist_desired(g: &mut std::sync::MutexGuard<'static, GuardState>) {
-    let _ = model::save_desired(&model::desired_path(), &g.desired);
+    // Clone before the file I/O so the guard is not held across fs::write
+    // (the 2s refresh timer shares this lock).
+    let desired = g.desired.clone();
+    let _ = model::save_desired(&model::desired_path(), &desired);
 }
 
 fn guard() -> std::sync::MutexGuard<'static, GuardState> {
@@ -324,12 +327,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ossmount = Rc::new(model::find_ossmount());
 
     // Re-arm the auto-restart guard from the persisted desired set: a tray
-    // restart/crash must not silently abandon supervision of running mounts
-    // (#61).
+    // restart/crash must not silently abandon supervision of mounts that are
+    // still running (#61). Drives that are NOT running are deliberately NOT
+    // re-armed — a machine reboot must not turn a past session's mounts into
+    // auto-mounts on tray startup; the user remounts explicitly.
     {
+        let running: std::collections::HashSet<String> =
+            model::read_mounts(&state.borrow().profiles)
+                .into_iter()
+                .filter(|m| m.alive)
+                .map(|m| m.drive)
+                .collect();
         let mut g = guard();
         let persisted = model::load_desired(&model::desired_path());
-        g.desired.extend(persisted);
+        g.desired
+            .extend(persisted.into_iter().filter(|d| running.contains(d)));
     }
 
     // Surface profile-storage problems (corrupt file recovered, secure
@@ -729,7 +741,14 @@ fn wire_callbacks(
                     {
                         let mut file = state2.borrow_mut();
                         if index >= 0 && (index as usize) < file.profiles.len() {
-                            file.profiles.remove(index as usize);
+                            let removed = file.profiles.remove(index as usize);
+                            // A deleted profile's drive must leave the
+                            // desired set too, or desired.json keeps a stale
+                            // entry that the watchdog retries forever (#61).
+                            let mut g = guard();
+                            if g.desired.remove(&removed.drive) {
+                                persist_desired(&mut g);
+                            }
                         }
                         match model::save_profiles(&file) {
                             Ok(res) => {
@@ -1379,10 +1398,16 @@ fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
                 // The unmount failed and the drive is no longer supervised:
                 // re-arm the auto-restart guard so the (possibly still
                 // running) mount stays watched, instead of silently losing
-                // supervision with a stale runtime record (review B4).
-                let mut g = guard();
-                g.desired.insert(m.drive.clone());
-                persist_desired(&mut g);
+                // supervision with a stale runtime record (review B4). Only
+                // re-arm when the process is genuinely still alive — a stale
+                // pid would make the watchdog resurrect a dead mount on the
+                // next tick, and the re-arm would survive a tray restart via
+                // desired.json (#61).
+                if winutil::pid_alive(m.pid) {
+                    let mut g = guard();
+                    g.desired.insert(m.drive.clone());
+                    persist_desired(&mut g);
+                }
                 let msg = format!("卸载 {} 失败：{e}", m.drive);
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                     ui.set_status_text(msg.into());
