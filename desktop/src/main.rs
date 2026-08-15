@@ -159,6 +159,15 @@ fn tray_menu_drives() -> std::sync::MutexGuard<'static, Vec<String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Persist the desired set after a mutation so a tray restart or crash
+/// re-arms the auto-restart supervision (#61). Best-effort: a failed state
+/// write only loses supervision across a restart, never blocks I/O.
+/// Callers must drop the guard before calling (the 2s refresh timer shares
+/// the lock; file I/O must not run under it).
+fn persist_desired(desired: &std::collections::HashSet<String>) {
+    let _ = model::save_desired(&model::desired_path(), desired);
+}
+
 fn guard() -> std::sync::MutexGuard<'static, GuardState> {
     MOUNT_GUARD
         .get_or_init(|| std::sync::Mutex::new(GuardState::default()))
@@ -315,6 +324,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recent = Rc::new(RefCell::new(Vec::<RecentSpawn>::new()));
     let hold = Rc::new(StatusHold::default());
     let ossmount = Rc::new(model::find_ossmount());
+
+    // Re-arm the auto-restart guard from the persisted desired set: a tray
+    // restart/crash must not silently abandon supervision of mounts that are
+    // still running (#61). Drives that are NOT running are deliberately NOT
+    // re-armed — a machine reboot must not turn a past session's mounts into
+    // auto-mounts on tray startup; the user remounts explicitly.
+    {
+        let running: std::collections::HashSet<String> =
+            model::read_mounts(&state.borrow().profiles)
+                .into_iter()
+                .filter(|m| m.alive)
+                .map(|m| m.drive)
+                .collect();
+        let mut g = guard();
+        let persisted = model::load_desired(&model::desired_path());
+        g.desired
+            .extend(persisted.into_iter().filter(|d| running.contains(d)));
+    }
 
     // Surface profile-storage problems (corrupt file recovered, secure
     // store unavailable, ...) to the user instead of failing silently.
@@ -653,14 +680,18 @@ fn wire_callbacks(
                     );
                     // Ask the guard to auto-restart this mount if it dies.
                     if started {
-                        let mut g = guard();
-                        g.desired.insert(drive.clone());
-                        // A manual mount starts a new lifetime: clear any
-                        // accumulated restart budget and fast-fail marks so
-                        // the fresh mount gets a full budget (review B2).
-                        g.failed.remove(&drive);
-                        g.restarts.remove(&drive);
-                        g.alive_since.remove(&drive);
+                        let desired = {
+                            let mut g = guard();
+                            g.desired.insert(drive.clone());
+                            // A manual mount starts a new lifetime: clear any
+                            // accumulated restart budget and fast-fail marks
+                            // so the fresh mount gets a full budget (B2).
+                            g.failed.remove(&drive);
+                            g.restarts.remove(&drive);
+                            g.alive_since.remove(&drive);
+                            g.desired.clone()
+                        };
+                        persist_desired(&desired);
                     }
                 }
             }
@@ -712,7 +743,20 @@ fn wire_callbacks(
                     {
                         let mut file = state2.borrow_mut();
                         if index >= 0 && (index as usize) < file.profiles.len() {
-                            file.profiles.remove(index as usize);
+                            let removed = file.profiles.remove(index as usize);
+                            // A deleted profile's drive must leave the
+                            // desired set too, or desired.json keeps a stale
+                            // entry that the watchdog retries forever (#61).
+                            // Match the normalized key the mount path uses.
+                            let desired = {
+                                let mut g = guard();
+                                let key = model::normalize_mount_point(&removed.drive);
+                                let changed = g.desired.remove(&key);
+                                (changed, g.desired.clone())
+                            };
+                            if desired.0 {
+                                persist_desired(&desired.1);
+                            }
                         }
                         match model::save_profiles(&file) {
                             Ok(res) => {
@@ -1341,14 +1385,18 @@ const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Writes are whole-file buffered and pushed on close, so force-killing the
 /// process can lose the entire in-flight buffer of a large file. The
 /// sequence is therefore: ask for a graceful shutdown (SIGTERM on Unix —
-/// `ossmount` unmounts cleanly on it), wait up to
-/// [`GRACEFUL_UNMOUNT_TIMEOUT`] for the process to exit, and only then
-/// force-terminate. Windows console mount processes have no mechanism to
-/// receive a soft shutdown request yet (needs an ossmount control handler /
-/// control-plane stop — tracked in #61), so there the force path is
-/// immediate, as before.
+/// `ossmount` unmounts cleanly on it; on Windows the tray signals the
+/// mount's `Local\ossfs-unmount-<pid>` control event, added in #61), wait up
+/// to [`GRACEFUL_UNMOUNT_TIMEOUT`] for the process to exit, and only then
+/// force-terminate. A mount running an ossmount build without the control
+/// event reports no graceful channel and is force-terminated as before.
 fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
-    guard().desired.remove(&m.drive);
+    let desired = {
+        let mut g = guard();
+        g.desired.remove(&m.drive);
+        g.desired.clone()
+    };
+    persist_desired(&desired);
     guard().alive_since.remove(&m.drive);
     let ui_weak = ui.as_weak();
     let m = m.clone();
@@ -1359,8 +1407,19 @@ fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
                 // The unmount failed and the drive is no longer supervised:
                 // re-arm the auto-restart guard so the (possibly still
                 // running) mount stays watched, instead of silently losing
-                // supervision with a stale runtime record (review B4).
-                guard().desired.insert(m.drive.clone());
+                // supervision with a stale runtime record (review B4). Only
+                // re-arm when the process is genuinely still alive — a stale
+                // pid would make the watchdog resurrect a dead mount on the
+                // next tick, and the re-arm would survive a tray restart via
+                // desired.json (#61).
+                if winutil::pid_alive(m.pid) {
+                    let desired = {
+                        let mut g = guard();
+                        g.desired.insert(m.drive.clone());
+                        g.desired.clone()
+                    };
+                    persist_desired(&desired);
+                }
                 let msg = format!("卸载 {} 失败：{e}", m.drive);
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                     ui.set_status_text(msg.into());
