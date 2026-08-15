@@ -42,6 +42,11 @@ jobs:
         run: |
           set -euo pipefail
           brew install --cask fuse-t
+          # Path of the downloaded FUSE-T installer (brew cask cache) — the
+          # packaging script bundles it into the DMG so a fresh OSSFS install
+          # works without a second download (FUSE-T license: free for
+          # non-commercial use; see scripts/package_macos.sh).
+          echo "FUSE_T_PKG=$(brew --cache --cask fuse-t)" >> "$GITHUB_ENV"
           # 准备 ossmount 链接用的 FUSE-T prefix（布局与 scripts/package_macos.sh 一致）
           FUSE_T_PREFIX="$HOME/ossfs-deps/fuse-t"
           mkdir -p "$FUSE_T_PREFIX/lib/pkgconfig" "$FUSE_T_PREFIX/include"

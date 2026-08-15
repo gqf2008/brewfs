@@ -241,9 +241,24 @@ rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
 ditto "$APP" "$DMG_ROOT/$APP_NAME.app"
 if [[ "$FUSE_BACKEND" == "fuse-t" ]]; then
-  # FUSE-T is free for non-commercial use but bundling it commercially needs a
-  # license, so ship install instructions instead of the installer.
-  cat > "$DMG_ROOT/安装FUSE-T（免内核扩展）.txt" <<'EOF'
+  # Bundle the FUSE-T installer when the workflow provides it (brew cask
+  # cache), so a freshly installed OSSFS is usable without a second download.
+  # FUSE-T is free for non-commercial use; bundling with commercial software
+  # needs a commercial license from the FUSE-T authors (License.txt is
+  # shipped alongside, see https://github.com/macos-fuse-t/fuse-t).
+  if [[ -n "${FUSE_T_PKG:-}" && -f "$FUSE_T_PKG" ]]; then
+    cp "$FUSE_T_PKG" "$DMG_ROOT/fuse-t-macos-installer.pkg"
+    cat > "$DMG_ROOT/FUSE-T-License.txt" <<'LICE'
+FUSE-T 二进制分发许可（摘要，完整条款见 https://github.com/macos-fuse-t/fuse-t/blob/main/License.txt）：
+- 非商业使用免费（BSD 风格条件）
+- 捆绑商业软件需向 FUSE-T 作者获取商业许可
+- 内置 LIBFUSE 库为 LGPL（fork 自 osxfuse/fuse）
+OSSFS（MIT）在本 DMG 中捆绑 FUSE-T 安装包供免费分发。
+LICE
+    echo "==> Bundled FUSE-T installer: $FUSE_T_PKG"
+  else
+    # No installer available (local builds): ship install instructions.
+    cat > "$DMG_ROOT/安装FUSE-T（免内核扩展）.txt" <<'EOF'
 本包使用 FUSE-T 作为 macOS 挂载后端（无需内核扩展、无需修改系统安全策略）。
 安装 FUSE-T（任选其一）：
   1) Homebrew:  brew install --cask fuse-t
@@ -252,6 +267,7 @@ if [[ "$FUSE_BACKEND" == "fuse-t" ]]; then
 安装后即可挂载 OSS 直挂盘。若系统提示"Network Volumes"访问权限，
 请在 系统设置 → 隐私与安全性 → 文件与文件夹 → 网络卷宗 中允许。
 EOF
+  fi
 elif [[ -d dist/macos/macfuse ]]; then
   cp dist/macos/macfuse/* "$DMG_ROOT/" 2>/dev/null || true
 fi
