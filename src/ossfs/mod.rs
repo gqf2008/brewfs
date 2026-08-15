@@ -5913,8 +5913,9 @@ mod s3_mock_tests {
             .await,
             "complete-multipart must be issued"
         );
-        // Give a hypothetically-spawned abort time to (not) land.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Give a hypothetically-spawned abort time to (not) land. The
+        // negative assertion cannot poll; 300ms is generous for the mock.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             !mock
                 .recorded
