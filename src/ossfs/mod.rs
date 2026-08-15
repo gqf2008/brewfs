@@ -3356,14 +3356,16 @@ impl ObjectFs {
                         // objects must be chunk-copied (#60).
                         self.multipart_copy_object(key, &dst, size as u64).await?;
                     } else {
-                        self.client
+                        let mut copy = self
+                            .client
                             .copy_object()
                             .bucket(&self.bucket)
                             .key(&dst)
-                            .copy_source(s3_copy_source(&self.bucket, key))
-                            .send()
-                            .await
-                            .context("s3 copy")?;
+                            .copy_source(s3_copy_source(&self.bucket, key));
+                        if let Some(sc) = &self.storage_class {
+                            copy = copy.storage_class(sc.clone());
+                        }
+                        copy.send().await.context("s3 copy")?;
                     }
                 }
             }
@@ -4536,11 +4538,18 @@ mod s3_mock_tests {
             let body = initiate_multipart_xml();
             http_response(200, "application/xml", Some(&body))
         } else if query.contains("uploadid") && query.contains("partnumber") {
-            // UploadPart: PUT /key?partNumber=N&uploadId=...
-            format!(
-                "HTTP/1.1 200 OK\r\nETag: \"etag-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                "mock"
-            )
+            // UploadPart / UploadPartCopy: PUT /key?partNumber=N&uploadId=...
+            // Answer a CopyPartResult when a copy-source header is present so
+            // the SDK's etag extraction path is exercised (#71 review).
+            if copy_source_header.is_some() {
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyPartResult><ETag>&quot;etag-part&quot;</ETag><LastModified>2026-01-01T00:00:00.000Z</LastModified></CopyPartResult>";
+                http_response(200, "application/xml", Some(&body.to_string()))
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"etag-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    "mock"
+                )
+            }
         } else if query.contains("uploadid") && method == "DELETE" {
             // AbortMultipartUpload
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -5008,8 +5017,8 @@ mod s3_mock_tests {
     /// #59 happy path: delete_dir_recursive removes every object under the
     /// prefix plus the directory marker. The mock never mutates its object
     /// store on DELETE, so the assertions check the issued DELETE targets.
-    /// Directory markers are CommonPrefixes in the listing, so they are
-    /// deleted separately at the end (`dir/sub/` is a marker, not an object).
+    /// Without a delimiter (how ObjectFs lists) directory markers are
+    /// ordinary objects in Contents and are covered by the batch delete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delete_dir_recursive_removes_tree_and_marker() {
         let (mock, port) = MockS3::start(
@@ -5028,16 +5037,6 @@ mod s3_mock_tests {
             .await
             .expect("recursive delete");
 
-        // Recorded targets look like `/b/dir/a.txt`; strip the bucket segment.
-        let key_of = |t: &str| {
-            t.split('?')
-                .next()
-                .unwrap_or("")
-                .splitn(3, '/')
-                .nth(2)
-                .unwrap_or("")
-                .to_string()
-        };
         let lc = |t: &str| t.to_lowercase();
         let recorded = mock.recorded.lock().unwrap();
         // Without a delimiter, directory markers are ordinary objects in
