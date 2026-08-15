@@ -803,7 +803,7 @@ fn unmount_event_name() -> String {
 /// remains the only graceful stop channel — a broken control plane must
 /// not break mounting (the tray falls back to force-terminate).
 async fn wait_unmount_event() {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 
     let name: Vec<u16> = unmount_event_name()
@@ -825,15 +825,18 @@ async fn wait_unmount_event() {
         warn!("cannot create the unmount control event; Ctrl+C stays the only stop channel");
         std::future::pending::<()>().await;
     }
-    // SAFETY: `handle` is a valid event handle owned by this call; the
-    // blocking wait runs off the async runtime. When select! cancels this
-    // branch (Ctrl+C path), the blocking thread keeps waiting until the
-    // process exits — the handle and thread are reclaimed by the OS at exit,
-    // so this is not a real leak.
+    // OwnedHandle wraps the raw HANDLE so it is `Send` (raw handles are
+    // `*mut c_void` and not Send in the type system; Win32 handles are plain
+    // integer identifiers, safe to move between threads) and closes the
+    // handle on drop — including when select! cancels this branch (Ctrl+C
+    // path), where the OS reclaims the handle and the blocking thread at
+    // process exit anyway.
+    // SAFETY: `handle` is a valid event handle owned by this call.
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
     let _ = tokio::task::spawn_blocking(move || {
-        unsafe { WaitForSingleObject(handle, INFINITE) };
-        // SAFETY: valid handle, single owner, no other waiter afterwards.
-        unsafe { CloseHandle(handle) };
+        // SAFETY: `owned` is a valid event handle held for the whole wait.
+        unsafe { WaitForSingleObject(owned.as_raw_handle() as _, INFINITE) };
+        // `owned` drops here → CloseHandle.
     })
     .await;
 }
