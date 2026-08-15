@@ -1691,6 +1691,11 @@ pub struct ObjectFs {
     metrics: Arc<Metrics>,
     /// Dirty-buffer budget for the adapters; None when unlimited.
     dirty_budget: Option<DirtyBudget>,
+    /// Upper bound for a single adapter operation (flush/cleanup uploads):
+    /// a network request hanging beyond this must fail the operation instead
+    /// of parking the WinFsp callback — and with it Explorer — forever
+    /// (#43). Mirrors `readwrite_timeout`.
+    operation_timeout: std::time::Duration,
 }
 
 impl ObjectFs {
@@ -1809,6 +1814,11 @@ impl ObjectFs {
                 .max(1),
             metrics: Arc::new(Metrics::default()),
             dirty_budget,
+            operation_timeout: std::time::Duration::from_secs(
+                config
+                    .readwrite_timeout_secs
+                    .unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
+            ),
         };
         // Fail fast on a missing bucket: every later request would 404, which
         // is indistinguishable from "empty bucket" and would surface as a
@@ -1863,6 +1873,11 @@ impl ObjectFs {
 
     pub fn dirty_budget(&self) -> Option<DirtyBudget> {
         self.dirty_budget.clone()
+    }
+
+    /// Adapter-operation timeout (see the `operation_timeout` field).
+    pub fn operation_timeout(&self) -> std::time::Duration {
+        self.operation_timeout
     }
 
     /// POSIX ownership / permission defaults applied by the FUSE adapters.
@@ -3707,6 +3722,7 @@ mod tests {
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
+            operation_timeout: std::time::Duration::from_secs(60),
             prefix: String::new(),
         }
     }
@@ -4735,6 +4751,7 @@ mod s3_mock_tests {
             multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
             metrics: Arc::new(Metrics::default()),
             dirty_budget: DirtyBudget::new(max_dirty_bytes.unwrap_or(0)),
+            operation_timeout: std::time::Duration::from_secs(60),
         }
     }
 

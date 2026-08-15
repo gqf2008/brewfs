@@ -285,6 +285,11 @@ pub struct OssMountContext {
     refresh: Mutex<RefreshState>,
     /// Optional mount-wide dirty-buffer budget.
     dirty_budget: Option<DirtyBudget>,
+    /// Upper bound for a single blocking adapter operation (flush/cleanup
+    /// uploads, close aborts). A network request hanging beyond this fails
+    /// the operation instead of parking the WinFsp callback — and with it
+    /// Explorer — indefinitely (#43).
+    operation_timeout: std::time::Duration,
 }
 
 impl OssMountContext {
@@ -408,13 +413,38 @@ impl OssMountContext {
         if new_units <= current {
             return Ok(());
         }
+        // try_acquire, not acquire: a blocking wait inside a WinFsp callback
+        // parks that callback thread indefinitely when the budget is
+        // exhausted by other handles — and with it Explorer, whose I/O
+        // waits on the callback. A full budget fails the write instead
+        // (same reasoning as the FUSE adapter, #53/#43).
         let permit = budget
-            .acquire_units(new_units - current)
+            .try_acquire_units(new_units - current)
             .await
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+            .ok_or_else(|| {
+                FspError::from(IoError::other(format!(
+                    "dirty buffer {bytes} bytes: max-dirty-bytes budget busy"
+                )))
+            })?;
         context.budget_permits.lock().unwrap().push(permit);
         context.budget_units.store(new_units, Ordering::Release);
         Ok(())
+    }
+
+    /// [`Self::upload_dirty`] bounded by the mount's operation timeout: an
+    /// upload that hangs beyond `readwrite-timeout` (network wedge, SDK
+    /// retry chain, budget/limiter wait) fails the flush/cleanup instead of
+    /// parking the WinFsp callback — and with it Explorer — indefinitely
+    /// (#43). The dropped future aborts any in-flight streaming upload via
+    /// [`StreamingUpload`]'s Drop impl.
+    async fn upload_dirty_timed(&self, ctx: &OssFileContext) -> winfsp::Result<()> {
+        match tokio::time::timeout(self.operation_timeout, self.upload_dirty(ctx)).await {
+            Ok(result) => result,
+            Err(_) => Err(FspError::from(IoError::other(format!(
+                "ossfs flush timed out after {}s",
+                self.operation_timeout.as_secs()
+            )))),
+        }
     }
 
     /// Upload the handle's dirty content, streaming from the spool file when
@@ -751,11 +781,12 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
     let read_only = fs.read_only();
     let dirty_budget = fs.dirty_budget();
     let context = OssMountContext {
-        fs,
+        fs: fs.clone(),
         rt,
         mount_point: mount_point.to_path_buf(),
         refresh: Mutex::new(RefreshState::new()),
         dirty_budget,
+        operation_timeout: fs.operation_timeout(),
     };
     let params = FileSystemParams::default_params(build_volume_params(read_only));
     let mut host = FileSystemHost::new_with_timer_async::<(), REFRESH_INTERVAL_MS>(params, context)
@@ -1062,7 +1093,7 @@ impl FileSystemContext for OssMountContext {
             return;
         }
         if context.dirty.load(Ordering::Acquire)
-            && let Err(e) = self.block_on(self.upload_dirty(context))
+            && let Err(e) = self.block_on(self.upload_dirty_timed(context))
         {
             warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
         }
@@ -1076,11 +1107,14 @@ impl FileSystemContext for OssMountContext {
             let _ = std::fs::remove_file(&path);
             context.spool_size.store(0, Ordering::Release);
         }
-        self.block_on(async {
-            let mut guard = context.stream.lock().await;
-            if let Some(up) = guard.take() {
-                up.abort().await;
-            }
+        let _ = self.block_on(async {
+            tokio::time::timeout(self.operation_timeout, async {
+                let mut guard = context.stream.lock().await;
+                if let Some(up) = guard.take() {
+                    up.abort().await;
+                }
+            })
+            .await
         });
     }
 
@@ -1090,7 +1124,7 @@ impl FileSystemContext for OssMountContext {
         _file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let Some(ctx) = context else { return Ok(()) };
-        self.block_on(self.upload_dirty(ctx))
+        self.block_on(self.upload_dirty_timed(ctx))
     }
 
     fn get_file_info(
@@ -1895,6 +1929,7 @@ mod tests {
             mount_point: PathBuf::from("Z:"),
             refresh: Mutex::new(RefreshState::new()),
             dirty_budget: fs.dirty_budget(),
+            operation_timeout: fs.operation_timeout(),
         };
         (fs, ctx)
     }
@@ -1987,6 +2022,66 @@ mod tests {
             })
             .expect("one plain PUT");
         assert_eq!(put.body, data, "uploaded body matches the written data");
+    }
+
+    /// #43: an upload that hangs beyond the mount's operation timeout must
+    /// fail the flush instead of parking the WinFsp callback — and with it
+    /// Explorer — indefinitely. The mock delays every request well past the
+    /// (shortened) timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upload_dirty_times_out_instead_of_hanging() {
+        let (mock, port) = MockS3::start(vec![], Duration::from_secs(30)).await;
+        let (fs, mut ctx) = test_mount(test_fs_with_budget(port, 32, None));
+        ctx.operation_timeout = Duration::from_secs(1);
+        let file = test_file("/f");
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, b"hello", 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        assert!(file.dirty.load(Ordering::Acquire));
+
+        let started = std::time::Instant::now();
+        let res = ctx.upload_dirty_timed(file).await;
+        assert!(
+            res.is_err(),
+            "a hung upload must fail the flush, got: {res:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout must fire well before the 30s mock delay, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #43: with the dirty budget exhausted by another handle, a write must
+    /// fail fast instead of blocking the callback thread forever (the FUSE
+    /// adapter got the same fix; here the WinFsp callback threads park
+    /// Explorer's I/O when blocked).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reserve_dirty_fails_fast_when_budget_exhausted() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let (fs, ctx) = test_mount(test_fs_with_budget(port, 32, Some(1 << 20)));
+        let budget = fs.dirty_budget().expect("budget configured");
+        let hog = budget
+            .try_acquire_units(budget.max_units())
+            .await
+            .expect("hog the whole budget");
+        let file = test_file("/f");
+
+        let started = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), ctx.reserve_dirty(file, 1 << 20)).await;
+        drop(hog);
+        // FspError's Display collapses to "IO(Other)", so assert the failure
+        // and the fast-fail timing, not the inner message.
+        result
+            .expect("reserve_dirty must not block when the budget is exhausted")
+            .expect_err("reserve_dirty must fail when the budget is exhausted");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must fail fast, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
