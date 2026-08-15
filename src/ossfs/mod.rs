@@ -3260,12 +3260,11 @@ impl ObjectFs {
 
         // Determine directory-ness from S3 instead of assuming a trailing
         // slash: WinFsp/FUSE rename paths for directories arrive without a
-        // trailing slash.
-        let is_dir = self
-            .stat_uncached_impl(old)
-            .await?
-            .map(|e| e.is_dir)
-            .unwrap_or(false);
+        // trailing slash. The size also decides whether the object copy must
+        // be chunked (> 5 GiB, #60).
+        let stat = self.stat_uncached_impl(old).await?;
+        let is_dir = stat.as_ref().map(|e| e.is_dir).unwrap_or(false);
+        let size = stat.map(|e| e.size).unwrap_or(0);
 
         if is_dir {
             if !self.allow_rename_dir {
@@ -3283,14 +3282,22 @@ impl ObjectFs {
             self.copy_tree(&old_key, &new_key).await?;
             self.delete_dir_recursive_impl(old).await
         } else {
-            self.client
-                .copy_object()
-                .bucket(&self.bucket)
-                .key(&new_key)
-                .copy_source(&source)
-                .send()
-                .await
-                .context("s3 copy")?;
+            if size >= MULTIPART_COPY_THRESHOLD {
+                // A single CopyObject is capped at 5 GiB; the file rename
+                // must chunk-copy like directory children do (#60 review).
+                self.multipart_copy_object(&old_key, &new_key, size).await?;
+            } else {
+                let mut copy = self
+                    .client
+                    .copy_object()
+                    .bucket(&self.bucket)
+                    .key(&new_key)
+                    .copy_source(&source);
+                if let Some(sc) = &self.storage_class {
+                    copy = copy.storage_class(sc.clone());
+                }
+                copy.send().await.context("s3 copy")?;
+            }
             self.delete_impl(old).await
         }
     }
@@ -4027,11 +4034,13 @@ mod tests {
     }
 
     #[test]
-    fn s3_timeout_config_always_sets_both_timeouts() {
+    fn s3_timeout_config_always_sets_timeouts() {
         // The SDK's own default has no read timeout; any path that lets a
         // None through to the client builder would reintroduce the
         // permanent-wedge bug. Explicit values win, None falls back to the
-        // defaults.
+        // defaults. The operation timeout (same value as read; it bounds the
+        // whole request including retries, #43) has no getter and is covered
+        // by operation_timeout_cuts_off_retry_chain.
         let explicit = s3_timeout_config(Some(3), Some(120));
         assert_eq!(explicit.connect_timeout(), Some(Duration::from_secs(3)));
         assert_eq!(explicit.read_timeout(), Some(Duration::from_secs(120)));
@@ -4279,6 +4288,9 @@ mod s3_mock_tests {
         /// Number of GET requests to fail with 500 before succeeding (used
         /// to exercise the SDK retry chain, #43).
         pub(crate) fail_get: AtomicUsize,
+        /// Keys reported as failed by DeleteObjects responses (exercises the
+        /// partial-failure error path, #60).
+        pub(crate) delete_errors: Arc<Mutex<Vec<String>>>,
         pub(crate) crc64: Mutex<u64>,
         pub(crate) head_etag: Mutex<String>,
         /// When non-zero, every HEAD answers with this status (used to
@@ -4326,6 +4338,7 @@ mod s3_mock_tests {
                 get_count: Arc::new(AtomicUsize::new(0)),
                 head_count: Arc::new(AtomicUsize::new(0)),
                 fail_get: AtomicUsize::new(0),
+                delete_errors: Arc::new(Mutex::new(Vec::new())),
                 entries: Arc::new(Mutex::new(entries)),
                 sizes: Arc::new(Mutex::new(HashMap::new())),
                 crc64: Mutex::new(0),
@@ -4394,7 +4407,10 @@ mod s3_mock_tests {
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
-        let query = target.split('?').nth(1).unwrap_or("").to_lowercase();
+        let query_raw = target.split('?').nth(1).unwrap_or("").to_string();
+        // Lowercased for the method/query dispatch below; prefix filtering
+        // must use the raw query (percent-decoded) so keys keep their case.
+        let query = query_raw.to_lowercase();
 
         // Read the remaining body bytes.
         let total = header_end.unwrap() + content_length;
@@ -4445,20 +4461,26 @@ mod s3_mock_tests {
             // Honor the `prefix` query param: ObjectFs lists with a prefix
             // (and probes implicit dirs with max_keys=1); returning entries
             // outside the prefix would make list/stat see phantom children.
-            let prefix = query
+            let prefix = query_raw
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("prefix="))
                 .unwrap_or("")
-                .replace("%2f", "/")
+                .replace("%2F", "/")
+                .replace("%20", " ")
                 .replace('+', " ");
             let entries = mock.entries.lock().unwrap().clone();
+            // ObjectFs lists without a delimiter; mock entries marked as
+            // directories then surface as plain (marker) objects in
+            // Contents, like real S3/OSS. Requests with a delimiter would
+            // fold them into CommonPrefixes instead.
+            let use_delimiter = query.contains("delimiter=");
             let filtered: Vec<(String, bool)> = entries
                 .into_iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
                 .collect();
             let sizes = mock.sizes.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
-            let body = list_xml(&filtered, &sizes, truncated);
+            let body = list_xml(&filtered, &sizes, truncated, use_delimiter);
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
@@ -4541,8 +4563,15 @@ mod s3_mock_tests {
                 )
             }
         } else if query.contains("delete") && method == "POST" {
-            // DeleteObjects: answer an empty successful result.
-            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult/>".to_string();
+            // DeleteObjects: answer a result listing any configured failures.
+            let errors = mock.delete_errors.lock().unwrap();
+            let mut body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>".to_string();
+            for key in errors.iter() {
+                body.push_str(&format!(
+                    "<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>mock</Message></Error>"
+                ));
+            }
+            body.push_str("</DeleteResult>");
             http_response(200, "application/xml", Some(&body))
         } else if method == "HEAD" {
             mock.head_count.fetch_add(1, Ordering::SeqCst);
@@ -4608,6 +4637,7 @@ mod s3_mock_tests {
         entries: &[(String, bool)],
         sizes: &HashMap<String, u64>,
         truncated_no_token: bool,
+        use_delimiter: bool,
     ) -> String {
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
@@ -4618,7 +4648,11 @@ mod s3_mock_tests {
         body.push_str(if truncated_no_token { "true" } else { "false" });
         body.push_str("</IsTruncated>");
         for (key, is_dir) in entries {
-            if *is_dir {
+            if *is_dir && use_delimiter {
+                // With a delimiter the server folds directory markers into
+                // CommonPrefixes; without one (how ObjectFs lists) a marker
+                // is an ordinary zero-byte object in Contents, matching real
+                // S3/OSS semantics (#60 review).
                 body.push_str(&format!(
                     "<CommonPrefixes><Prefix>{key}</Prefix></CommonPrefixes>"
                 ));
@@ -5006,28 +5040,24 @@ mod s3_mock_tests {
         };
         let lc = |t: &str| t.to_lowercase();
         let recorded = mock.recorded.lock().unwrap();
-        // Objects are deleted via one DeleteObjects request; the marker via
-        // a plain DELETE.
+        // Without a delimiter, directory markers are ordinary objects in
+        // the listing, so the batch delete covers them too; the trailing
+        // plain DELETE is a redundant 404 no-op kept for safety.
         let batch = recorded
             .iter()
             .find(|r| r.method == "POST" && lc(&r.target).contains("delete"))
             .expect("objects must be deleted via a batch delete");
         let body = String::from_utf8_lossy(&batch.body);
-        for key in ["dir/a.txt", "dir/sub/b.txt"] {
+        for key in ["dir/", "dir/a.txt", "dir/sub/", "dir/sub/b.txt"] {
             assert!(
                 body.contains(key),
                 "batch delete body must contain {key}: {body}"
             );
         }
-        let deleted: Vec<String> = recorded
-            .iter()
-            .filter(|r| r.method == "DELETE")
-            .map(|r| key_of(&r.target))
-            .collect();
+        let plain_deletes = recorded.iter().filter(|r| r.method == "DELETE").count();
         assert_eq!(
-            deleted,
-            vec!["dir/".to_string()],
-            "only the directory marker is deleted with a plain DELETE"
+            plain_deletes, 1,
+            "trailing marker DELETE stays a plain delete"
         );
     }
 
@@ -5048,6 +5078,67 @@ mod s3_mock_tests {
             recorded[0].target.contains("/single.txt"),
             "target must be the object key: {}",
             recorded[0].target
+        );
+    }
+
+    /// #60: >1000 keys are deleted in multiple DeleteObjects requests
+    /// (S3's per-request cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_chunks_over_1000_keys() {
+        let entries: Vec<(String, bool)> = (0..1001)
+            .map(|i| (format!("dir/f{i:04}.bin"), false))
+            .collect();
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("recursive delete");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        let batches = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .count();
+        assert_eq!(
+            batches, 2,
+            "1001 keys must be split into two DeleteObjects requests"
+        );
+        let batch_bodies: usize = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .map(|r| String::from_utf8_lossy(&r.body).matches("<Key>").count())
+            .sum();
+        assert_eq!(batch_bodies, 1001, "all keys must be in the batch bodies");
+    }
+
+    /// #60: a partially-failing DeleteObjects must surface an error instead
+    /// of silently reporting success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_reports_batch_failures() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("dir/".into(), true),
+                ("dir/a.txt".into(), false),
+                ("dir/b.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.delete_errors
+            .lock()
+            .unwrap()
+            .push("dir/a.txt".to_string());
+        let fs = test_fs(port, 32);
+
+        let err = fs
+            .delete_dir_recursive("/dir")
+            .await
+            .expect_err("a partially-failing batch delete must error");
+        assert!(
+            err.to_string().contains("batch delete failed"),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -5187,7 +5278,9 @@ mod s3_mock_tests {
                 "copy source must reference the source object: {p:?}"
             );
         }
-        // The small object: a single copy_object (PUT + copy-source, no part).
+        // Small objects: a single copy_object each (PUT + copy-source, no
+        // part). Without a delimiter the source dir marker is an ordinary
+        // object, so: small.txt + source dir/ marker + dst dir marker.
         let plain_copies = recorded
             .iter()
             .filter(|r| {
@@ -5197,8 +5290,8 @@ mod s3_mock_tests {
             })
             .count();
         assert_eq!(
-            plain_copies, 2,
-            "small.txt + the dir marker copied with plain copy_object: {recorded:?}"
+            plain_copies, 3,
+            "small.txt + source + dst dir markers copied with plain copy_object: {recorded:?}"
         );
         // One multipart upload initiated + completed for the big object.
         let creates = recorded
