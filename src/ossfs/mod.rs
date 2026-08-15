@@ -31,7 +31,8 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::{Client, config::BehaviorVersion};
 use aws_smithy_runtime_api::client::interceptors::{
-    Intercept, context::BeforeDeserializationInterceptorContextRef,
+    Intercept,
+    context::{BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -298,6 +299,81 @@ impl Intercept for Crc64ResponseCapture {
             .get("x-oss-hash-crc64ecma")
             .and_then(|v| v.parse::<u64>().ok());
         *self.slot.lock().unwrap() = value;
+        Ok(())
+    }
+}
+
+/// Makes the DeleteObjects batch request carry `Content-MD5` (base64 MD5 of
+/// the serialized body), which Aliyun OSS's DeleteMultipleObjects mandates
+/// (#74). With `behavior-version-latest` the SDK treats DeleteObjects as
+/// checksum-required and adds `x-amz-checksum-crc32` +
+/// `x-amz-sdk-checksum-algorithm: CRC32` itself — headers OSS neither
+/// expects nor validates — so without this the batch was rejected with 400
+/// `InvalidDigest` and directory markers survived ("新建文件夹删不掉").
+///
+/// `customize().interceptor()` registers in a config-override plugin the SDK
+/// appends after the operation's own interceptors, so the checksum
+/// computation runs first and `modify_before_signing` below strips those
+/// headers and substitutes the real digest. The placeholder planted in
+/// `modify_before_retry_loop` is defensive only: the SDK's checksum
+/// interceptor skips when any user-set `x-amz-checksum-*` header is present,
+/// which protects the opposite (hypothetical) registration order. Both the
+/// ordering and the placeholder are SDK implementation details, not
+/// contracts — `delete_dir_recursive_sends_oss_content_md5` asserts the wire
+/// shape and turns red on an SDK upgrade that changes either.
+#[derive(Debug, Default)]
+struct DeleteObjectsContentMd5;
+
+impl Intercept for DeleteObjectsContentMd5 {
+    fn name(&self) -> &'static str {
+        "DeleteObjectsContentMd5"
+    }
+
+    /// Defensive (see struct docs): in the current SDK this runs after the
+    /// checksum decision and the value is overwritten by the SDK's real
+    /// CRC32; if registration order ever puts us first, it makes the SDK's
+    /// checksum interceptor skip instead of computing.
+    fn modify_before_retry_loop(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+    ) -> std::result::Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        context
+            .request_mut()
+            .headers_mut()
+            .insert("x-amz-checksum-crc32", "placeholder");
+        Ok(())
+    }
+
+    /// Drop whatever automatic checksum headers the SDK produced (the prefix
+    /// scan survives a future default-algorithm change, e.g. CRC64NVME) and
+    /// add the Content-MD5 OSS actually validates, computed over the exact
+    /// serialized body. Runs after the SDK's checksum interceptor in the
+    /// current registration order.
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+    ) -> std::result::Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        let request = context.request_mut();
+        let checksum_headers: Vec<String> = request
+            .headers()
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| {
+                name.starts_with("x-amz-checksum-") || name == "x-amz-sdk-checksum-algorithm"
+            })
+            .collect();
+        for name in checksum_headers {
+            request.headers_mut().remove(&name);
+        }
+        let Some(body) = request.body().bytes() else {
+            return Err("DeleteObjects body must be in-memory to compute Content-MD5".into());
+        };
+        let digest = content_md5(body);
+        request.headers_mut().insert("content-md5", digest);
         Ok(())
     }
 }
@@ -3220,6 +3296,11 @@ impl ObjectFs {
                     .delete_objects()
                     .bucket(&self.bucket)
                     .delete(delete)
+                    // Aliyun OSS requires Content-MD5 on DeleteMultipleObjects
+                    // (#74); the SDK's default CRC32 checksum would be
+                    // rejected with 400 InvalidDigest.
+                    .customize()
+                    .interceptor(DeleteObjectsContentMd5)
                     .send()
                     .await
                     .context("s3 batch delete")?;
@@ -4309,6 +4390,10 @@ mod s3_mock_tests {
         pub(crate) storage_class: Option<String>,
         pub(crate) content_md5: Option<String>,
         pub(crate) copy_source: Option<String>,
+        /// `x-amz-checksum-*` / `x-amz-sdk-checksum-algorithm` headers (the
+        /// AWS SDK's automatic CRC32 additions, which Aliyun OSS neither
+        /// expects nor accepts as a substitute for Content-MD5, #74).
+        pub(crate) checksum_headers: Vec<(String, String)>,
     }
 
     pub(crate) struct MockS3 {
@@ -4327,6 +4412,9 @@ mod s3_mock_tests {
         /// Number of GET requests to fail with 500 before succeeding (used
         /// to exercise the SDK retry chain, #43).
         pub(crate) fail_get: AtomicUsize,
+        /// Number of DeleteObjects requests to fail with 500 before
+        /// succeeding (exercises Content-MD5 recompute across retries, #74).
+        pub(crate) fail_delete: AtomicUsize,
         /// Keys reported as failed by DeleteObjects responses (exercises the
         /// partial-failure error path, #60).
         pub(crate) delete_errors: Arc<Mutex<Vec<String>>>,
@@ -4377,6 +4465,7 @@ mod s3_mock_tests {
                 get_count: Arc::new(AtomicUsize::new(0)),
                 head_count: Arc::new(AtomicUsize::new(0)),
                 fail_get: AtomicUsize::new(0),
+                fail_delete: AtomicUsize::new(0),
                 delete_errors: Arc::new(Mutex::new(Vec::new())),
                 entries: Arc::new(Mutex::new(entries)),
                 sizes: Arc::new(Mutex::new(HashMap::new())),
@@ -4425,8 +4514,15 @@ mod s3_mock_tests {
         let mut storage_class_header: Option<String> = None;
         let mut content_md5_header: Option<String> = None;
         let mut copy_source_header: Option<String> = None;
+        let mut checksum_headers: Vec<(String, String)> = Vec::new();
         for line in head.lines() {
             let lower = line.to_ascii_lowercase();
+            if (lower.starts_with("x-amz-checksum-")
+                || lower.starts_with("x-amz-sdk-checksum-algorithm"))
+                && let Some((k, v)) = line.split_once(':')
+            {
+                checksum_headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
             if let Some(v) = lower.strip_prefix("range:") {
                 range_header = Some(v.trim().to_string());
             }
@@ -4487,6 +4583,7 @@ mod s3_mock_tests {
             storage_class: storage_class_header.clone(),
             content_md5: content_md5_header.clone(),
             copy_source: copy_source_header.clone(),
+            checksum_headers,
         });
 
         tokio::time::sleep(mock.delay).await;
@@ -4609,16 +4706,30 @@ mod s3_mock_tests {
                 )
             }
         } else if query.contains("delete") && method == "POST" {
-            // DeleteObjects: answer a result listing any configured failures.
-            let errors = mock.delete_errors.lock().unwrap();
-            let mut body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>".to_string();
-            for key in errors.iter() {
-                body.push_str(&format!(
-                    "<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>mock</Message></Error>"
-                ));
+            // DeleteObjects: mirror Aliyun OSS's DeleteMultipleObjects
+            // contract — Content-MD5 is mandatory; without it the real OSS
+            // answers 400 InvalidDigest and the batch is a no-op (#74). The
+            // AWS SDK's automatic CRC32 checksum headers do not satisfy it.
+            if mock.fail_delete.load(Ordering::SeqCst) > 0 {
+                mock.fail_delete.fetch_sub(1, Ordering::SeqCst);
+                let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
+                http_response(500, "application/xml", Some(&body.to_string()))
+            } else if content_md5_header.is_none() {
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidDigest</Code><Message>The Content-MD5 you specified was invalid.</Message></Error>".to_string();
+                http_response(400, "application/xml", Some(&body))
+            } else {
+                // Answer a result listing any configured failures.
+                let errors = mock.delete_errors.lock().unwrap();
+                let mut body =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>".to_string();
+                for key in errors.iter() {
+                    body.push_str(&format!(
+                        "<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>mock</Message></Error>"
+                    ));
+                }
+                body.push_str("</DeleteResult>");
+                http_response(200, "application/xml", Some(&body))
             }
-            body.push_str("</DeleteResult>");
-            http_response(200, "application/xml", Some(&body))
         } else if method == "HEAD" {
             mock.head_count.fetch_add(1, Ordering::SeqCst);
             let forced = mock.head_status.load(Ordering::SeqCst);
@@ -5096,6 +5207,98 @@ mod s3_mock_tests {
             plain_deletes, 1,
             "trailing marker DELETE stays a plain delete"
         );
+    }
+
+    /// #74 regression: Aliyun OSS's DeleteMultipleObjects requires
+    /// Content-MD5. aws-sdk-s3's automatic CRC32 checksum
+    /// (behavior-version-latest) does not send it, so the real OSS rejected
+    /// the batch with 400, the directory marker survived, and a freshly
+    /// created folder reappeared after refresh ("新建文件夹删不掉"). The batch
+    /// must carry Content-MD5 over the exact serialized body — and no
+    /// `x-amz-checksum-*` headers at all. The mock enforces the OSS gate, so
+    /// this test fails outright on the pre-fix request shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_sends_oss_content_md5() {
+        let (mock, port) =
+            MockS3::start(vec![("dir/".into(), true)], Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("batch delete must pass the OSS Content-MD5 gate");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let lc = |t: &str| t.to_lowercase();
+        let batch = recorded
+            .iter()
+            .find(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .expect("objects must be deleted via a batch delete");
+        let md5 = content_md5(&batch.body);
+        assert_eq!(
+            batch.content_md5.as_deref(),
+            Some(md5.as_str()),
+            "Content-MD5 must be the base64 md5 of the exact serialized body"
+        );
+        for (name, _) in &batch.checksum_headers {
+            assert!(
+                !name.starts_with("x-amz-checksum-") && !name.starts_with("x-amz-sdk-checksum-"),
+                "SDK automatic checksum headers must not reach OSS: {name}"
+            );
+        }
+    }
+
+    /// #74: the interceptor runs per attempt in `modify_before_signing`, so
+    /// a retried batch must carry the identical Content-MD5 on every attempt
+    /// (the SDK rewinds the serialized body between attempts). The raw
+    /// config Builder ships no retries, so they are enabled explicitly like
+    /// the #43 retry tests do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_content_md5_survives_retry() {
+        let (mock, port) =
+            MockS3::start(vec![("dir/".into(), true)], Duration::from_millis(1)).await;
+        mock.fail_delete.store(1, Ordering::SeqCst); // first batch answers 500
+        let mut fs = test_fs(port, 32);
+        fs.client = Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .endpoint_url(format!("http://127.0.0.1:{port}"))
+                .force_path_style(true)
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "ak", "sk", None, None, "test",
+                ))
+                .behavior_version(BehaviorVersion::latest())
+                .retry_config(aws_smithy_types::retry::RetryConfig::standard())
+                .build(),
+        );
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("recursive delete must survive a transient 500");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let lc = |t: &str| t.to_lowercase();
+        let batches: Vec<_> = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .collect();
+        assert_eq!(
+            batches.len(),
+            2,
+            "a 500 on the first attempt must be retried"
+        );
+        for (i, batch) in batches.iter().enumerate() {
+            let md5 = content_md5(&batch.body);
+            assert_eq!(
+                batch.content_md5.as_deref(),
+                Some(md5.as_str()),
+                "attempt {i} must carry the correct Content-MD5"
+            );
+            assert!(
+                batch.checksum_headers.is_empty(),
+                "attempt {i} must carry no checksum headers: {:?}",
+                batch.checksum_headers
+            );
+        }
     }
 
     /// #59 happy path: delete() issues exactly one DELETE for the object.
