@@ -159,14 +159,13 @@ fn tray_menu_drives() -> std::sync::MutexGuard<'static, Vec<String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Persist the guard's desired set after a mutation so a tray restart or
-/// crash re-arms the auto-restart supervision (#61). Best-effort: a failed
-/// state write only loses supervision across a restart, never blocks I/O.
-fn persist_desired(g: &mut std::sync::MutexGuard<'static, GuardState>) {
-    // Clone before the file I/O so the guard is not held across fs::write
-    // (the 2s refresh timer shares this lock).
-    let desired = g.desired.clone();
-    let _ = model::save_desired(&model::desired_path(), &desired);
+/// Persist the desired set after a mutation so a tray restart or crash
+/// re-arms the auto-restart supervision (#61). Best-effort: a failed state
+/// write only loses supervision across a restart, never blocks I/O.
+/// Callers must drop the guard before calling (the 2s refresh timer shares
+/// the lock; file I/O must not run under it).
+fn persist_desired(desired: &std::collections::HashSet<String>) {
+    let _ = model::save_desired(&model::desired_path(), desired);
 }
 
 fn guard() -> std::sync::MutexGuard<'static, GuardState> {
@@ -681,15 +680,18 @@ fn wire_callbacks(
                     );
                     // Ask the guard to auto-restart this mount if it dies.
                     if started {
-                        let mut g = guard();
-                        g.desired.insert(drive.clone());
-                        persist_desired(&mut g);
-                        // A manual mount starts a new lifetime: clear any
-                        // accumulated restart budget and fast-fail marks so
-                        // the fresh mount gets a full budget (review B2).
-                        g.failed.remove(&drive);
-                        g.restarts.remove(&drive);
-                        g.alive_since.remove(&drive);
+                        let desired = {
+                            let mut g = guard();
+                            g.desired.insert(drive.clone());
+                            // A manual mount starts a new lifetime: clear any
+                            // accumulated restart budget and fast-fail marks
+                            // so the fresh mount gets a full budget (B2).
+                            g.failed.remove(&drive);
+                            g.restarts.remove(&drive);
+                            g.alive_since.remove(&drive);
+                            g.desired.clone()
+                        };
+                        persist_desired(&desired);
                     }
                 }
             }
@@ -745,9 +747,15 @@ fn wire_callbacks(
                             // A deleted profile's drive must leave the
                             // desired set too, or desired.json keeps a stale
                             // entry that the watchdog retries forever (#61).
-                            let mut g = guard();
-                            if g.desired.remove(&removed.drive) {
-                                persist_desired(&mut g);
+                            // Match the normalized key the mount path uses.
+                            let desired = {
+                                let mut g = guard();
+                                let key = model::normalize_mount_point(&removed.drive);
+                                let changed = g.desired.remove(&key);
+                                (changed, g.desired.clone())
+                            };
+                            if desired.0 {
+                                persist_desired(&desired.1);
                             }
                         }
                         match model::save_profiles(&file) {
@@ -1383,11 +1391,12 @@ const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 /// force-terminate. A mount running an ossmount build without the control
 /// event reports no graceful channel and is force-terminated as before.
 fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
-    {
+    let desired = {
         let mut g = guard();
         g.desired.remove(&m.drive);
-        persist_desired(&mut g);
-    }
+        g.desired.clone()
+    };
+    persist_desired(&desired);
     guard().alive_since.remove(&m.drive);
     let ui_weak = ui.as_weak();
     let m = m.clone();
@@ -1404,9 +1413,12 @@ fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
                 // next tick, and the re-arm would survive a tray restart via
                 // desired.json (#61).
                 if winutil::pid_alive(m.pid) {
-                    let mut g = guard();
-                    g.desired.insert(m.drive.clone());
-                    persist_desired(&mut g);
+                    let desired = {
+                        let mut g = guard();
+                        g.desired.insert(m.drive.clone());
+                        g.desired.clone()
+                    };
+                    persist_desired(&desired);
                 }
                 let msg = format!("卸载 {} 失败：{e}", m.drive);
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {

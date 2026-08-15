@@ -212,11 +212,16 @@ pub fn save_desired(path: &Path, desired: &std::collections::HashSet<String>) ->
     }
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(desired)?;
-    fs::write(&tmp, &bytes)?;
-    // Flush to disk before the rename so the rename never publishes a torn
-    // file after a power loss (load_desired tolerates corruption, but
-    // avoiding it costs nothing here).
-    fs::File::open(&tmp)?.sync_all()?;
+    // Sync the WRITE handle (a read-only reopen of tmp and sync_all would
+    // fail on Windows with ERROR_ACCESS_DENIED — FlushFileBuffers needs
+    // write access), then rename so the rename never publishes a torn file
+    // after a power loss (load_desired tolerates corruption, but avoiding
+    // it costs nothing here).
+    use std::io::Write;
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, path)
 }
 
