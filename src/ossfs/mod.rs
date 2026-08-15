@@ -1289,6 +1289,12 @@ pub struct StreamingUpload {
     /// [`Drop`] then skips its best-effort abort — otherwise dropping a
     /// finished handle would abort the very object it just completed.
     aborted: bool,
+    /// Tokio runtime captured at [`ObjectFs::begin_streaming_upload`] (which
+    /// always runs in a runtime context). The adapter may drop the handle on
+    /// a plain synchronous thread (e.g. a FUSE release callback), where
+    /// `Handle::try_current` would fail; the captured handle lets [`Drop`]
+    /// still spawn its best-effort abort (#55).
+    rt: tokio::runtime::Handle,
 }
 
 impl StreamingUpload {
@@ -1486,6 +1492,12 @@ impl StreamingUpload {
         }
         if let Some(expected) = expected_crc {
             check_crc64_response(crc_slot, expected, &self.metrics)?;
+            // The object completed server-side; a Drop abort would be a
+            // no-op. Mark terminal so Drop skips the wasted request even on
+            // this error path (#55 review).
+            self.aborted = true;
+        } else {
+            self.aborted = true;
         }
         // One completed streamed object: a single PUT-equivalent upload of
         // `total_bytes` (#60 — streaming uploads used to be invisible to the
@@ -1540,17 +1552,15 @@ impl Drop for StreamingUpload {
         }
         self.aborted = true;
         self.tasks.abort_all();
-        // Spawn outside the caller's async context: drop can run on a plain
-        // sync path (e.g. a FUSE callback erroring before any await).
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
+        // Drop can run on a plain sync thread (a FUSE release callback
+        // outside block_on); the runtime handle captured at begin() lets us
+        // still spawn the abort from anywhere.
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
         let upload_id = self.upload_id.clone();
         let limiter = self.limiter.clone();
-        handle.spawn(async move {
+        self.rt.spawn(async move {
             let _permit = match limiter.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
@@ -1852,6 +1862,13 @@ impl ObjectFs {
 
     /// Acquire the in-flight write-byte budget for `data_len` bytes.
     /// Returns a permit that must be held for the whole upload.
+    ///
+    /// try_acquire, not acquire: on macOS the whole-object write runs on the
+    /// single fuser dispatcher thread (flush_open), and a blocking wait can
+    /// hang the mount forever — streaming handles hold their budget permits
+    /// across operations and release them only from a later dispatcher
+    /// callback (#55). A full budget therefore fails the write instead of
+    /// parking the only thread that could ever free it.
     async fn acquire_upload_budget(
         &self,
         data_len: usize,
@@ -1871,9 +1888,13 @@ impl ObjectFs {
         }
         Ok(Some(
             sem.clone()
-                .acquire_many_owned(units as u32)
-                .await
-                .map_err(|_| anyhow::anyhow!("upload budget closed"))?,
+                .try_acquire_many_owned(units as u32)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "write of {data_len} bytes exceeds max-upload-bytes budget: \
+                         in-flight streaming uploads hold all of it"
+                    )
+                })?,
         ))
     }
 
@@ -1889,12 +1910,14 @@ impl ObjectFs {
     /// S3-facing method takes exactly one permit for its whole body (mkdir
     /// takes one indirectly via write); internal `*_impl` helpers never
     /// acquire, so cross-calls cannot deadlock even when the pool is
-    /// saturated. Helpers that issue their *own* S3 request (verification
-    /// HEADs, aborts — see `head_reports_size` / `abort_upload` /
-    /// `verify_disk_cache_etag`) acquire one permit for that request, so the
-    /// in-flight count never exceeds `MAX_CONCURRENT_S3_REQUESTS` even
-    /// stacked on a public method's permit (#55). Keep this invariant:
-    /// public methods acquire, `*_impl` helpers never do.
+    /// saturated. Helpers that issue their *own* S3 request on top of a
+    /// caller's permit must use `try_acquire` (see `verify_disk_cache_etag`)
+    /// — never block on a second permit, or a saturated pool deadlocks.
+    /// Helpers that issue their own request with no outer permit (verification
+    /// HEADs, aborts — see `head_reports_size` / `abort_upload`) acquire one
+    /// permit for that request, so the in-flight count never exceeds
+    /// `MAX_CONCURRENT_S3_REQUESTS` even stacked on a public method (#55).
+    /// Keep this invariant: public methods acquire, `*_impl` helpers never do.
     async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
         self.limiter
             .clone()
@@ -2444,9 +2467,11 @@ impl ObjectFs {
         self.metrics.s3_etag_heads.fetch_add(1, Ordering::Relaxed);
         let cache = self.disk_cache.as_ref().expect("disk cache enabled");
         // The verification HEAD is a second in-flight S3 request on top of
-        // the read_range that called us; bound it by the global limit like
-        // every other request (#55).
-        let Ok(_permit) = self.acquire().await else {
+        // the read_range that called us. try_acquire: this runs while the
+        // caller already holds a permit, and a blocking wait when the pool is
+        // saturated (all readers stuck re-verifying) could deadlock; skipping
+        // the verification under load is equivalent to the HEAD failing (#55).
+        let Ok(_permit) = self.limiter.clone().try_acquire_owned() else {
             return;
         };
         let Ok(resp) = self
@@ -3050,6 +3075,7 @@ impl ObjectFs {
             budget_units: 0,
             budget_permits: Vec::new(),
             aborted: false,
+            rt: tokio::runtime::Handle::current(),
         })
     }
 
@@ -4379,6 +4405,22 @@ mod s3_mock_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    /// Poll `mock.recorded` until `pred` matches or 2s elapse. The abort
+    /// issued from a [`StreamingUpload`] drop is spawned async, so assertions
+    /// must poll instead of sleeping a fixed interval (#55 review).
+    async fn wait_for_recorded(mock: &MockS3, pred: impl Fn(&MockRequest) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if mock.recorded.lock().unwrap().iter().any(&pred) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Minimal in-process S3 mock: counts concurrent in-flight requests,
     /// records request targets + bodies, and serves canned responses so the
     /// AWS SDK can round-trip (ListBucketResult and multipart uploads).
@@ -5614,18 +5656,16 @@ mod s3_mock_tests {
         // Drop without finish / abort: Drop must issue the abort itself.
         drop(up);
 
-        // The abort is spawned best-effort; give it a moment to land.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The abort is spawned async; poll instead of a fixed sleep.
         let lc = |t: &str| t.to_lowercase();
-        let recorded = mock.recorded.lock().unwrap();
-        let aborts = recorded
-            .iter()
-            .filter(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid"))
-            .count();
-        assert_eq!(
-            aborts, 1,
-            "dropping an unfinished streaming handle must abort the upload: {recorded:?}"
+        assert!(
+            wait_for_recorded(&mock, |r| {
+                r.method == "DELETE" && lc(&r.target).contains("uploadid")
+            })
+            .await,
+            "dropping an unfinished streaming handle must abort the upload"
         );
+        let recorded = mock.recorded.lock().unwrap();
         let completes = recorded
             .iter()
             .filter(|r| {
@@ -5681,14 +5721,12 @@ mod s3_mock_tests {
             "unexpected error: {err:?}"
         );
         drop(up);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let lc = |t: &str| t.to_lowercase();
         assert!(
-            mock.recorded
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid")),
+            wait_for_recorded(&mock, |r| {
+                r.method == "DELETE" && lc(&r.target).contains("uploadid")
+            })
+            .await,
             "failed budget write must abort its upload"
         );
 
@@ -5707,6 +5745,41 @@ mod s3_mock_tests {
             .await
             .expect("write after finish must succeed");
         up2.finish().await.expect("second finish");
+    }
+
+    /// #55-review B1: with the whole budget held by an in-flight streaming
+    /// upload, a whole-object write (the flush path, which runs on the FUSE
+    /// dispatcher) must fail fast instead of blocking on the budget — a
+    /// blocking wait would park the single macOS dispatcher thread that must
+    /// later release the streaming handle, deadlocking the mount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn whole_object_write_fails_fast_when_budget_held_by_streaming() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.upload_budget = Some(Arc::new(Semaphore::new(1)));
+        fs.upload_budget_units = 1; // 1 MiB budget
+
+        // Streaming handle holds the whole budget across operations.
+        let mut up = fs.begin_streaming_upload("/hold.bin").await.expect("begin");
+        up.write(&vec![0x11u8; 512 * 1024])
+            .await
+            .expect("streaming write within budget");
+
+        // A small whole-object write must fail fast, not block forever.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fs.write("/small.bin", &vec![0x22u8; 1024]),
+        )
+        .await;
+        let err = result
+            .expect("whole-object write must not block when the budget is held")
+            .expect_err("whole-object write must fail when the budget is held");
+        assert!(
+            err.to_string().contains("max-upload-bytes"),
+            "unexpected error: {err:?}"
+        );
+        // Finish the streaming upload so the budget is released cleanly.
+        up.finish().await.expect("finish");
     }
 
     /// Every S3 request of the streaming path must hold a limiter permit:
@@ -5801,14 +5874,12 @@ mod s3_mock_tests {
             "unexpected error: {err:?}"
         );
         drop(up);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let lc = |t: &str| t.to_lowercase();
         assert!(
-            mock.recorded
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid")),
+            wait_for_recorded(&mock, |r| {
+                r.method == "DELETE" && lc(&r.target).contains("uploadid")
+            })
+            .await,
             "the rejected upload must still be aborted on drop"
         );
     }
