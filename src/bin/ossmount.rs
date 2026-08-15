@@ -37,6 +37,8 @@ fn usage_text() -> String {
                  [--storage-class SC] [--multipart-size N] [--multipart-concurrency N]\n\
                  [--content-md5] [--connect-timeout N] [--readwrite-timeout N] [--retries N]\n\
                  (timeouts default 10 / 600 seconds; 0 = default; retries 0 = no retry)\n\
+                 (readwrite-timeout bounds one whole S3 request incl. its retries —\n\
+                  a slow-but-flowing upload/download is also cut at this budget)\n\
                  [--notsup-compat-dir]\n\
                  [--disk-cache-reserve-diskfree N] [--disk-cache-free-space-ratio R]\n\
                  [--max-dirty-bytes N] [--credential-process CMD]\n\

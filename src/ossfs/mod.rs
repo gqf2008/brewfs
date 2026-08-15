@@ -26,7 +26,9 @@ pub mod winfsp;
 use anyhow::{Context as _, Result};
 use aws_config::credential_process::CredentialProcessProvider;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, StorageClass,
+};
 use aws_sdk_s3::{Client, config::BehaviorVersion};
 use aws_smithy_runtime_api::client::interceptors::{
     Intercept, context::BeforeDeserializationInterceptorContextRef,
@@ -434,6 +436,11 @@ fn read_body_budget(expected_len: usize) -> Duration {
 /// parts) instead of a single PUT. A single PUT is capped at 5 GiB by OSS/S3
 /// and is more sensitive to timeouts / retries on large objects.
 const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+/// S3's single CopyObject limit: objects at or above this size must be
+/// copied via multipart copy (#60).
+const MULTIPART_COPY_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
+/// DeleteObjects batches at most this many keys per request (#60).
+const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1000;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -538,13 +545,21 @@ fn s3_timeout_config(
     connect_secs: Option<u64>,
     read_secs: Option<u64>,
 ) -> aws_smithy_types::timeout::TimeoutConfig {
+    let read = Duration::from_secs(read_secs.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS));
     aws_smithy_types::timeout::TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(
             connect_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
         ))
-        .read_timeout(Duration::from_secs(
-            read_secs.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
-        ))
+        .read_timeout(read)
+        // End-to-end budget for the whole operation, *including retries*:
+        // without it the SDK's retry chain (default 3 attempts) lets one
+        // request hold its limiter permit / part slot for attempts × read
+        // timeout (3 × 600s) before giving up. A wedged request parks that
+        // permit the whole time, which froze copies and deferred-close
+        // uploads under load. Tying the operation budget to the configured
+        // read timeout keeps the semantics simple: one operation — however
+        // many attempts it needs — never outlives `readwrite-timeout` (#43).
+        .operation_timeout(read)
         .build()
 }
 
@@ -3152,15 +3167,40 @@ impl ObjectFs {
                 req = req.continuation_token(tok);
             }
             let resp = req.send().await.context("s3 list for delete")?;
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    self.client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .context("s3 delete object")?;
+            let keys: Vec<String> = resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string))
+                .collect();
+            // Batch deletes (1000 keys/request) instead of one DELETE per
+            // object — deleting a large tree was O(n) round trips (#60).
+            for chunk in keys.chunks(MAX_DELETE_OBJECTS_PER_REQUEST) {
+                let objects = chunk
+                    .iter()
+                    .map(|k| ObjectIdentifier::builder().key(k).build())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("build delete object identifiers")?;
+                let delete = Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .context("build batch delete request")?;
+                let resp = self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .context("s3 batch delete")?;
+                let failed = resp.errors();
+                if !failed.is_empty() {
+                    let sample: Vec<&str> = failed.iter().filter_map(|e| e.key()).take(5).collect();
+                    anyhow::bail!(
+                        "s3 batch delete failed for {} of {} keys (e.g. {:?})",
+                        failed.len(),
+                        chunk.len(),
+                        sample
+                    );
                 }
             }
             match next_page_token(&resp)? {
@@ -3220,12 +3260,11 @@ impl ObjectFs {
 
         // Determine directory-ness from S3 instead of assuming a trailing
         // slash: WinFsp/FUSE rename paths for directories arrive without a
-        // trailing slash.
-        let is_dir = self
-            .stat_uncached_impl(old)
-            .await?
-            .map(|e| e.is_dir)
-            .unwrap_or(false);
+        // trailing slash. The size also decides whether the object copy must
+        // be chunked (> 5 GiB, #60).
+        let stat = self.stat_uncached_impl(old).await?;
+        let is_dir = stat.as_ref().map(|e| e.is_dir).unwrap_or(false);
+        let size = stat.map(|e| e.size).unwrap_or(0);
 
         if is_dir {
             if !self.allow_rename_dir {
@@ -3243,14 +3282,22 @@ impl ObjectFs {
             self.copy_tree(&old_key, &new_key).await?;
             self.delete_dir_recursive_impl(old).await
         } else {
-            self.client
-                .copy_object()
-                .bucket(&self.bucket)
-                .key(&new_key)
-                .copy_source(&source)
-                .send()
-                .await
-                .context("s3 copy")?;
+            if size >= MULTIPART_COPY_THRESHOLD {
+                // A single CopyObject is capped at 5 GiB; the file rename
+                // must chunk-copy like directory children do (#60 review).
+                self.multipart_copy_object(&old_key, &new_key, size).await?;
+            } else {
+                let mut copy = self
+                    .client
+                    .copy_object()
+                    .bucket(&self.bucket)
+                    .key(&new_key)
+                    .copy_source(&source);
+                if let Some(sc) = &self.storage_class {
+                    copy = copy.storage_class(sc.clone());
+                }
+                copy.send().await.context("s3 copy")?;
+            }
             self.delete_impl(old).await
         }
     }
@@ -3303,14 +3350,23 @@ impl ObjectFs {
                 if let Some(key) = obj.key() {
                     let suffix = key.strip_prefix(&prefix).unwrap_or(key);
                     let dst = format!("{}/{suffix}", new_key.trim_end_matches('/'));
-                    self.client
-                        .copy_object()
-                        .bucket(&self.bucket)
-                        .key(&dst)
-                        .copy_source(s3_copy_source(&self.bucket, key))
-                        .send()
-                        .await
-                        .context("s3 copy")?;
+                    let size = obj.size().unwrap_or(0);
+                    if size >= MULTIPART_COPY_THRESHOLD as i64 {
+                        // A single CopyObject is capped at 5 GiB; larger
+                        // objects must be chunk-copied (#60).
+                        self.multipart_copy_object(key, &dst, size as u64).await?;
+                    } else {
+                        let mut copy = self
+                            .client
+                            .copy_object()
+                            .bucket(&self.bucket)
+                            .key(&dst)
+                            .copy_source(s3_copy_source(&self.bucket, key));
+                        if let Some(sc) = &self.storage_class {
+                            copy = copy.storage_class(sc.clone());
+                        }
+                        copy.send().await.context("s3 copy")?;
+                    }
                 }
             }
             match next_page_token(&resp)? {
@@ -3330,6 +3386,87 @@ impl ObjectFs {
             .send()
             .await
             .context("s3 copy marker")?;
+        Ok(())
+    }
+
+    /// Copy one object via multipart copy. S3 caps a single CopyObject at
+    /// 5 GiB; larger objects are chunk-copied with `upload_part_copy` parts
+    /// of [`Self::multipart_part_size`] (floored at the 5 MiB AWS minimum
+    /// for non-final copy parts). Any failure aborts the upload (#60).
+    async fn multipart_copy_object(&self, src_key: &str, dst_key: &str, size: u64) -> Result<()> {
+        let part_size = (self.multipart_part_size as u64).max(5 * 1024 * 1024);
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(dst_key);
+        if let Some(sc) = &self.storage_class {
+            create = create.storage_class(sc.clone());
+        }
+        let upload_id = create
+            .send()
+            .await
+            .context("s3 create multipart copy")?
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("multipart copy returned no upload id"))?
+            .to_string();
+        let source = s3_copy_source(&self.bucket, src_key);
+        let mut parts = Vec::new();
+        let mut part_number = 1i32;
+        let mut offset = 0u64;
+        loop {
+            let end = (offset + part_size).min(size);
+            let range = format!("bytes={}-{}", offset, end.saturating_sub(1));
+            let resp = self
+                .client
+                .upload_part_copy()
+                .bucket(&self.bucket)
+                .key(dst_key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .copy_source(&source)
+                .copy_source_range(&range)
+                .send()
+                .await;
+            let etag = match resp {
+                Ok(r) => r
+                    .copy_part_result()
+                    .and_then(|c| c.e_tag().map(str::to_string))
+                    .unwrap_or_default(),
+                Err(e) => {
+                    self.abort_upload(dst_key, &upload_id).await;
+                    return Err(e).context("s3 copy part");
+                }
+            };
+            parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+            if end >= size {
+                break;
+            }
+            offset = end;
+            part_number += 1;
+        }
+        let complete = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(dst_key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await;
+        if let Err(e) = complete {
+            self.abort_upload(dst_key, &upload_id).await;
+            return Err(e).context("s3 complete multipart copy");
+        }
         Ok(())
     }
 }
@@ -3527,53 +3664,12 @@ mod tests {
         assert_eq!(parent_path("/"), "/");
     }
 
-    #[test]
-    fn key_for_applies_prefix() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: "ossfs/".into(),
-        };
-        assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
-        assert_eq!(fs.key_for("/docs/"), "ossfs/docs/");
-        assert_eq!(fs.key_for("/"), "ossfs");
-
-        let fs2 = ObjectFs {
+    /// Minimal [`ObjectFs`] with default config and no S3 client. Tests that
+    /// need a live mock call [`super::s3_mock_tests::test_fs`] instead. A
+    /// single builder keeps the ~40-line literal from being duplicated per
+    /// test — adding a field must not mean editing ten sites (#59).
+    fn test_fs() -> ObjectFs {
+        ObjectFs {
             client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
             bucket: "b".into(),
             stats: Mutex::new(HashMap::new()),
@@ -3612,7 +3708,18 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             dirty_budget: None,
             prefix: String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn key_for_applies_prefix() {
+        let mut fs = test_fs();
+        fs.prefix = "ossfs/".into();
+        assert_eq!(fs.key_for("/docs/a.txt"), "ossfs/docs/a.txt");
+        assert_eq!(fs.key_for("/docs/"), "ossfs/docs/");
+        assert_eq!(fs.key_for("/"), "ossfs");
+
+        let fs2 = test_fs();
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
         assert_eq!(fs2.list_prefix("/docs"), "docs/");
         assert_eq!(fs2.list_prefix("/"), "");
@@ -3630,46 +3737,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_rejects_all_mutations() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: true,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let mut fs = test_fs();
+        fs.read_only = true;
         assert!(fs.ensure_writable().is_err());
         assert!(fs.write("/a", b"x").await.is_err());
         assert!(fs.mkdir("/d").await.is_err());
@@ -3680,46 +3749,9 @@ mod tests {
 
     #[tokio::test]
     async fn upload_budget_rejects_object_larger_than_limit() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: Some(Arc::new(Semaphore::new(1))),
-            upload_budget_units: 1,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let mut fs = test_fs();
+        fs.upload_budget = Some(Arc::new(Semaphore::new(1)));
+        fs.upload_budget_units = 1;
         let data = vec![0u8; 2 * UPLOAD_BUDGET_UNIT];
         let err = fs.write("/large.bin", &data).await.unwrap_err();
         assert!(err.to_string().contains("max-upload-bytes budget"));
@@ -3735,46 +3767,8 @@ mod tests {
 
     #[test]
     fn read_cache_hit_and_invalidation() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 1024,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let mut fs = test_fs();
+        fs.read_ahead_window = 1024;
         fs.insert_read_cache("/a", 0, (0..1024u32).map(|v| v as u8).collect::<Vec<_>>());
         assert_eq!(fs.read_cache_hit("/a", 10, 4), Some(vec![10, 11, 12, 13]));
         assert_eq!(fs.read_cache_hit("/a", 2048, 4), None);
@@ -4042,11 +4036,13 @@ mod tests {
     }
 
     #[test]
-    fn s3_timeout_config_always_sets_both_timeouts() {
+    fn s3_timeout_config_always_sets_timeouts() {
         // The SDK's own default has no read timeout; any path that lets a
         // None through to the client builder would reintroduce the
         // permanent-wedge bug. Explicit values win, None falls back to the
-        // defaults.
+        // defaults. The operation timeout (same value as read; it bounds the
+        // whole request including retries, #43) has no getter and is covered
+        // by operation_timeout_cuts_off_retry_chain.
         let explicit = s3_timeout_config(Some(3), Some(120));
         assert_eq!(explicit.connect_timeout(), Some(Duration::from_secs(3)));
         assert_eq!(explicit.read_timeout(), Some(Duration::from_secs(120)));
@@ -4145,46 +4141,7 @@ mod tests {
 
     #[tokio::test]
     async fn stat_returns_cached_entry_without_s3() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let fs = test_fs();
         let entry = DirEntry {
             name: "a.txt".into(),
             is_dir: false,
@@ -4209,46 +4166,7 @@ mod tests {
         // as it does not panic. Here we only assert the plumbing: after
         // seeding a stale (expired) entry, stat must not return it and must
         // not leave the cache holding the stale entry past a successful call.
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let fs = test_fs();
         let old = DirEntry {
             name: "a.txt".into(),
             is_dir: false,
@@ -4267,46 +4185,7 @@ mod tests {
 
     #[test]
     fn stat_cache_invalidate_removes_entry() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let fs = test_fs();
         let entry = DirEntry {
             name: "a.txt".into(),
             is_dir: false,
@@ -4324,46 +4203,7 @@ mod tests {
 
     #[test]
     fn stat_cache_evicts_all_when_over_bound() {
-        let fs = ObjectFs {
-            client: Client::from_conf(aws_sdk_s3::config::Config::builder().build()),
-            bucket: "b".into(),
-            stats: Mutex::new(HashMap::new()),
-            negative: Mutex::new(HashMap::new()),
-            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_S3_REQUESTS)),
-            read_only: false,
-            allow_other: false,
-            list_rate: None,
-            mount_attr: MountAttr::default(),
-            allow_rename_dir: true,
-            rename_dir_limit: None,
-            upload_budget: None,
-            upload_budget_units: 0,
-            read_ahead_window: 0,
-            read_cache: Mutex::new(ReadCache::default()),
-            read_cache_max_bytes: READ_CACHE_MAX_BYTES,
-            disk_cache: None,
-            disk_cache_prefetch_blocks: 1,
-            prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
-            prefetch_sem: Arc::new(Semaphore::new(DISK_CACHE_PREFETCH_CONCURRENCY)),
-            disk_cache_verify_etag: false,
-            etag_checked: Mutex::new(HashMap::new()),
-            etag_ttl: ETAG_CHECK_TTL,
-            negative_ttl: NEGATIVE_CACHE_TTL,
-            stat_ttl: STAT_TTL,
-            negative_max_entries: MAX_NEGATIVE_ENTRIES,
-            stat_max_entries: MAX_STAT_ENTRIES,
-            read_seq: Mutex::new(HashMap::new()),
-            ignore_fsync: true,
-            verify_crc64: false,
-            storage_class: None,
-            content_md5: false,
-            notsup_compat_dir: false,
-            multipart_part_size: MULTIPART_PART_SIZE as usize,
-            multipart_concurrency: MULTIPART_UPLOAD_CONCURRENCY,
-            metrics: Arc::new(Metrics::default()),
-            dirty_budget: None,
-            prefix: String::new(),
-        };
+        let fs = test_fs();
         let entry = DirEntry {
             name: "f".into(),
             is_dir: false,
@@ -4442,8 +4282,17 @@ mod s3_mock_tests {
         pub(crate) delay: Duration,
         pub(crate) entries: Arc<Mutex<Vec<(String, bool)>>>,
         pub(crate) objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// Per-key sizes for listing (defaults to 5 when absent); lets tests
+        /// model objects too large to materialize (e.g. > 5 GiB copies, #60).
+        pub(crate) sizes: Arc<Mutex<HashMap<String, u64>>>,
         pub(crate) get_count: Arc<AtomicUsize>,
         pub(crate) head_count: Arc<AtomicUsize>,
+        /// Number of GET requests to fail with 500 before succeeding (used
+        /// to exercise the SDK retry chain, #43).
+        pub(crate) fail_get: AtomicUsize,
+        /// Keys reported as failed by DeleteObjects responses (exercises the
+        /// partial-failure error path, #60).
+        pub(crate) delete_errors: Arc<Mutex<Vec<String>>>,
         pub(crate) crc64: Mutex<u64>,
         pub(crate) head_etag: Mutex<String>,
         /// When non-zero, every HEAD answers with this status (used to
@@ -4461,6 +4310,10 @@ mod s3_mock_tests {
     impl MockS3 {
         pub(crate) fn set_object(&self, key: &str, data: Vec<u8>) {
             self.objects.lock().unwrap().insert(key.to_string(), data);
+        }
+
+        pub(crate) fn set_size(&self, key: &str, size: u64) {
+            self.sizes.lock().unwrap().insert(key.to_string(), size);
         }
 
         fn set_head_etag(&self, v: &str) {
@@ -4486,7 +4339,10 @@ mod s3_mock_tests {
                 objects: Arc::new(Mutex::new(HashMap::new())),
                 get_count: Arc::new(AtomicUsize::new(0)),
                 head_count: Arc::new(AtomicUsize::new(0)),
+                fail_get: AtomicUsize::new(0),
+                delete_errors: Arc::new(Mutex::new(Vec::new())),
                 entries: Arc::new(Mutex::new(entries)),
+                sizes: Arc::new(Mutex::new(HashMap::new())),
                 crc64: Mutex::new(0),
                 head_etag: Mutex::new("mock-etag".to_string()),
                 head_status: std::sync::atomic::AtomicU16::new(0),
@@ -4553,7 +4409,10 @@ mod s3_mock_tests {
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
-        let query = target.split('?').nth(1).unwrap_or("").to_lowercase();
+        let query_raw = target.split('?').nth(1).unwrap_or("").to_string();
+        // Lowercased for the method/query dispatch below; prefix filtering
+        // must use the raw query (percent-decoded) so keys keep their case.
+        let query = query_raw.to_lowercase();
 
         // Read the remaining body bytes.
         let total = header_end.unwrap() + content_length;
@@ -4601,61 +4460,96 @@ mod s3_mock_tests {
 
         let mut get_body: Option<Vec<u8>> = None;
         let response = if query.contains("list-type=2") {
+            // Honor the `prefix` query param: ObjectFs lists with a prefix
+            // (and probes implicit dirs with max_keys=1); returning entries
+            // outside the prefix would make list/stat see phantom children.
+            let prefix = query_raw
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("prefix="))
+                .unwrap_or("")
+                .replace("%2F", "/")
+                .replace("%20", " ")
+                .replace('+', " ");
             let entries = mock.entries.lock().unwrap().clone();
+            // ObjectFs lists without a delimiter; mock entries marked as
+            // directories then surface as plain (marker) objects in
+            // Contents, like real S3/OSS. Requests with a delimiter would
+            // fold them into CommonPrefixes instead.
+            let use_delimiter = query.contains("delimiter=");
+            let filtered: Vec<(String, bool)> = entries
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .collect();
+            let sizes = mock.sizes.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
-            let body = list_xml(&entries, truncated);
+            let body = list_xml(&filtered, &sizes, truncated, use_delimiter);
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
-            let path = target.split('?').next().unwrap_or(&target);
-            let key = path
-                .trim_start_matches('/')
-                .split_once('/')
-                .map(|(_, k)| k.to_string())
-                .unwrap_or_default();
-            let objects = mock.objects.lock().unwrap();
-            match objects.get(&key) {
-                Some(object) => {
-                    let len = object.len();
-                    let (start, end) = match &range_header {
-                        Some(range) => {
-                            let range = range.trim().strip_prefix("bytes=").unwrap_or(range);
-                            match range.split_once('-') {
-                                Some((start, end)) => {
-                                    let start = start.parse::<usize>().unwrap_or(0).min(len);
-                                    let end = end
-                                        .parse::<usize>()
-                                        .ok()
-                                        .map(|e| e + 1)
-                                        .unwrap_or(len)
-                                        .min(len)
-                                        .max(start);
-                                    (start, end)
+            if mock.fail_get.load(Ordering::SeqCst) > 0 {
+                mock.fail_get.fetch_sub(1, Ordering::SeqCst);
+                let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
+                http_response(500, "application/xml", Some(&body.to_string()))
+            } else {
+                let path = target.split('?').next().unwrap_or(&target);
+                let key = path
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .map(|(_, k)| k.to_string())
+                    .unwrap_or_default();
+                let objects = mock.objects.lock().unwrap();
+                match objects.get(&key) {
+                    Some(object) => {
+                        let len = object.len();
+                        let (start, end) = match &range_header {
+                            Some(range) => {
+                                let range = range.trim().strip_prefix("bytes=").unwrap_or(range);
+                                match range.split_once('-') {
+                                    Some((start, end)) => {
+                                        let start = start.parse::<usize>().unwrap_or(0).min(len);
+                                        let end = end
+                                            .parse::<usize>()
+                                            .ok()
+                                            .map(|e| e + 1)
+                                            .unwrap_or(len)
+                                            .min(len)
+                                            .max(start);
+                                        (start, end)
+                                    }
+                                    None => (0, len),
                                 }
-                                None => (0, len),
                             }
-                        }
-                        None => (0, len),
-                    };
-                    get_body = Some(object[start..end].to_vec());
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        end - start
-                    )
+                            None => (0, len),
+                        };
+                        get_body = Some(object[start..end].to_vec());
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            end - start
+                        )
+                    }
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
                 }
-                None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string(),
             }
         } else if query.contains("uploads") && !query.contains("uploadid") {
             // InitiateMultipartUpload: POST /key?uploads
             let body = initiate_multipart_xml();
             http_response(200, "application/xml", Some(&body))
         } else if query.contains("uploadid") && query.contains("partnumber") {
-            // UploadPart: PUT /key?partNumber=N&uploadId=...
-            format!(
-                "HTTP/1.1 200 OK\r\nETag: \"etag-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                "mock"
-            )
+            // UploadPart / UploadPartCopy: PUT /key?partNumber=N&uploadId=...
+            // Answer a CopyPartResult when a copy-source header is present so
+            // the SDK's etag extraction path is exercised (#71 review).
+            if copy_source_header.is_some() {
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyPartResult><ETag>&quot;etag-part&quot;</ETag><LastModified>2026-01-01T00:00:00.000Z</LastModified></CopyPartResult>";
+                http_response(200, "application/xml", Some(&body.to_string()))
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"etag-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    "mock"
+                )
+            }
         } else if query.contains("uploadid") && method == "DELETE" {
             // AbortMultipartUpload
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -4677,6 +4571,17 @@ mod s3_mock_tests {
                     body.len()
                 )
             }
+        } else if query.contains("delete") && method == "POST" {
+            // DeleteObjects: answer a result listing any configured failures.
+            let errors = mock.delete_errors.lock().unwrap();
+            let mut body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>".to_string();
+            for key in errors.iter() {
+                body.push_str(&format!(
+                    "<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>mock</Message></Error>"
+                ));
+            }
+            body.push_str("</DeleteResult>");
+            http_response(200, "application/xml", Some(&body))
         } else if method == "HEAD" {
             mock.head_count.fetch_add(1, Ordering::SeqCst);
             let forced = mock.head_status.load(Ordering::SeqCst);
@@ -4737,7 +4642,12 @@ mod s3_mock_tests {
             .to_string()
     }
 
-    fn list_xml(entries: &[(String, bool)], truncated_no_token: bool) -> String {
+    fn list_xml(
+        entries: &[(String, bool)],
+        sizes: &HashMap<String, u64>,
+        truncated_no_token: bool,
+        use_delimiter: bool,
+    ) -> String {
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
@@ -4747,13 +4657,18 @@ mod s3_mock_tests {
         body.push_str(if truncated_no_token { "true" } else { "false" });
         body.push_str("</IsTruncated>");
         for (key, is_dir) in entries {
-            if *is_dir {
+            if *is_dir && use_delimiter {
+                // With a delimiter the server folds directory markers into
+                // CommonPrefixes; without one (how ObjectFs lists) a marker
+                // is an ordinary zero-byte object in Contents, matching real
+                // S3/OSS semantics (#60 review).
                 body.push_str(&format!(
                     "<CommonPrefixes><Prefix>{key}</Prefix></CommonPrefixes>"
                 ));
             } else {
+                let size = sizes.get(key).copied().unwrap_or(5);
                 body.push_str(&format!(
-                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>5</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
                 ));
             }
         }
@@ -5097,6 +5012,301 @@ mod s3_mock_tests {
             err.to_string().contains("truncated"),
             "unexpected error: {err}"
         );
+    }
+
+    /// #59 happy path: delete_dir_recursive removes every object under the
+    /// prefix plus the directory marker. The mock never mutates its object
+    /// store on DELETE, so the assertions check the issued DELETE targets.
+    /// Without a delimiter (how ObjectFs lists) directory markers are
+    /// ordinary objects in Contents and are covered by the batch delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_removes_tree_and_marker() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("dir/".into(), true),
+                ("dir/a.txt".into(), false),
+                ("dir/sub/".into(), true),
+                ("dir/sub/b.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("recursive delete");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        // Without a delimiter, directory markers are ordinary objects in
+        // the listing, so the batch delete covers them too; the trailing
+        // plain DELETE is a redundant 404 no-op kept for safety.
+        let batch = recorded
+            .iter()
+            .find(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .expect("objects must be deleted via a batch delete");
+        let body = String::from_utf8_lossy(&batch.body);
+        for key in ["dir/", "dir/a.txt", "dir/sub/", "dir/sub/b.txt"] {
+            assert!(
+                body.contains(key),
+                "batch delete body must contain {key}: {body}"
+            );
+        }
+        let plain_deletes = recorded.iter().filter(|r| r.method == "DELETE").count();
+        assert_eq!(
+            plain_deletes, 1,
+            "trailing marker DELETE stays a plain delete"
+        );
+    }
+
+    /// #59 happy path: delete() issues exactly one DELETE for the object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_removes_single_object() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        fs.delete("/single.txt")
+            .await
+            .expect("delete single object");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "single DELETE for a single object");
+        assert_eq!(recorded[0].method, "DELETE");
+        assert!(
+            recorded[0].target.contains("/single.txt"),
+            "target must be the object key: {}",
+            recorded[0].target
+        );
+    }
+
+    /// #60: >1000 keys are deleted in multiple DeleteObjects requests
+    /// (S3's per-request cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_chunks_over_1000_keys() {
+        let entries: Vec<(String, bool)> = (0..1001)
+            .map(|i| (format!("dir/f{i:04}.bin"), false))
+            .collect();
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let fs = test_fs(port, 32);
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("recursive delete");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        let batches = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .count();
+        assert_eq!(
+            batches, 2,
+            "1001 keys must be split into two DeleteObjects requests"
+        );
+        let batch_bodies: usize = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .map(|r| String::from_utf8_lossy(&r.body).matches("<Key>").count())
+            .sum();
+        assert_eq!(batch_bodies, 1001, "all keys must be in the batch bodies");
+    }
+
+    /// #60: a partially-failing DeleteObjects must surface an error instead
+    /// of silently reporting success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_reports_batch_failures() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("dir/".into(), true),
+                ("dir/a.txt".into(), false),
+                ("dir/b.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.delete_errors
+            .lock()
+            .unwrap()
+            .push("dir/a.txt".to_string());
+        let fs = test_fs(port, 32);
+
+        let err = fs
+            .delete_dir_recursive("/dir")
+            .await
+            .expect_err("a partially-failing batch delete must error");
+        assert!(
+            err.to_string().contains("batch delete failed"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// #60: delete_dir_recursive batches keys through DeleteObjects (one
+    /// request, `?delete`) instead of one DELETE per object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_dir_recursive_uses_batch_delete() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("dir/".into(), true),
+                ("dir/a.txt".into(), false),
+                ("dir/b.txt".into(), false),
+                ("dir/c.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        let fs = test_fs(port, 32);
+
+        fs.delete_dir_recursive("/dir")
+            .await
+            .expect("recursive delete");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        let batch = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batch.len(),
+            1,
+            "objects must be deleted in one DeleteObjects request: {recorded:?}"
+        );
+        let body = String::from_utf8_lossy(&batch[0].body);
+        for key in ["dir/a.txt", "dir/b.txt", "dir/c.txt"] {
+            assert!(
+                body.contains(key),
+                "DeleteObjects body must contain {key}: {body}"
+            );
+        }
+        // The marker itself is still a plain DELETE (one request).
+        assert_eq!(
+            recorded.iter().filter(|r| r.method == "DELETE").count(),
+            1,
+            "the directory marker is deleted with a plain DELETE"
+        );
+    }
+
+    /// #43: the operation timeout caps the *whole* request including its
+    /// retry chain. A failing (500) request must not burn attempts × read
+    /// timeout; the SDK must give up as soon as the operation budget is
+    /// exhausted, so the limiter permit / part slot it holds is freed
+    /// promptly. Without the operation timeout the retry chain would retry
+    /// the 500 until it succeeds (3 attempts here); with it, only the first
+    /// attempt fits in the budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operation_timeout_cuts_off_retry_chain() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(500)).await;
+        mock.fail_get.store(3, Ordering::SeqCst); // first 3 GETs fail with 500
+        let mut fs = test_fs(port, 32);
+        // 1s read + operation budget: attempt 1 (~0.5s) fails with 500; the
+        // retry backoff would exceed the remaining operation budget, so the
+        // SDK must give up without a second attempt.
+        fs.client = Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .endpoint_url(format!("http://127.0.0.1:{port}"))
+                .force_path_style(true)
+                .region(aws_sdk_s3::config::Region::new("cn-shanghai"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "ak", "sk", None, None, "test",
+                ))
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .retry_config(aws_smithy_types::retry::RetryConfig::standard())
+                .timeout_config(s3_timeout_config(Some(10), Some(1)))
+                .build(),
+        );
+
+        let started = std::time::Instant::now();
+        let err = fs
+            .read_range("/stall.bin", 0, 16)
+            .await
+            .expect_err("a stalled request must fail within the operation budget");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "operation must give up within the operation budget, took {:?}",
+            started.elapsed()
+        );
+        let attempts = mock.get_count.load(Ordering::SeqCst);
+        assert!(
+            attempts < 3,
+            "retry chain must be cut by the operation budget, got {attempts} GET attempts: {err}"
+        );
+    }
+
+    /// #60: objects at or above the 5 GiB single-copy cap are copied via
+    /// multipart copy (upload_part_copy chunks), smaller ones via a single
+    /// copy_object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_dir_copies_big_object_via_multipart_copy() {
+        let (mock, port) = MockS3::start(
+            vec![
+                ("dir/".into(), true),
+                ("dir/big.bin".into(), false),
+                ("dir/small.txt".into(), false),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.set_size("dir/big.bin", MULTIPART_COPY_THRESHOLD + 1);
+        let fs = test_fs(port, 32);
+
+        fs.rename("/dir", "/dir2", false)
+            .await
+            .expect("rename directory");
+
+        let lc = |t: &str| t.to_lowercase();
+        let recorded = mock.recorded.lock().unwrap();
+        // The 5 GiB object: copied through upload_part_copy chunks with a
+        // copy-source range (PUT + partNumber + uploadId + copy-source).
+        let parts = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && lc(&r.target).contains("partnumber") && r.copy_source.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            parts.len() >= 2,
+            "big object must be copied in multiple parts: {recorded:?}"
+        );
+        for p in &parts {
+            assert!(
+                p.copy_source
+                    .as_deref()
+                    .map(|s| s.contains("/dir/big.bin"))
+                    .unwrap_or(false),
+                "copy source must reference the source object: {p:?}"
+            );
+        }
+        // Small objects: a single copy_object each (PUT + copy-source, no
+        // part). Without a delimiter the source dir marker is an ordinary
+        // object, so: small.txt + source dir/ marker + dst dir marker.
+        let plain_copies = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "PUT"
+                    && r.copy_source.is_some()
+                    && !lc(&r.target).contains("partnumber")
+            })
+            .count();
+        assert_eq!(
+            plain_copies, 3,
+            "small.txt + source + dst dir markers copied with plain copy_object: {recorded:?}"
+        );
+        // One multipart upload initiated + completed for the big object.
+        let creates = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("uploads"))
+            .count();
+        assert_eq!(creates, 1, "one multipart upload for the big object");
+        let completes = recorded
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploadid")
+                    && !lc(&r.target).contains("partnumber")
+            })
+            .count();
+        assert_eq!(completes, 1, "one multipart complete");
     }
 
     #[test]
