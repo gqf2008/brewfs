@@ -255,6 +255,9 @@ EOF
 elif [[ -d dist/macos/macfuse ]]; then
   cp dist/macos/macfuse/* "$DMG_ROOT/" 2>/dev/null || true
 fi
+# Standard drag-to-install layout: the "Applications" alias lets the user
+# drop the app onto /Applications from Finder.
+ln -s /Applications "$DMG_ROOT/Applications"
 echo "==> Creating DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_ROOT" -ov -format UDZO -fs HFS+ "$DMG"
 if [[ "$SKIP_SIGN" == "0" ]]; then
