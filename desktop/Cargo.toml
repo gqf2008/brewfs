@@ -7,7 +7,15 @@ license = "MIT"
 publish = false
 
 [dependencies]
-slint = { version = "1.17", features = ["unstable-winit-030"] }
+slint = { version = "1.17", default-features = false, features = [
+    "unstable-winit-030",
+    "std",
+    "backend-default",
+    "renderer-femtovg",
+    "accessibility",
+    "compat-1-2",
+    "system-tray",
+] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 dirs = { workspace = true }
