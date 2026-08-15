@@ -777,12 +777,54 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
             signal?;
             println!("unmounting...");
         }
+        () = wait_unmount_event() => {
+            println!("unmount requested via control event; unmounting...");
+        }
     }
 
     host.stop();
     host.unmount();
     remove_runtime_record();
     Ok(())
+}
+
+/// Name of the per-process named event the tray signals to request a
+/// graceful unmount. Must stay in sync with `desktop/src/winutil.rs`
+/// (`request_graceful_shutdown`), which opens it by the mount's PID from
+/// the runtime record.
+fn unmount_event_name() -> String {
+    format!(r"Local\ossfs-unmount-{}", std::process::id())
+}
+
+/// Create the manual-reset unmount event and wait for it on a blocking
+/// thread; resolves once the tray signals a graceful unmount (#61).
+///
+/// When the event cannot be created the future never resolves: Ctrl+C
+/// remains the only graceful stop channel — a broken control plane must
+/// not break mounting (the tray falls back to force-terminate).
+async fn wait_unmount_event() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+    let name: Vec<u16> = unmount_event_name()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: valid NUL-terminated name; manual-reset, initially unset; no
+    // security attributes (per-session `Local\` object, same user).
+    let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        warn!("cannot create the unmount control event; Ctrl+C stays the only stop channel");
+        std::future::pending::<()>().await;
+    }
+    // SAFETY: `handle` is a valid event handle owned by this call; the
+    // blocking wait runs off the async runtime.
+    let _ = tokio::task::spawn_blocking(move || {
+        unsafe { WaitForSingleObject(handle, INFINITE) };
+        // SAFETY: valid handle, single owner, no other waiter afterwards.
+        unsafe { CloseHandle(handle) };
+    })
+    .await;
 }
 
 fn build_volume_params(read_only: bool) -> VolumeParams {

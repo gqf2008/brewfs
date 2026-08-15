@@ -182,6 +182,36 @@ pub fn profiles_path() -> PathBuf {
         .join("profiles.json")
 }
 
+/// Path of the persisted "desired mounts" state: the drives the user
+/// explicitly mounted, so a restarted/crashed tray re-arms its auto-restart
+/// guard instead of silently abandoning the supervision (#61).
+pub fn desired_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ossfs-tray")
+        .join("desired.json")
+}
+
+/// Load the persisted desired-mount set. Any unreadable or corrupt file is
+/// treated as empty: losing the list only means the user remounts by hand —
+/// a state file must never block startup (contrast with profiles.json,
+/// whose corruption is reported and backed up).
+pub fn load_desired(path: &Path) -> std::collections::HashSet<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the desired-mount set atomically (write tmp + rename), so a
+/// crash mid-write leaves either the old or the new file, never a torn one.
+pub fn save_desired(path: &Path, desired: &std::collections::HashSet<String>) -> io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(desired)?;
+    fs::write(&tmp, &bytes)?;
+    fs::rename(&tmp, path)
+}
+
 /// Result of loading the profiles file.
 #[derive(Debug)]
 pub struct LoadProfilesResult {
@@ -1346,6 +1376,59 @@ mod tests {
         assert!(
             !got.contains('\u{FFFD}'),
             "boundary skip must avoid a leading replacement char; got {got:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desired_roundtrip_and_atomic_write() {
+        // Regression (#61): the desired-mount set was memory-only; a tray
+        // restart/crash silently abandoned supervision of running mounts.
+        let dir =
+            std::env::temp_dir().join(format!("ossfs-tray-test-desired-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+
+        let mut set = std::collections::HashSet::new();
+        set.insert("Z:".to_string());
+        set.insert("Y:".to_string());
+        save_desired(&path, &set).expect("save");
+
+        // Atomic write must leave no tmp residue.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "tmp file must be renamed away"
+        );
+        assert_eq!(load_desired(&path), set, "roundtrip must be lossless");
+
+        // Removal roundtrip.
+        set.remove("Z:");
+        save_desired(&path, &set).expect("save 2");
+        assert_eq!(
+            load_desired(&path),
+            std::collections::HashSet::from(["Y:".to_string()])
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desired_load_tolerates_missing_and_corrupt_state() {
+        // A state file must never block startup: missing or corrupt reads as
+        // an empty set (contrast with profiles.json, which is backed up and
+        // reported).
+        let dir =
+            std::env::temp_dir().join(format!("ossfs-tray-test-desired2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+
+        assert!(load_desired(&path).is_empty(), "missing file loads empty");
+
+        fs::write(&path, b"{not json").unwrap();
+        assert!(
+            load_desired(&path).is_empty(),
+            "corrupt file loads empty, no panic"
         );
         let _ = fs::remove_dir_all(&dir);
     }

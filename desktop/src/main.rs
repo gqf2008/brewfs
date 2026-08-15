@@ -159,6 +159,13 @@ fn tray_menu_drives() -> std::sync::MutexGuard<'static, Vec<String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Persist the guard's desired set after a mutation so a tray restart or
+/// crash re-arms the auto-restart supervision (#61). Best-effort: a failed
+/// state write only loses supervision across a restart, never blocks I/O.
+fn persist_desired(g: &mut std::sync::MutexGuard<'static, GuardState>) {
+    let _ = model::save_desired(&model::desired_path(), &g.desired);
+}
+
 fn guard() -> std::sync::MutexGuard<'static, GuardState> {
     MOUNT_GUARD
         .get_or_init(|| std::sync::Mutex::new(GuardState::default()))
@@ -315,6 +322,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recent = Rc::new(RefCell::new(Vec::<RecentSpawn>::new()));
     let hold = Rc::new(StatusHold::default());
     let ossmount = Rc::new(model::find_ossmount());
+
+    // Re-arm the auto-restart guard from the persisted desired set: a tray
+    // restart/crash must not silently abandon supervision of running mounts
+    // (#61).
+    {
+        let mut g = guard();
+        let persisted = model::load_desired(&model::desired_path());
+        g.desired.extend(persisted);
+    }
 
     // Surface profile-storage problems (corrupt file recovered, secure
     // store unavailable, ...) to the user instead of failing silently.
@@ -655,6 +671,7 @@ fn wire_callbacks(
                     if started {
                         let mut g = guard();
                         g.desired.insert(drive.clone());
+                        persist_desired(&mut g);
                         // A manual mount starts a new lifetime: clear any
                         // accumulated restart budget and fast-fail marks so
                         // the fresh mount gets a full budget (review B2).
@@ -1341,14 +1358,17 @@ const GRACEFUL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Writes are whole-file buffered and pushed on close, so force-killing the
 /// process can lose the entire in-flight buffer of a large file. The
 /// sequence is therefore: ask for a graceful shutdown (SIGTERM on Unix —
-/// `ossmount` unmounts cleanly on it), wait up to
-/// [`GRACEFUL_UNMOUNT_TIMEOUT`] for the process to exit, and only then
-/// force-terminate. Windows console mount processes have no mechanism to
-/// receive a soft shutdown request yet (needs an ossmount control handler /
-/// control-plane stop — tracked in #61), so there the force path is
-/// immediate, as before.
+/// `ossmount` unmounts cleanly on it; on Windows the tray signals the
+/// mount's `Local\ossfs-unmount-<pid>` control event, added in #61), wait up
+/// to [`GRACEFUL_UNMOUNT_TIMEOUT`] for the process to exit, and only then
+/// force-terminate. A mount running an ossmount build without the control
+/// event reports no graceful channel and is force-terminated as before.
 fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
-    guard().desired.remove(&m.drive);
+    {
+        let mut g = guard();
+        g.desired.remove(&m.drive);
+        persist_desired(&mut g);
+    }
     guard().alive_since.remove(&m.drive);
     let ui_weak = ui.as_weak();
     let m = m.clone();
@@ -1360,7 +1380,9 @@ fn graceful_or_kill(ui: &MainWindow, m: &model::MountStatus) {
                 // re-arm the auto-restart guard so the (possibly still
                 // running) mount stays watched, instead of silently losing
                 // supervision with a stale runtime record (review B4).
-                guard().desired.insert(m.drive.clone());
+                let mut g = guard();
+                g.desired.insert(m.drive.clone());
+                persist_desired(&mut g);
                 let msg = format!("卸载 {} 失败：{e}", m.drive);
                 let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                     ui.set_status_text(msg.into());

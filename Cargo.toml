@@ -60,7 +60,12 @@ strip = false
 
 [target.'cfg(windows)'.dependencies]
 winfsp = { workspace = true, features = ["delayload", "async-io", "notify"] }
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 winfsp = { workspace = true, features = ["delayload"] }

@@ -230,15 +230,33 @@ pub fn set_dock_visible(_visible: bool) {}
 
 /// Ask the mount process to shut down gracefully so it can flush its
 /// whole-file write buffers and unmount cleanly. Unix sends SIGTERM, which
-/// `ossmount` handles by unmounting; Windows console mount processes have no
-/// message pump or control handler to receive a soft signal, so there is no
-/// graceful path and the caller must fall back to [`terminate_process`].
-/// Returns whether a graceful shutdown was requested.
+/// `ossmount` handles by unmounting; Windows signals the mount's named
+/// control event (`Local\ossfs-unmount-<pid>`, created by
+/// `ossfs`'s WinFsp adapter — see `src/ossfs/winfsp.rs`), which resolves the
+/// mount's stop select and unmounts cleanly. Returns whether a graceful
+/// shutdown was requested.
 pub fn request_graceful_shutdown(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+        let name: Vec<u16> = format!(r"Local\ossfs-unmount-{pid}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: valid NUL-terminated name; the handle is ours to close.
+        unsafe {
+            let handle = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+            if handle.is_null() {
+                // The mount is older than the control-event feature (or a
+                // non-ossmount process): no graceful channel, fall back.
+                return false;
+            }
+            let signaled = SetEvent(handle) != 0;
+            CloseHandle(handle);
+            signaled
+        }
     }
     #[cfg(not(windows))]
     {
