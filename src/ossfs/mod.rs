@@ -1491,13 +1491,13 @@ impl StreamingUpload {
             return Err(e).context("s3 complete multipart upload");
         }
         if let Some(expected) = expected_crc {
-            check_crc64_response(crc_slot, expected, &self.metrics)?;
-            // The object completed server-side; a Drop abort would be a
-            // no-op. Mark terminal so Drop skips the wasted request even on
-            // this error path (#55 review).
-            self.aborted = true;
-        } else {
-            self.aborted = true;
+            if let Err(e) = check_crc64_response(crc_slot, expected, &self.metrics) {
+                // The object completed server-side; a Drop abort would be a
+                // no-op. Mark terminal so Drop skips the wasted request even
+                // on this error path (#55 review).
+                self.aborted = true;
+                return Err(e);
+            }
         }
         // One completed streamed object: a single PUT-equivalent upload of
         // `total_bytes` (#60 — streaming uploads used to be invisible to the
@@ -5881,6 +5881,48 @@ mod s3_mock_tests {
             })
             .await,
             "the rejected upload must still be aborted on drop"
+        );
+    }
+
+    /// #55-review M3: a CRC mismatch after a completed multipart must surface
+    /// the error WITHOUT a follow-up abort — the object already exists, so
+    /// aborting would be a wasted (NoSuchUpload) request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_crc_mismatch_does_not_abort_completed_object() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.verify_crc64 = true;
+        let data: Vec<u8> = (0..(MULTIPART_PART_SIZE as usize + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        mock.set_crc64(crc64ecma(&data).wrapping_add(1)); // wrong CRC
+
+        let mut up = fs.begin_streaming_upload("/crc.bin").await.expect("begin");
+        up.write(&data).await.expect("write");
+        let res = up.finish().await;
+        assert!(res.is_err(), "CRC mismatch must surface an error");
+
+        // The complete must have been issued first (it carries the bad CRC).
+        let lc = |t: &str| t.to_lowercase();
+        assert!(
+            wait_for_recorded(&mock, |r| {
+                r.method == "POST"
+                    && lc(&r.target).contains("uploadid")
+                    && !lc(&r.target).contains("partnumber")
+            })
+            .await,
+            "complete-multipart must be issued"
+        );
+        // Give a hypothetically-spawned abort time to (not) land.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !mock
+                .recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "DELETE" && lc(&r.target).contains("uploadid")),
+            "a completed object must not be aborted after a CRC mismatch"
         );
     }
 
