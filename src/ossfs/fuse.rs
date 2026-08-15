@@ -221,7 +221,17 @@ impl OssFs {
         if new_units <= current {
             return Ok(());
         }
-        let permit = budget.acquire_units(new_units - current).await?;
+        // try_acquire, not acquire: write/setattr run on the fuser session
+        // thread (a single dispatcher on macOS), and a blocking wait would
+        // park the only thread that can ever release the permits (handle
+        // close / release), deadlocking the whole mount (#53). Same pattern
+        // as reserve_rmw_budget below.
+        let permit = budget
+            .try_acquire_units(new_units - current)
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("dirty-buffer budget busy: cannot grow handle to {bytes} bytes")
+            })?;
         open.budget_permits.lock().unwrap().push(permit);
         open.budget_units.store(new_units, Ordering::Release);
         Ok(())
@@ -2003,6 +2013,47 @@ mod tests {
             recorded.iter().filter(|r| r.method == "PUT").count(),
             1,
             "one PUT"
+        );
+    }
+
+    /// #53: when the dirty budget is exhausted, write/setattr budget growth
+    /// must fail fast instead of blocking — a blocking acquire would park the
+    /// single FUSE dispatcher thread forever (nothing else can release the
+    /// permits: release() also needs that thread).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reserve_dirty_fails_fast_when_budget_exhausted() {
+        let (_mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        // 1 MiB budget, already fully held by another handle.
+        let oss = test_oss(port, Some(1 << 20));
+        let budget = oss.dirty_budget.as_ref().expect("budget configured");
+        let hog = budget
+            .try_acquire_units(budget.units_for(1 << 20).unwrap())
+            .await
+            .expect("initial hog acquisition");
+        let open = OpenFile {
+            path: "/f".to_string(),
+            is_dir: false,
+            write_buf: Some(Vec::new()),
+            loaded: false,
+            dirty: false,
+            budget_units: Arc::new(AtomicUsize::new(0)),
+            budget_permits: Arc::new(Mutex::new(Vec::new())),
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            logical_size: 0,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            oss.reserve_dirty(&open, 1 << 20),
+        )
+        .await;
+        drop(hog);
+        let err = result
+            .expect("reserve_dirty must not block when the budget is exhausted")
+            .expect_err("reserve_dirty must fail when the budget is exhausted");
+        assert!(
+            err.to_string().contains("budget busy"),
+            "unexpected error: {err:?}"
         );
     }
 
