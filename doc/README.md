@@ -75,10 +75,10 @@ documented here:
   while tombstones manage interaction: what the mount view hides and how
   restore/GC behave. The two are complementary and can be enabled together.
 - **Operations**: the `.trash/` prefix stays in the bucket and is hidden from
-  the mount view (it cannot be created or seen through the drive, so a real
-  `.trash` directory at the namespace root is unavailable). Recreating a path
-  with the same name first clears its tombstone, so the new content is
-  immediately visible (overwrite semantics).
+  the mount view (creating it succeeds but it is immediately hidden from the
+  view, so a real `.trash` directory at the namespace root is unavailable).
+  Recreating a path with the same name first clears its tombstone, so the new
+  content is immediately visible (overwrite semantics).
 
 ## Known POSIX / FUSE limitations
 

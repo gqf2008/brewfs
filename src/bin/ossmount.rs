@@ -51,7 +51,8 @@ fn usage_text() -> String {
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
          --trash-dir NAME:  trash (soft delete) directory, default ON as .trash\n\
-                           (deleted objects stay until GC, default 30-day retention);\n\
+                           (deleted objects stay until GC, default 30-day retention;\n\
+                           restore / GC commands land in 0.2.0);\n\
                            --no-trash restores immediate permanent delete\n\
          --trash-refresh-mode lazy|eager:  trash refresh policy, default lazy\n\
                            (eager refreshes tombstones before every list/stat,\n\
