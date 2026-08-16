@@ -1816,7 +1816,9 @@ pub struct ObjectFs {
     /// Negative stat cache: path -> cached_at (path known missing).
     negative: Mutex<HashMap<String, Instant>>,
     /// Trash (soft-delete) index; `None` = trash disabled (hard delete).
-    trash: Option<Arc<trash::TrashState>>,
+    /// pub(crate):单元 4 winfsp.rs 内联消费(裁决 R16:match_system_trash /
+    /// set_recycle_i 经此字段直调 TrashState 方法,不加 ObjectFs 包装)。
+    pub(crate) trash: Option<Arc<trash::TrashState>>,
     /// 回收站后台刷新循环已启动标记(挂载钩子调用 trash_refresh_start 的
     /// 防重入;compare_exchange/swap 语义,重复调用 no-op)。
     trash_refresh_started: AtomicBool,

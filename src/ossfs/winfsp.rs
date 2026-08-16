@@ -23,11 +23,16 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, U16CStr};
 
+use super::trash::{SystemTrashMatch, SystemTrashPlatform, is_i_entry};
 use super::{DirEntry, DirtyBudget, DirtyPermit, ObjectFs, StreamingUpload, spool_file_path};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+// 裁决 R10:$Recycle.Bin 与 SID 目录按 HIDDEN|SYSTEM 暴露(Explorer 对
+// 回收站目录的属性判定;实测项 [待验证],见规格 §4.4.5)。
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
@@ -98,6 +103,15 @@ fn parent_posix(path: &str) -> String {
     }
 }
 
+/// $R 名称判定(单元 4 $R 写拒绝):`$R` + 8 位十六进制(镜像 trash.rs
+/// 的 is_i_entry;$I 名互换前缀即得,单一推导点在 trash.rs)。Windows
+/// 回收站条目恒为 $R/$I 成对,非此形态的条目(桶中真实用户数据)不拒绝。
+fn is_r_entry(name: &str) -> bool {
+    name.len() >= 10
+        && name.starts_with("$R")
+        && name.as_bytes()[2..10].iter().all(u8::is_ascii_hexdigit)
+}
+
 fn file_info_from(entry: &DirEntry, index: u64) -> FileInfo {
     let mut fi = FileInfo::default();
     fi.file_attributes = if entry.is_dir {
@@ -150,6 +164,11 @@ pub struct OssFileContext {
     loaded: AtomicBool,
     dirty: AtomicBool,
     delete_on_close: AtomicBool,
+    /// 单元 4:$I 捕获句柄(裁决 R8/R11 ②)。路径为系统回收站内 $I 形态
+    /// 且对应 $R 墓碑存在时置位:write_buf 承载捕获字节、**不落 S3**
+    /// (P8:桶中无真实 $I 对象),dirty 恒 false(flush/cleanup 不 PUT),
+    /// close 时经 commit_capture_i 落墓碑 body。非捕获句柄恒 false。
+    capture_i: AtomicBool,
     dir_buffer: DirBuffer,
     /// High-water MiB units reserved from [`OssMountContext::dirty_budget`].
     budget_units: AtomicUsize,
@@ -335,6 +354,29 @@ impl OssMountContext {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
         }
 
+        // 单元 4:$I 捕获句柄 —— SetEndOfFile 仅调缓冲逻辑大小,不落 S3
+        // (dirty 不置;Explorer 写 $I 前的清空/截断只应作用于捕获缓冲)。
+        // 上限 MAX_RECYCLE_I_BYTES:超限 preallocate 截断,防内存撑爆。
+        if context.capture_i.load(Ordering::Acquire) {
+            let mut guard = context.write_buf.lock().unwrap();
+            let buf = guard.get_or_insert_with(Vec::new);
+            let capped = new_size.min(crate::ossfs::trash::MAX_RECYCLE_I_BYTES as u64);
+            if capped == 0 {
+                buf.clear();
+            } else {
+                buf.resize(capped as usize, 0);
+            }
+            context.logical_size.store(capped, Ordering::Release);
+            let entry = DirEntry {
+                name: context.path.lock().unwrap().clone(),
+                is_dir: false,
+                size: capped,
+                mtime_secs: 0,
+            };
+            *file_info = file_info_from(&entry, context.index());
+            return Ok(());
+        }
+
         if new_size == 0 {
             // Truncate to zero: abort any in-flight stream (bytes written
             // after the truncate would otherwise append to it), discard the
@@ -445,6 +487,32 @@ impl OssMountContext {
                 self.operation_timeout.as_secs()
             )))),
         }
+    }
+
+    /// $I 捕获提交(单元 4,裁决 R8):close 时把 write_buf 里的捕获字节
+    /// 落墓碑 body(异步 update 式写,经 TrashState::set_recycle_i ——
+    /// 内部截断 4KiB、未命中 warn + no-op)。独立方法便于测试直驱
+    /// (close 按值消费 context,测试用 & 引用驱动同一提交逻辑)。
+    /// 调用方不持 limiter permit(set_recycle_i 内部处理)。
+    async fn commit_capture_i(&self, context: &OssFileContext) -> winfsp::Result<()> {
+        let Some(trash) = &self.fs.trash else {
+            return Ok(()); // trash 关闭:无墓碑可落(捕获句柄不可能出现)
+        };
+        let path = context.path.lock().unwrap().clone();
+        let bytes = context.write_buf.lock().unwrap().take();
+        let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
+            return Ok(()); // 空写/探测句柄:$I 无字节可落
+        };
+        let entry_name = path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&path)
+            .to_string();
+        trash
+            .set_recycle_i(&self.fs, &entry_name, bytes)
+            .await
+            .map_err(|e| FspError::from(IoError::other(e.to_string())))
     }
 
     /// Upload the handle's dirty content, streaming from the spool file when
@@ -915,19 +983,38 @@ impl FileSystemContext for OssMountContext {
             .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
         let entry = entry
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
+        // 单元 4(裁决 R10):系统回收站目录($Recycle.Bin 与 SID 层)按
+        // DIRECTORY|HIDDEN|SYSTEM 暴露;Windows $I 条目 ARCHIVE|HIDDEN;
+        // $R 保持 ARCHIVE(只读预览)。判定经 fs.trash 内联(裁决 R16:
+        // 不加 ObjectFs 包装方法)。
+        let mut attributes = if entry.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_ARCHIVE
+                | if self.fs.read_only() {
+                    FILE_ATTRIBUTE_READONLY
+                } else {
+                    0
+                }
+        };
+        if let Some(trash) = &self.fs.trash {
+            match trash.match_system_trash(&posix) {
+                Some(SystemTrashMatch::Dir { .. }) => {
+                    attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+                }
+                Some(SystemTrashMatch::Entry { entry_name })
+                    if trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                        && is_i_entry(&entry_name) =>
+                {
+                    attributes |= FILE_ATTRIBUTE_HIDDEN;
+                }
+                _ => {}
+            }
+        }
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: 0,
-            attributes: if entry.is_dir {
-                FILE_ATTRIBUTE_DIRECTORY
-            } else {
-                FILE_ATTRIBUTE_ARCHIVE
-                    | if self.fs.read_only() {
-                        FILE_ATTRIBUTE_READONLY
-                    } else {
-                        0
-                    }
-            },
+            attributes,
         })
     }
 
@@ -956,6 +1043,25 @@ impl FileSystemContext for OssMountContext {
         if write && self.fs.read_only() {
             return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
         }
+        // 单元 4(裁决 R11 ②):Windows 回收站条目写拒绝($R)/捕获($I)。
+        // 捕获条件:$I 形态(8 位 hex)且对应 $R 墓碑已在反向索引(零远程);
+        // $R 形态 open-for-write → ACCESS_DENIED(只读预览放行)。
+        let mut capture_i = false;
+        if write {
+            if let Some(trash) = &self.fs.trash {
+                if let Some(SystemTrashMatch::Entry { entry_name }) =
+                    trash.match_system_trash(&posix)
+                    && trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                {
+                    if is_r_entry(&entry_name) {
+                        return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                    }
+                    if is_i_entry(&entry_name) {
+                        capture_i = trash.i_entry_has_r_tombstone(&entry_name);
+                    }
+                }
+            }
+        }
         let write_buf = if is_dir {
             None
         } else if write {
@@ -971,9 +1077,11 @@ impl FileSystemContext for OssMountContext {
             path: Mutex::new(posix),
             is_dir,
             write_buf: Mutex::new(write_buf),
-            loaded: AtomicBool::new(false),
+            // $I 捕获:缓冲权威(无 S3 对象可懒加载),首个写直接落缓冲。
+            loaded: AtomicBool::new(capture_i),
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
+            capture_i: AtomicBool::new(capture_i),
             dir_buffer: DirBuffer::new(),
             budget_units: AtomicUsize::new(0),
             budget_permits: Mutex::new(Vec::new()),
@@ -1002,6 +1110,25 @@ impl FileSystemContext for OssMountContext {
         if self.fs.read_only() {
             return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
         }
+        // 单元 4(裁决 R11 ②):回收站内 $R 创建拒绝(只读条目);
+        // $I 创建进入捕获模式 —— 不落 S3(P8:桶中无真实 $I 对象),
+        // close 时经 set_recycle_i 落墓碑 body。
+        let mut capture_i = false;
+        if !is_dir {
+            if let Some(trash) = &self.fs.trash {
+                if let Some(SystemTrashMatch::Entry { entry_name }) =
+                    trash.match_system_trash(&posix)
+                    && trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                {
+                    if is_r_entry(&entry_name) {
+                        return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                    }
+                    if is_i_entry(&entry_name) {
+                        capture_i = trash.i_entry_has_r_tombstone(&entry_name);
+                    }
+                }
+            }
+        }
         // Real size / lazy-load flag when `create` finds the file already
         // exists; set below. A brand-new file keeps size 0 with an
         // authoritative empty buffer.
@@ -1010,7 +1137,7 @@ impl FileSystemContext for OssMountContext {
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
                 .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        } else {
+        } else if !capture_i {
             // #50: materialize the object for a brand-new file so it still
             // exists after the handle closes (a never-PUT path would 404 on
             // the next stat and the file would "vanish"). An existing file
@@ -1049,10 +1176,11 @@ impl FileSystemContext for OssMountContext {
             // brand-new file's empty buffer is authoritative. For an existing
             // file (the security lookup raced a concurrent create/rename),
             // the first write lazy-loads the object so it merges instead of
-            // zero-filling over the content.
-            loaded: AtomicBool::new(!needs_existing),
+            // zero-filling over the content. $I 捕获缓冲同样权威(无 S3 对象)。
+            loaded: AtomicBool::new(capture_i || !needs_existing),
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
+            capture_i: AtomicBool::new(capture_i),
             dir_buffer: DirBuffer::new(),
             budget_units: AtomicUsize::new(0),
             budget_permits: Mutex::new(Vec::new()),
@@ -1108,6 +1236,16 @@ impl FileSystemContext for OssMountContext {
     }
 
     fn close(&self, context: Self::FileContext) {
+        // 单元 4(裁决 R8):$I 捕获句柄 —— 捕获缓冲落墓碑 body(异步,
+        // update 式写:GET body → 设 recycle_i → PUT,保 etag/size)。
+        // 空写/$R 未解析 → commit_capture_i 内部 no-op;超时静默丢弃
+        // (close 无错误回报通道,落 body 失败由 set_recycle_i warn)。
+        if context.capture_i.load(Ordering::Acquire) {
+            let _ = self.block_on(async {
+                tokio::time::timeout(self.operation_timeout, self.commit_capture_i(&context)).await
+            });
+            return;
+        }
         // The handle is gone, so nothing can retry a failed upload — release
         // the read-back spool and abort any leftover stream so neither leaks
         // in %TEMP% / S3 (#47).
@@ -1209,6 +1347,24 @@ impl FileSystemContext for OssMountContext {
     ) -> winfsp::Result<()> {
         if context.is_dir {
             return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32));
+        }
+        // 单元 4:$I 捕获句柄的 overwrite(Explorer 以 CREATE_ALWAYS 建 $I,
+        // WinFsp 对已存在文件走 overwrite 回调):清空捕获缓冲即可,不置
+        // dirty —— flush/cleanup 不得 PUT 真实 $I 对象(P8)。
+        if context.capture_i.load(Ordering::Acquire) {
+            if let Some(buf) = context.write_buf.lock().unwrap().as_mut() {
+                buf.clear();
+            }
+            context.logical_size.store(0, Ordering::Release);
+            context.loaded.store(true, Ordering::Release);
+            let entry = DirEntry {
+                name: context.path.lock().unwrap().clone(),
+                is_dir: false,
+                size: 0,
+                mtime_secs: 0,
+            };
+            *file_info = file_info_from(&entry, context.index());
+            return Ok(());
         }
         // #47: an in-flight streaming upload must be aborted or the bytes
         // written after the overwrite would append to the old stream and the
@@ -1401,6 +1557,36 @@ impl AsyncFileSystemContext for OssMountContext {
     ) -> winfsp::Result<u32> {
         if buffer.is_empty() {
             return Ok(0);
+        }
+
+        // 单元 4(裁决 R8):$I 捕获句柄 —— 字节进 write_buf、不落 S3
+        // (P8:桶中无真实 $I 对象),dirty 恒 false(flush/cleanup 不 PUT),
+        // close 时 commit_capture_i 落墓碑 body。缓冲上限
+        // MAX_RECYCLE_I_BYTES:超限写入截断(提交时也截断,双保险;
+        // 防恶意/异常句柄撑爆内存)。
+        if context.capture_i.load(Ordering::Acquire) {
+            let mut guard = context.write_buf.lock().unwrap();
+            let buf = guard.get_or_insert_with(Vec::new);
+            let start = if write_to_eof {
+                buf.len()
+            } else {
+                offset as usize
+            };
+            if start + buffer.len() > buf.len() {
+                buf.resize(start + buffer.len(), 0);
+            }
+            buf[start..start + buffer.len()].copy_from_slice(buffer);
+            buf.truncate(crate::ossfs::trash::MAX_RECYCLE_I_BYTES);
+            let size = buf.len() as u64;
+            context.logical_size.store(size, Ordering::Release);
+            let entry = DirEntry {
+                name: context.path.lock().unwrap().clone(),
+                is_dir: false,
+                size,
+                mtime_secs: 0,
+            };
+            *file_info = file_info_from(&entry, context.index());
+            return Ok(buffer.len() as u32);
         }
 
         // Streaming multipart already active: feed it directly (upload
@@ -1956,6 +2142,7 @@ mod tests {
             loaded: AtomicBool::new(loaded),
             dirty: AtomicBool::new(false),
             delete_on_close: AtomicBool::new(false),
+            capture_i: AtomicBool::new(false),
             dir_buffer: DirBuffer::new(),
             budget_units: AtomicUsize::new(0),
             budget_permits: Mutex::new(Vec::new()),
@@ -2393,5 +2580,375 @@ mod tests {
             0,
             "no GET for a refused extension"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // 单元 4:Windows 细化($I 捕获 / $R 拒绝 / HIDDEN|SYSTEM / SetDisposition)
+    // -------------------------------------------------------------------
+
+    /// 单元 4 测试日期(墓碑 key 分区,与 mod.rs/trash.rs 系统视图测试同构)。
+    fn sys_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 16).unwrap()
+    }
+
+    /// 单元 4:Windows 系统回收站视图状态(直接置 pub(crate) 字段,不走
+    /// build_trash_state —— 与 trash.rs 测试同构)。
+    fn system_trash_state() -> Arc<crate::ossfs::trash::TrashState> {
+        let mut state = crate::ossfs::trash::TrashState::new(
+            ".trash/".to_string(),
+            crate::ossfs::TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        Arc::get_mut(&mut state)
+            .expect("freshly created arc is uniquely owned")
+            .system = Some(crate::ossfs::trash::SystemTrash {
+            dir_name: "$Recycle.Bin".into(),
+            key_prefix: "$Recycle.Bin/".into(),
+            platform: crate::ossfs::trash::SystemTrashPlatform::WindowsRecycleBin,
+            macos_uid_dirs: vec![],
+        });
+        state
+    }
+
+    /// 单元 4:文件墓碑种子 —— 索引 insert + by_name/by_key + mock 对象
+    /// (与 mod.rs 测试的 seed_system_tombstone 同构,winfsp.rs 测试独立
+    /// 一份以覆盖 Windows 侧上下文)。
+    fn seed_tombstone(
+        mock: &MockS3,
+        trash: &Arc<crate::ossfs::trash::TrashState>,
+        original_key: &str,
+        recycle_name: &str,
+        etag: Option<&str>,
+        size: Option<u64>,
+    ) {
+        trash
+            .index
+            .write()
+            .unwrap()
+            .insert(original_key, false, sys_date());
+        let tomb_key = crate::ossfs::trash::encode_tombstone_key(
+            &trash.prefix,
+            sys_date(),
+            original_key,
+            false,
+        );
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert(recycle_name.to_string(), tomb_key);
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_key
+            .insert(original_key.to_string(), recycle_name.to_string());
+        let body = crate::ossfs::trash::TombstoneBody {
+            etag: etag.map(str::to_string),
+            size,
+            is_dir: false,
+            recycle_name: Some(recycle_name.to_string()),
+            recycle_i: None,
+        };
+        mock.set_object(&tomb_key, serde_json::to_vec(&body).unwrap());
+    }
+
+    /// WinFsp 驱动侧对象,无 safe 构造器:零初始化足够(回调只经
+    /// `as_mut()` 写入 file_info;FSP_FSCTL_OPEN_FILE_INFO 全零合法)。
+    fn open_info() -> OpenFileInfo {
+        unsafe { std::mem::zeroed() }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_delete_cancel_cleanup_preserves_file() {
+        // 裁决 R11 ③ 关键查证落地(SetDisposition 取消语义回归):
+        // set_delete(true) → set_delete(false) → cleanup(无 FspCleanupDelete)
+        // → 零 S3 请求、文件存活、无墓碑;正向对照确认 delete 仍生效。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("f", b"data".to_vec());
+        let mut fs = test_fs_with_budget(port, 32, None);
+        fs.trash = Some(system_trash_state()); // 软删开启:取消后不得产生墓碑
+        let (_fs, ctx) = test_mount(fs);
+        let file = test_file("/f");
+        // 探测序列:set_delete(true) 后取消(无粘性)
+        ctx.set_delete(file, w("\\f"), true)
+            .expect("set_delete(true)");
+        ctx.set_delete(file, w("\\f"), false)
+            .expect("set_delete(false) 取消");
+        assert!(!file.delete_on_close.load(Ordering::Acquire));
+        ctx.cleanup(file, None, 0); // 无 FspCleanupDelete 标志
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            0,
+            "取消后 cleanup 必须零 S3 请求"
+        );
+        assert!(mock.objects.lock().unwrap().contains_key("f"), "文件存活");
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with(".trash/")),
+            "取消后无墓碑"
+        );
+        // 正向对照:set_delete(true) + FspCleanupDelete → 软删(墓碑落盘)
+        ctx.set_delete(file, w("\\f"), true)
+            .expect("set_delete(true)");
+        ctx.cleanup(
+            file,
+            None,
+            winfsp::constants::FspCleanupFlags::FspCleanupDelete as u32,
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with(".trash/")),
+            "delete 生效应软删产生墓碑"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recycle_i_capture_create_write_close_lands_body() {
+        // 裁决 R8/R11:create+write+close 把 Explorer 的 $I 捕获字节落墓碑
+        // body(update 式写,保 etag/size);P8:桶中无真实 $I 对象。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let trash = system_trash_state();
+        fs.trash = Some(trash.clone());
+        seed_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            "$R4de00001a.txt",
+            Some("\"e-1\""),
+            Some(5),
+        );
+        let (fs, ctx) = test_mount(fs);
+        let mut fi = open_info();
+        let file = ctx
+            .create(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                0,
+                0,
+                0,
+                None,
+                0,
+                None,
+                false,
+                &mut fi,
+            )
+            .expect("create $I 进入捕获模式");
+        assert!(file.capture_i.load(Ordering::Acquire));
+        let bytes = vec![0x01u8, 0, 0, 0, 0x04, 0, 0, 0];
+        let mut wfi = FileInfo::default();
+        let written = ctx
+            .write_async(&file, &bytes, 0, false, false, &mut wfi)
+            .await
+            .expect("write $I 头");
+        assert_eq!(written as usize, bytes.len());
+        assert!(
+            !file.dirty.load(Ordering::Acquire),
+            "捕获句柄不置 dirty(flush/cleanup 不得 PUT)"
+        );
+        ctx.close(file);
+        // P8:唯一 PUT 是墓碑,桶中无 $I 对象
+        {
+            let recorded = mock.recorded.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .all(|r| r.method != "PUT" || !r.target.contains("$I4de00001a")),
+                "桶中不得出现真实 $I 对象"
+            );
+        }
+        let back: crate::ossfs::trash::TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i.as_deref(), Some(&bytes[..]));
+        assert_eq!(back.etag.as_deref(), Some("\"e-1\""), "etag 保留");
+        assert_eq!(back.size, Some(5), "size 保留");
+        // stat($I) size = 捕获字节长度
+        let e = fs
+            .stat("/$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt")
+            .await
+            .unwrap()
+            .expect("$I 条目");
+        assert_eq!(e.size, bytes.len() as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recycle_i_capture_truncates_over_4k_on_commit() {
+        // 端到端阈值验证:适配器写超 4KiB → close 提交时截断(阈值
+        // MAX_RECYCLE_I_BYTES 的消费侧,trash.rs 测试验证落点)。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let trash = system_trash_state();
+        fs.trash = Some(trash.clone());
+        seed_tombstone(&mock, &trash, "docs/a.txt", "$R4de00001a.txt", None, None);
+        let (_fs, ctx) = test_mount(fs);
+        let mut fi = open_info();
+        let file = ctx
+            .create(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                0,
+                0,
+                0,
+                None,
+                0,
+                None,
+                false,
+                &mut fi,
+            )
+            .expect("create $I");
+        let big = vec![0xCDu8; crate::ossfs::trash::MAX_RECYCLE_I_BYTES + 10];
+        let mut wfi = FileInfo::default();
+        ctx.write_async(&file, &big, 0, false, false, &mut wfi)
+            .await
+            .expect("write");
+        ctx.close(file);
+        let back: crate::ossfs::trash::TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(
+            back.recycle_i.unwrap().len(),
+            crate::ossfs::trash::MAX_RECYCLE_I_BYTES,
+            "超限截断"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recycle_r_write_denied_read_forwards() {
+        // 裁决 R11 ②:$R open-for-write → ACCESS_DENIED(只读预览放行);
+        // 读经 read_range 转发原 key(单元 1 拦截,请求键断言)。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.set_object("docs/a.txt", b"hello recycle".to_vec());
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let trash = system_trash_state();
+        fs.trash = Some(trash.clone());
+        seed_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            "$R4de00001a.txt",
+            None,
+            Some(11),
+        );
+        let (_fs, ctx) = test_mount(fs);
+        let mut fi = open_info();
+        let err = ctx
+            .open(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
+                0,
+                0x2,
+                &mut fi,
+            )
+            .expect_err("$R open-for-write 必须拒绝");
+        assert!(matches!(err, FspError::NTSTATUS(5)), "got {err:?}");
+        // 读放行 + 转发:内容 = 原对象 docs/a.txt
+        let file = ctx
+            .open(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
+                0,
+                0,
+                &mut fi,
+            )
+            .expect("$R 读打开放行");
+        let mut buf = [0u8; 32];
+        let n = ctx.read_async(&file, &mut buf, 0).await.expect("read");
+        assert_eq!(&buf[..n], b"hello recycle");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recycle_i_open_for_write_enters_capture_mode() {
+        // 裁决 R11 ②:$I open-for-write → 捕获句柄(缓冲权威,无懒加载);
+        // 普通文件 open-for-write 不进捕获。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let trash = system_trash_state();
+        fs.trash = Some(trash.clone());
+        seed_tombstone(&mock, &trash, "docs/a.txt", "$R4de00001a.txt", None, None);
+        mock.set_object("docs/plain.txt", b"x".to_vec());
+        let (_fs, ctx) = test_mount(fs);
+        let mut fi = open_info();
+        let file = ctx
+            .open(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                0,
+                0x2,
+                &mut fi,
+            )
+            .expect("open $I write");
+        assert!(file.capture_i.load(Ordering::Acquire));
+        assert!(
+            file.loaded.load(Ordering::Acquire),
+            "捕获缓冲权威:首个写不懒加载合成字节"
+        );
+        let file2 = ctx
+            .open(w("\\docs\\plain.txt"), 0, 0x2, &mut fi)
+            .expect("open plain write");
+        assert!(!file2.capture_i.load(Ordering::Acquire), "普通文件不进捕获");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn security_attributes_for_recycle_view() {
+        // 裁决 R10 属性矩阵:$Recycle.Bin/SID 目录 DIRECTORY|HIDDEN|SYSTEM;
+        // $R 仅 ARCHIVE;$I ARCHIVE|HIDDEN;普通文件不变。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let trash = system_trash_state();
+        fs.trash = Some(trash.clone());
+        seed_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            "$R4de00001a.txt",
+            None,
+            Some(5),
+        );
+        mock.set_object("docs/plain.txt", b"x".to_vec());
+        let (_fs, ctx) = test_mount(fs);
+        let sec = ctx
+            .get_security_by_name(w("\\$Recycle.Bin"), None, |_| None)
+            .expect("root dir");
+        assert_eq!(
+            sec.attributes,
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+        );
+        let sec = ctx
+            .get_security_by_name(w("\\$Recycle.Bin\\S-1-5-21-1"), None, |_| None)
+            .expect("sid dir");
+        assert_eq!(
+            sec.attributes,
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+        );
+        let sec = ctx
+            .get_security_by_name(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
+                None,
+                |_| None,
+            )
+            .expect("$R entry");
+        assert_eq!(sec.attributes, FILE_ATTRIBUTE_ARCHIVE);
+        let sec = ctx
+            .get_security_by_name(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                None,
+                |_| None,
+            )
+            .expect("$I entry");
+        assert_eq!(
+            sec.attributes,
+            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN
+        );
+        let sec = ctx
+            .get_security_by_name(w("\\docs\\plain.txt"), None, |_| None)
+            .expect("plain file");
+        assert_eq!(sec.attributes, FILE_ATTRIBUTE_ARCHIVE);
     }
 }
