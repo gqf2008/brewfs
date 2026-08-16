@@ -3087,8 +3087,11 @@ impl ObjectFs {
         // write() —— 同名重建 = 覆盖语义。清墓碑在提交写之后(裁决 #3):
         // PUT 失败 → 墓碑保留(软删除不被静默撤销,已删文件不复活);
         // 清墓碑失败 → Err,重试自愈。未覆盖时零远程请求(性能守卫)。
+        // 双形态门控(F1):rmdir /e 后再写文件 /e —— 目录墓碑 e/ 前缀
+        // 覆盖新文件 key,只清文件形态会静默不可见;此处 is_covered
+        // 裸 key 门控 + 文件/目录两形态一并清除。
         if let Some(trash) = &self.trash {
-            trash.clear_file_tombstone_if_covered(self, path).await?;
+            trash.clear_tombstones_if_covered(self, path).await?;
         }
         Ok(())
     }
@@ -3304,9 +3307,9 @@ impl ObjectFs {
         // 清墓碑挂点(C9 裁决修正):WinFsp overwrite 回调经
         // write_from_file()(winfsp.rs:518),是独立方法不走 write() ——
         // 与 write() 共享同一语义(同名重建清墓碑,且清墓碑在提交写之后,
-        // 裁决 #3:写失败时墓碑保留)。
+        // 裁决 #3:写失败时墓碑保留)。双形态门控同 write()(F1)。
         if let Some(trash) = &self.trash {
-            trash.clear_file_tombstone_if_covered(self, path).await?;
+            trash.clear_tombstones_if_covered(self, path).await?;
         }
         Ok(())
     }
@@ -3536,18 +3539,22 @@ impl ObjectFs {
             anyhow::bail!("directory / already exists");
         }
         self.invalidate_stat(path);
-        // 清目录墓碑:mkdir 同名重建 = 覆盖语义(目录墓碑精确项)。
-        // 未覆盖 → 零远程请求。mkdir 内部还会调 write() → 文件清墓碑
-        // 对目录 key 为 no-op(files 不含目录 key),可接受。
-        if let Some(trash) = &self.trash {
-            trash.clear_dir_tombstone_if_covered(self, path).await?;
-        }
         let dir = if path.ends_with('/') {
             path.to_string()
         } else {
             format!("{path}/")
         };
-        self.write(&dir, &[]).await
+        // marker 写提交在前,清墓碑在后(裁决 #3 / F2):marker 写失败 →
+        // 墓碑保留,软删除不被静默撤销(修复前:先清墓碑再写 marker,
+        // 写失败后已删目录复活、trash 追踪丢失)。清双形态(F1):unlink
+        // /e 后再 mkdir /e 的文件墓碑同样被清 —— stat("/e") 立即可用。
+        // write() 内部挂点已对目录 key 清过一次,此处门控 false 即零远程
+        // (幂等,双保险)。
+        self.write(&dir, &[]).await?;
+        if let Some(trash) = &self.trash {
+            trash.clear_tombstones_if_covered(self, path).await?;
+        }
+        Ok(())
     }
 
     /// Delete a single object.
@@ -3753,12 +3760,10 @@ impl ObjectFs {
             self.copy_tree(&old_key, &new_key).await?;
             // (b) 目标被墓碑覆盖 → copy 成功后清墓碑(rename = 覆盖语义)。
             // 清墓碑在 copy 之后(裁决 #3):copy 失败 → 墓碑保留(软删除
-            // 不被静默撤销);清墓碑失败 → rename 失败,重试自愈。
+            // 不被静默撤销);清墓碑失败 → rename 失败,重试自愈。清双形态
+            // (F1):unlink /e 后 rename 目录到 /e 的文件墓碑同样被清。
             if let Some(trash) = &self.trash {
-                let dir_new_key = format!("{new_key}/");
-                if trash.index.read().unwrap().is_covered(&dir_new_key) {
-                    trash.clear_dir_tombstone(self, &new_key).await?;
-                }
+                trash.clear_target_tombstones(self, &new_key).await?;
             }
             self.delete_dir_recursive_impl(old).await
         } else {
@@ -3778,13 +3783,10 @@ impl ObjectFs {
                 }
                 copy.send().await.context("s3 copy")?;
             }
-            // (b) 文件目标:copy 成功后清墓碑(与目录分支同语义,裁决 #3)
+            // (b) 文件目标:copy 成功后清墓碑(与目录分支同语义,裁决 #3;
+            // 双形态 F1:rmdir /e 后 rename 文件到 /e 的目录墓碑被清)。
             if let Some(trash) = &self.trash {
-                // 覆盖判定在作用域块内完成,索引读锁不跨 await(clippy 纪律)
-                let covered = { trash.index.read().unwrap().is_file_covered(&new_key) };
-                if covered {
-                    trash.clear_file_tombstone(self, &new_key).await?;
-                }
+                trash.clear_target_tombstones(self, &new_key).await?;
             }
             self.delete_impl(old).await
         }
@@ -7903,6 +7905,131 @@ mod s3_mock_tests {
         );
     }
 
+    // ===== F1/F2:跨形态同名重建(rmdir 后写文件 / unlink 后建目录)+ mkdir 失败窗口 =====
+
+    /// F1 回归:rmdir /e(目录墓碑 e/)后再写文件 /e —— 目录墓碑前缀覆盖
+    /// 新文件 key,修复前 write 只清文件形态(门控 is_file_covered 不含
+    /// 目录前缀),新文件写入成功但 list/stat 全部隐藏且无自愈(600s 全量
+    /// 重建也救不了,墓碑还在桶里)。修复后清双形态:新文件立即可见,
+    /// 索引无幽灵。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_form_recreate_file_after_rmdir_visible() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // rmdir /e → 目录墓碑 e/(空目录也可软删:不 HEAD、不枚举)
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir");
+        assert!(fs.stat("/e").await.unwrap().is_none(), "rmdir 后隐藏");
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // 跨形态重建:在目录墓碑上写同名文件
+        fs.write("/e", b"new").await.expect("写文件到原目录路径");
+
+        // 目录形态墓碑必须被清除(否则新文件被前缀覆盖隐藏)
+        let recorded = mock.recorded.lock().unwrap();
+        let dir_tomb_delete = recorded.iter().any(|r| {
+            r.method == "DELETE"
+                && r.target
+                    .split('?')
+                    .next()
+                    .is_some_and(|t| t.contains(".trash") && t.ends_with("/e/"))
+        });
+        assert!(dir_tomb_delete, "目录墓碑 e/ 必须被 DELETE: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "索引无幽灵");
+        assert!(fs.stat("/e").await.unwrap().is_some(), "新文件立即可见");
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().any(|e| e.name == "e"),
+            "list 立即可见: {root:?}"
+        );
+    }
+
+    /// F1 回归:unlink /e(文件墓碑 e)后再 mkdir /e —— 修复前 mkdir 门控
+    /// is_covered(dir_key "e/") 不命中文件墓碑,目录 marker 写入但
+    /// stat("/e") 返回 None,目录打不开、rename 被「source path is in
+    /// the trash」拦截。修复后清双形态:目录 stat Some、可进入、可写。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_form_recreate_dir_after_unlink_usable() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        // unlink 前原对象必须存在(mock 的 HEAD 只对 set_object 过的 key
+        // 返回 200,否则软删走 404 幂等分支不写墓碑)
+        mock.set_object("e", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/e").await.expect("soft delete file");
+        assert!(fs.stat("/e").await.unwrap().is_none(), "unlink 后隐藏");
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // 跨形态重建:在文件墓碑上建同名目录
+        fs.mkdir("/e").await.expect("mkdir 同名重建");
+
+        // 文件形态墓碑必须被清除(否则 stat("/e") 仍被文件墓碑隐藏)
+        let recorded = mock.recorded.lock().unwrap();
+        let file_tomb_delete = recorded.iter().any(|r| {
+            r.method == "DELETE"
+                && r.target
+                    .split('?')
+                    .next()
+                    .is_some_and(|t| t.contains(".trash") && t.ends_with("/e"))
+        });
+        assert!(file_tomb_delete, "文件墓碑 e 必须被 DELETE: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "索引无幽灵");
+        // 目录可用:stat Some、可进入、可写
+        assert!(fs.stat("/e").await.unwrap().is_some(), "目录立即可用");
+        assert!(fs.list("/e").await.unwrap().is_empty(), "可进入");
+        fs.write("/e/f.txt", b"x").await.expect("目录内可写");
+        assert!(fs.stat("/e/f.txt").await.unwrap().is_some());
+    }
+
+    /// F2 回归(mkdir 失败窗口):mkdir 的 marker 写失败 → 目录墓碑必须
+    /// 保留(软删除不被静默撤销,已删目录不得复活)。修复前:先清墓碑
+    /// 再写 marker,写失败后墓碑已被删、已删目录复活且 trash 追踪丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mkdir_failure_keeps_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("e/x", b"x".to_vec()); // rmdir 前子树对象
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir");
+        assert!(fs.stat("/e").await.unwrap().is_none());
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // marker 写失败(10 > 重试上限)
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let err = fs.mkdir("/e").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put"), "{err:?}");
+
+        // 墓碑仍在 → 索引仍覆盖 → 已删目录不得复活
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with(".trash/")),
+            "mkdir 失败后目录墓碑必须保留(软删除不得被静默撤销)"
+        );
+        assert_eq!(fs.metrics().trash_index_entries, 1, "索引仍覆盖");
+        assert!(
+            fs.stat("/e").await.unwrap().is_none(),
+            "mkdir 失败后已删目录不得复活"
+        );
+
+        // 故障恢复后重试 mkdir 收敛(清墓碑 + marker 写都成功)
+        mock.fail_put.store(0, Ordering::SeqCst);
+        fs.mkdir("/e").await.expect("重试 mkdir");
+        assert!(fs.stat("/e").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
     /// 裁决 #8:stat("/d/") 尾斜杠形态先入正值缓存 → soft_delete_dir 后
     /// 双形态都必须立即失效(修复前:soft_delete_dir 只失效裸形态
     /// invalidate_stat("/d") + clear_read_cache,stat("/d/") 缓存条目
@@ -8405,8 +8532,9 @@ mod s3_mock_tests {
     /// 裁决 #10:清墓碑按日期分区反向扫描(先查今天分区)—— 请求数从
     /// O(墓碑总数/页) 收紧为 O(分区数);全量覆盖(不做「首个命中即停」:
     /// 旧分区残留墓碑会让已提交写入在下次刷新后重新隐藏);今天分区最先
-    /// 探测。修复前:全量分页枚举 .trash(1 次 list),本测试断言 1+分区数
-    /// 次列表与探测顺序,旧实现必红。
+    /// 探测。修复前:全量分页枚举 .trash(1 次 list),本测试断言
+    /// 1+2×分区数次列表(文件+目录双形态,常量因子)与探测顺序,旧实现
+    /// 必红。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn clear_tombstones_partition_scan_bounded_and_full_coverage() {
         let today = trash::date_partition_utc(std::time::SystemTime::now());
@@ -8466,8 +8594,9 @@ mod s3_mock_tests {
             mock.objects.lock().unwrap().contains_key(&unrelated),
             "无关墓碑不得误删"
         );
-        // 请求数有界:1 次分区枚举(delimiter)+ 分区数次探测 —— 与墓碑
-        // 总数无关(修复前为 1 次全量分页枚举)
+        // 请求数有界:1 次分区枚举(delimiter)+ 分区数 × 2 形态(文件 +
+        // 目录)探测 —— 与墓碑总数无关,仅双形态常量因子(修复前单形态
+        // 为 1 次全量分页枚举,本断言约束 O(分区数) 上界不回归)
         let lists: Vec<String> = mock
             .requests
             .lock()
@@ -8476,7 +8605,11 @@ mod s3_mock_tests {
             .filter(|t| t.contains("list-type=2"))
             .cloned()
             .collect();
-        assert_eq!(lists.len(), 3, "1 delimiter 枚举 + 2 分区探测: {lists:?}");
+        assert_eq!(
+            lists.len(),
+            5,
+            "1 delimiter 枚举 + 2 分区 × 2 形态探测: {lists:?}"
+        );
         assert!(
             lists[0].contains("delimiter="),
             "第一笔必须是分区枚举(delimiter): {lists:?}"

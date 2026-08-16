@@ -605,8 +605,9 @@ pub struct TombstoneBody {
 }
 
 impl TombstoneIndex {
-    /// 仅 files 精确命中(不含 dirs 前缀覆盖)—— 清墓碑门控专用
-    /// (write/rename 目标门控:目录墓碑覆盖下的子路径创建不清祖先墓碑,V1 不做)。
+    /// 仅 files 精确命中(不含 dirs 前缀覆盖)—— 软删幂等门控专用
+    /// (soft_delete_file:索引已覆盖 → 幂等 Ok,零远程;重建入口的双形态
+    /// 门控见 [`Self::clear_tombstones_if_covered`])。
     pub fn is_file_covered(&self, key: &str) -> bool {
         self.files.contains(key)
     }
@@ -741,60 +742,100 @@ impl TrashState {
         Ok(())
     }
 
-    /// write 挂点(文件):仅当索引 files 精确覆盖 key 才动作 —— list
-    /// `.trash` 前缀,decode 精确匹配 `original_key == key && !is_dir` 的
-    /// 项逐个 DELETE(跨全部日期分区)→ index.remove + invalidate_stat(path)。
-    /// 未覆盖 → 零远程请求(性能守卫)。删除失败 → Err(write 失败)。
-    /// 入口级:调用链无外层 permit(write/write_from_file 的 permit 在
-    /// put_whole_object 内部),此处持一个 permit 完成列表+删除。
-    pub(crate) async fn clear_file_tombstone_if_covered(
+    /// 重建入口统一清墓碑挂点(write / write_from_file / mkdir):门控 =
+    /// 裸 key 的 is_covered(文件精确命中 或 目录前缀覆盖 —— 跨形态同名
+    /// 重建 F1 的双形态判定),覆盖则清文件+目录双形态墓碑。未覆盖 →
+    /// 零远程请求(性能守卫)。入口级:调用链无外层 permit
+    /// (write/write_from_file/mkdir 的 permit 在 put_whole_object 内部),
+    /// 此处持一个 permit 完成列表+删除。
+    pub(crate) async fn clear_tombstones_if_covered(
         &self,
         fs: &ObjectFs,
         path: &str,
     ) -> Result<()> {
         let key = fs.key_for(path);
-        if !self.index.read().unwrap().is_file_covered(&key) {
+        let bare = key.trim_end_matches('/');
+        if !self.index.read().unwrap().is_covered(bare) {
             return Ok(());
         }
         let _permit = fs.acquire().await?;
-        self.clear_tombstones_matching(fs, &key, false).await?;
+        self.clear_tombstones_both_forms(fs, &key).await?;
         fs.invalidate_stat(path);
         Ok(())
     }
 
-    /// mkdir 挂点:dir_key 带尾斜杠;is_covered(dir_key) → 清目录墓碑
-    /// (匹配 `original_key == dir_key && is_dir` 的精确项,跨全部分区)。
-    /// 子路径个体墓碑不清(文档化)。未覆盖 → 零远程请求。
-    pub(crate) async fn clear_dir_tombstone_if_covered(
-        &self,
-        fs: &ObjectFs,
-        dir_path: &str,
-    ) -> Result<()> {
-        let dir_key = format!("{}/", fs.key_for(dir_path).trim_end_matches('/'));
-        if !self.index.read().unwrap().is_covered(&dir_key) {
+    /// rename 目标清墓碑(调用方已持 limiter permit,内部不 acquire ——
+    /// 饱和池阻塞第二次 acquire 会死锁,#55 纪律)。门控与清双形态语义
+    /// 同 [`Self::clear_tombstones_if_covered`](F1:rmdir /e 后 rename
+    /// 文件到 /e 的目录墓碑、unlink /e 后 rename 目录到 /e 的文件墓碑
+    /// 均被清)。未覆盖 → 零远程请求。
+    pub(crate) async fn clear_target_tombstones(&self, fs: &ObjectFs, key: &str) -> Result<()> {
+        let bare = key.trim_end_matches('/');
+        if !self.index.read().unwrap().is_covered(bare) {
             return Ok(());
         }
-        let _permit = fs.acquire().await?;
-        self.clear_dir_tombstone(fs, &dir_key).await?;
-        fs.invalidate_stat(dir_path);
+        self.clear_tombstones_both_forms(fs, key).await
+    }
+
+    /// 清双形态墓碑(跨形态同名重建统一扫描,F1 裁决):文件形态(key 精确、
+    /// is_dir=false)与目录形态(key+"/"、is_dir=true)跨全部分区一并清除,
+    /// 索引两种形态条目一并移除(不存在时 remove 为 no-op —— 祖先墓碑
+    /// 覆盖下的子路径创建不清祖先墓碑,V1 语义不变)。
+    /// 请求数 = 1 次分区枚举 + 2×分区数次精确前缀探测(双形态,常量因子,
+    /// 裁决 #10 的 O(分区数) 有界不回归)。任一 DELETE 失败 → Err。
+    /// 锁纪律与旧 clear_tombstones_matching 相同:列表/删除期间不持
+    /// index 锁,仅收尾时短写锁。不 acquire permit:入口(_if_covered
+    /// 变体)或调用方(rename 的外层 permit)负责。
+    async fn clear_tombstones_both_forms(&self, fs: &ObjectFs, key: &str) -> Result<()> {
+        let file_key = key.trim_end_matches('/');
+        let dir_key = format!("{file_key}/");
+        let prefix = self.prefix.clone();
+        let mut to_delete: Vec<String> = Vec::new();
+        let partitions = Self::list_partitions_desc(fs, &prefix).await?;
+        for date in &partitions {
+            // 每分区两个精确前缀探测:文件形态与目录形态(各 0-2 键,
+            // 均经 decode 精确过滤 —— 目录形态探测不会误收文件墓碑)
+            for probe_key in [file_key, dir_key.as_str()] {
+                let probe = format!("{prefix}{date}/{probe_key}");
+                list_trash_keys(fs, None, Some(&probe), |page| {
+                    for k in page {
+                        if let Some(t) = decode_tombstone_key(&prefix, &k)
+                            && t.is_dir == (probe_key.ends_with('/'))
+                            && t.original_key == probe_key
+                        {
+                            to_delete.push(k);
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+        }
+        for k in &to_delete {
+            fs.client
+                .delete_object()
+                .bucket(&fs.bucket)
+                .key(k)
+                .send()
+                .await
+                .inspect_err(|_| {
+                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .inspect_err(|_| {
+                    fs.metrics.s3_delete_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .context("s3 delete tombstone")?;
+        }
+        // 扫描成功 = 远端已无对应形态墓碑(命中已删,或外部客户端先删 →
+        // 幽灵):无条件移除两种形态索引条目并同步 gauge —— 扫描无命中
+        // 即幽灵,立即解除隐藏(裁决 #4;不存在时 remove 为 no-op)。
+        {
+            let mut idx = self.index.write().unwrap();
+            idx.remove(file_key, false);
+            idx.remove(&dir_key, true);
+            self.store_index_entries(idx.len());
+        }
         Ok(())
-    }
-
-    /// rename 目标用:精确 key,跨所有日期分区,不预检。调用方
-    /// (rename_impl)已持 limiter permit —— 内部 helper 不再 acquire
-    /// (饱和池阻塞第二次 acquire 会死锁,#55 纪律)。
-    pub(crate) async fn clear_file_tombstone(&self, fs: &ObjectFs, key: &str) -> Result<()> {
-        self.clear_tombstones_matching(fs, key, false).await
-    }
-
-    /// rename 目标用:精确目录 key(内部归一化补尾斜杠),跨所有日期分区。
-    pub(crate) async fn clear_dir_tombstone(&self, fs: &ObjectFs, dir_key: &str) -> Result<()> {
-        let dir_key = if dir_key.ends_with('/') {
-            dir_key.to_string()
-        } else {
-            format!("{dir_key}/")
-        };
-        self.clear_tombstones_matching(fs, &dir_key, true).await
     }
 
     /// 枚举 .trash 下全部日期分区(common prefixes,delimiter 扫描,
@@ -840,72 +881,6 @@ impl TrashState {
         parts.sort_unstable_by(|a, b| b.cmp(a)); // 降序:今天分区最先
         parts.dedup();
         Ok(parts)
-    }
-
-    /// 分页 list trash 前缀,decode 精确匹配 `original_key == target &&
-    /// is_dir` 后逐个 DELETE;全部成功后索引 remove + gauge store。
-    /// 任一 DELETE 失败 → Err(调用方决定整体失败)。
-    /// 锁纪律:列表/删除期间不持 index 锁,仅收尾时短写锁。
-    /// 不 acquire permit:permit 由入口(_if_covered 变体)或调用方
-    /// (rename_impl 的外层 permit)负责,此处只做请求。
-    ///
-    /// 扫描策略(裁决 #10):按日期分区**反向**扫描 —— 先枚举分区
-    /// (1 次 delimiter list),再逐分区精确前缀探测、最新在前(今天
-    /// 分区最先:同日删除+重建最常见,第一笔请求即命中并删除)。请求数
-    /// 从 O(墓碑总数/页) 收紧为 O(分区数)(≤ 保留窗口,有界)。**全量
-    /// 覆盖,不做「首个命中即停」**:旧分区残留墓碑会让已提交写入在下次
-    /// 刷新后重新隐藏(静默回归),跨分区同名墓碑(跨日删除链)必须全清。
-    async fn clear_tombstones_matching(
-        &self,
-        fs: &ObjectFs,
-        target: &str,
-        is_dir: bool,
-    ) -> Result<()> {
-        let prefix = self.prefix.clone();
-        let mut to_delete: Vec<String> = Vec::new();
-        let partitions = Self::list_partitions_desc(fs, &prefix).await?;
-        for date in &partitions {
-            // 精确前缀探测:仅该分区的同名墓碑(含目录尾斜杠变体与子路径
-            // 同名键,均经 decode 精确过滤),页面恒为 0-2 键。
-            let probe = format!("{prefix}{date}/{target}");
-            list_trash_keys(fs, None, Some(&probe), |page| {
-                for k in page {
-                    if let Some(t) = decode_tombstone_key(&prefix, &k)
-                        && t.is_dir == is_dir
-                        && t.original_key == target
-                    {
-                        to_delete.push(k);
-                    }
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        for k in &to_delete {
-            fs.client
-                .delete_object()
-                .bucket(&fs.bucket)
-                .key(k)
-                .send()
-                .await
-                .inspect_err(|_| {
-                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
-                })
-                .inspect_err(|_| {
-                    fs.metrics.s3_delete_errors.fetch_add(1, Ordering::Relaxed);
-                })
-                .context("s3 delete tombstone")?;
-        }
-        // 扫描成功 = 远端已无该墓碑(命中已删,或外部客户端先删 → 幽灵):
-        // 无条件移除索引条目并同步 gauge —— 扫描无命中即幽灵,立即解除
-        // 隐藏(裁决 #4;修复前跳过后同名重建文件最长 600s 不可见)。
-        // 不存在时 remove 为 no-op(祖先墓碑覆盖下的 mkdir 等,安全)。
-        {
-            let mut idx = self.index.write().unwrap();
-            idx.remove(target, is_dir);
-            self.store_index_entries(idx.len());
-        }
-        Ok(())
     }
 
     /// PUT 墓碑小对象:serde_json body + content_type("application/json");
