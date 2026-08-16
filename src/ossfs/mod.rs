@@ -3065,19 +3065,21 @@ impl ObjectFs {
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
+        let _budget = self.acquire_upload_budget(data.len()).await?;
+        if data.len() as u64 > MULTIPART_THRESHOLD {
+            self.write_multipart(path, data).await?;
+        } else {
+            let _permit = self.acquire().await?;
+            self.put_whole_object(path, data).await?;
+        }
         // 清墓碑挂点(C9 裁决):FUSE create / WinFsp create 均收敛到
-        // write() —— 同名重建 = 覆盖语义,PUT 前清该路径墓碑。
-        // 未覆盖时零远程请求(性能守卫)。
+        // write() —— 同名重建 = 覆盖语义。清墓碑在提交写之后(裁决 #3):
+        // PUT 失败 → 墓碑保留(软删除不被静默撤销,已删文件不复活);
+        // 清墓碑失败 → Err,重试自愈。未覆盖时零远程请求(性能守卫)。
         if let Some(trash) = &self.trash {
             trash.clear_file_tombstone_if_covered(self, path).await?;
         }
-        let _budget = self.acquire_upload_budget(data.len()).await?;
-        if data.len() as u64 > MULTIPART_THRESHOLD {
-            self.write_multipart(path, data).await
-        } else {
-            let _permit = self.acquire().await?;
-            self.put_whole_object(path, data).await
-        }
+        Ok(())
     }
 
     async fn put_whole_object(&self, path: &str, data: &[u8]) -> Result<()> {
@@ -3280,20 +3282,22 @@ impl ObjectFs {
             .fetch_add(size, Ordering::Relaxed);
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
-        // 清墓碑挂点(C9 裁决修正):WinFsp overwrite 回调经
-        // write_from_file()(winfsp.rs:518),是独立方法不走 write() ——
-        // 与 write() 共享同一语义(同名重建清墓碑)。
-        if let Some(trash) = &self.trash {
-            trash.clear_file_tombstone_if_covered(self, path).await?;
-        }
         let _budget = self.acquire_upload_budget(size as usize).await?;
         if size > MULTIPART_THRESHOLD {
-            self.write_multipart_from_file(path, src, size).await
+            self.write_multipart_from_file(path, src, size).await?;
         } else {
             let data = tokio::fs::read(src).await.context("read spool file")?;
             let _permit = self.acquire().await?;
-            self.put_whole_object(path, &data).await
+            self.put_whole_object(path, &data).await?;
         }
+        // 清墓碑挂点(C9 裁决修正):WinFsp overwrite 回调经
+        // write_from_file()(winfsp.rs:518),是独立方法不走 write() ——
+        // 与 write() 共享同一语义(同名重建清墓碑,且清墓碑在提交写之后,
+        // 裁决 #3:写失败时墓碑保留)。
+        if let Some(trash) = &self.trash {
+            trash.clear_file_tombstone_if_covered(self, path).await?;
+        }
+        Ok(())
     }
 
     /// Multipart upload reading part chunks directly from `src`, bounded by
@@ -3716,20 +3720,9 @@ impl ObjectFs {
         let is_dir = stat.as_ref().map(|e| e.is_dir).unwrap_or(false);
         let size = stat.map(|e| e.size).unwrap_or(0);
 
-        // (b) 目标被墓碑覆盖 → 提交点前清墓碑(rename = 覆盖语义)。
-        // 文件目标:files 精确命中;目录目标:dirs 前缀覆盖。清墓碑失败
-        // → rename 整体失败(提交点前零副作用)。
-        if let Some(trash) = &self.trash {
-            if is_dir {
-                let dir_new_key = format!("{new_key}/");
-                if trash.index.read().unwrap().is_covered(&dir_new_key) {
-                    trash.clear_dir_tombstone(self, &new_key).await?;
-                }
-            } else if trash.index.read().unwrap().is_file_covered(&new_key) {
-                trash.clear_file_tombstone(self, &new_key).await?;
-            }
-        }
-
+        // (0) 目录 rename 的全部失败检查前移到清墓碑之前(裁决 #3):
+        // 超限检查失败时目标墓碑必须原样保留 —— 修复前「先清墓碑再
+        // count」,超限 bail 后已删目录子树永久复活、trash 追踪丢失。
         if is_dir {
             if !self.allow_rename_dir {
                 anyhow::bail!("directory rename is disabled");
@@ -3742,8 +3735,20 @@ impl ObjectFs {
                     );
                 }
             }
+        }
+
+        if is_dir {
             // Directory: copy the marker + every child recursively.
             self.copy_tree(&old_key, &new_key).await?;
+            // (b) 目标被墓碑覆盖 → copy 成功后清墓碑(rename = 覆盖语义)。
+            // 清墓碑在 copy 之后(裁决 #3):copy 失败 → 墓碑保留(软删除
+            // 不被静默撤销);清墓碑失败 → rename 失败,重试自愈。
+            if let Some(trash) = &self.trash {
+                let dir_new_key = format!("{new_key}/");
+                if trash.index.read().unwrap().is_covered(&dir_new_key) {
+                    trash.clear_dir_tombstone(self, &new_key).await?;
+                }
+            }
             self.delete_dir_recursive_impl(old).await
         } else {
             if size >= MULTIPART_COPY_THRESHOLD {
@@ -3761,6 +3766,12 @@ impl ObjectFs {
                     copy = copy.storage_class(sc.clone());
                 }
                 copy.send().await.context("s3 copy")?;
+            }
+            // (b) 文件目标:copy 成功后清墓碑(与目录分支同语义,裁决 #3)
+            if let Some(trash) = &self.trash {
+                if trash.index.read().unwrap().is_file_covered(&new_key) {
+                    trash.clear_file_tombstone(self, &new_key).await?;
+                }
             }
             self.delete_impl(old).await
         }
@@ -7820,6 +7831,91 @@ mod s3_mock_tests {
             fs.metrics().trash_index_entries,
             0,
             "幽灵索引条目必须移除并同步 gauge"
+        );
+    }
+
+    /// 裁决 #3 回归:同名重建 write 的 PUT 失败 → 墓碑必须保留(软删除
+    /// 不被静默撤销)。修复前:先清墓碑再 PUT,PUT 失败后已删文件带旧内容
+    /// 永久可见、trash 索引/GC 追踪丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_put_failure_keeps_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        mock.recorded.lock().unwrap().clear();
+
+        // 之后所有 PUT 失败(10 > SDK 默认 3 次重试)
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let err = fs.write("/a.txt", b"new").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put"), "{err:?}");
+
+        // 墓碑仍在(mock 远端墓碑对象仍在)→ 索引仍覆盖 → 文件仍隐藏
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with(".trash/")),
+            "write PUT 失败后墓碑必须保留(软删除不得被静默撤销)"
+        );
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            1,
+            "索引仍覆盖(墓碑未清)"
+        );
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_none(),
+            "PUT 失败后已删文件不得复活"
+        );
+
+        // 故障恢复后重试 write 收敛(清墓碑 + PUT 都成功)
+        mock.fail_put.store(0, Ordering::SeqCst);
+        fs.write("/a.txt", b"new").await.expect("重试 write");
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 裁决 #3 回归:目录 rename 目标被墓碑覆盖 + 源超 rename-dir-limit →
+    /// 失败检查(count)必须发生在清墓碑之前;超限 bail 后墓碑仍在(修复前:
+    /// 先清墓碑再 count,超限 bail 后已删目录子树永久复活、trash 追踪丢失)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_over_limit_keeps_tombstone() {
+        let entries = vec![
+            ("d/a.txt".to_string(), false),
+            ("d/b.txt".to_string(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("d/a.txt", b"x".to_vec());
+        mock.set_object("d/b.txt", b"y".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rename_dir_limit = Some(1);
+        fs.delete_dir_recursive("/e").await.expect("soft delete dir e");
+        mock.recorded.lock().unwrap().clear();
+
+        let err = fs.rename("/d", "/e", false).await.unwrap_err();
+        assert!(err.to_string().contains("rename-dir-limit"), "{err:?}");
+        // 失败检查在清墓碑之前:超限 bail 前不得发生任何 .trash DELETE
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            !recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
+            "超限 bail 前不得清墓碑: {recorded:?}"
+        );
+        drop(recorded);
+        // 墓碑仍在 → 索引仍覆盖 → 视图仍隐藏(已删目录不得复活)
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            1,
+            "目录墓碑索引必须保留"
+        );
+        assert!(
+            fs.stat("/e").await.unwrap().is_none(),
+            "rename 超限失败后已删目录不得复活"
         );
     }
 
