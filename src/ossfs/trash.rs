@@ -687,8 +687,13 @@ fn de_naive_date<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreOutcome {
     /// 已恢复(墓碑已删,原对象立即复活);etag_mismatch=true 表示
-    /// 墓碑 etag 与当前原对象不一致,恢复的是当前内容(已警告)
-    Restored { etag_mismatch: bool },
+    /// 墓碑 etag 与当前原对象不一致,恢复的是当前内容(已警告);
+    /// multiple_versions=true 表示同名存在多个日期墓碑,仅清除了最旧
+    /// 一条 —— 调用方(CLI)应提示用户用 --date 指定版本(L6)。
+    Restored {
+        etag_mismatch: bool,
+        multiple_versions: bool,
+    },
     /// 墓碑存在但原对象 HEAD 404(已 GC / 其他端删):按 §7 顺序约定
     /// 清墓碑,不留空引用
     OriginalGone,
@@ -716,8 +721,10 @@ pub struct GcReport {
 /// GC 选项(契约 C10,全 pub)。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GcOptions {
-    /// 只处理日期分区严格早于该日期的;None = today - TRASH_RETENTION_DAYS
-    /// (严格早于,边界日不清;--before 只收紧不放松)
+    /// 只处理日期分区严格早于该日期的;None = today - 保留期(严格早于,
+    /// 边界日不清)。**--before 只收紧不放松**:晚于默认保留期的 --before
+    /// 无效 —— cutoff = min(before, today - retention_days)(L7 文档口径;
+    /// 按字段字面语义实现会破坏 retention 对近期墓碑的保护)。
     pub before: Option<chrono::NaiveDate>,
     /// 只报告不删除(trash-clean --dry-run;判定照做,删除动作跳过)
     pub dry_run: bool,
@@ -1040,20 +1047,22 @@ impl TrashState {
 
     // ---------- 单元 4:管理命令与 GC ----------
 
-    /// 找原 key 的墓碑:date Some → 快速路径直查 `.trash/<date>/<key>`
+    /// 找原 key 的全部墓碑:date Some → 快速路径直查 `.trash/<date>/<key>`
     /// 与 `.trash/<date>/<key>/` 两形(精确前缀探测,各 0-1 键);date
     /// None → 全量分页扫描(管理命令成本,规格 4.4 风险 5 文档化)。
-    /// 返回 (date, is_dir);外部杂项 key 经 decode 校验跳过。
+    /// 返回全部命中按 (date, is_dir) 升序(最旧在前);外部杂项 key 经
+    /// decode 校验跳过。多命中即 L6 场景(同名多日期墓碑 / 文件目录
+    /// 双形):restore 只清最旧一条并标记 multiple_versions。
     pub(crate) async fn find_tombstone(
         &self,
         fs: &ObjectFs,
         key: &str,
         date: Option<chrono::NaiveDate>,
-    ) -> Result<Option<(chrono::NaiveDate, bool)>> {
+    ) -> Result<Vec<(chrono::NaiveDate, bool)>> {
         let prefix = self.prefix.clone();
         let file_key = key.trim_end_matches('/');
         let dir_key = format!("{file_key}/");
-        let mut hit: Option<(chrono::NaiveDate, bool)> = None;
+        let mut hits: Vec<(chrono::NaiveDate, bool)> = Vec::new();
         if let Some(d) = date {
             for probe in [file_key, dir_key.as_str()] {
                 let p = format!("{prefix}{d}/{probe}");
@@ -1062,30 +1071,29 @@ impl TrashState {
                         if let Some(t) = decode_tombstone_key(&prefix, &k)
                             && t.original_key == probe
                         {
-                            hit = Some((t.date, t.is_dir));
+                            hits.push((t.date, t.is_dir));
                         }
                     }
                     Ok(())
                 })
                 .await?;
             }
-            return Ok(hit);
+            hits.sort(); // (date, is_dir) 升序,最旧在前
+            return Ok(hits);
         }
         list_trash_keys(fs, None, None, |page| {
             for k in page {
-                if hit.is_some() {
-                    continue;
-                }
                 if let Some(t) = decode_tombstone_key(&prefix, &k)
                     && (t.original_key == file_key || t.original_key == dir_key)
                 {
-                    hit = Some((t.date, t.is_dir));
+                    hits.push((t.date, t.is_dir));
                 }
             }
             Ok(())
         })
         .await?;
-        Ok(hit)
+        hits.sort(); // 最旧在前:restore 无 --date 恢复最旧一条(L6)
+        Ok(hits)
     }
 
     /// 恢复:删墓碑 + 索引 remove + 缓存失效 → 原对象立即复活。
@@ -1101,9 +1109,13 @@ impl TrashState {
         date: Option<chrono::NaiveDate>,
     ) -> Result<RestoreOutcome> {
         let key = fs.key_for(path);
-        let Some((d, is_dir)) = self.find_tombstone(fs, &key, date).await? else {
+        let hits = self.find_tombstone(fs, &key, date).await?;
+        let Some(&(d, is_dir)) = hits.first() else {
             return Ok(RestoreOutcome::NoTombstone);
         };
+        // L6:同名多日期墓碑(或文件/目录双形)时只清最旧一条 —— 其余
+        // 仍隐藏 key,调用方(CLI)据此提示用户用 --date 指定版本。
+        let multiple_versions = hits.len() > 1;
         // L2:入口持一个 permit 覆盖 find_tombstone 之后的 HEAD/GET/DELETE
         // (head_original/read_tombstone 的「调用方已持 permit」契约;
         // delete_tombstone 不再内部 acquire —— 饱和池二次 acquire 死锁,
@@ -1122,6 +1134,7 @@ impl TrashState {
             self.delete_tombstone(fs, &tomb_key).await?;
             RestoreOutcome::Restored {
                 etag_mismatch: false,
+                multiple_versions,
             }
         } else {
             // 文件:HEAD 原对象校验(三分支)
@@ -1153,6 +1166,7 @@ impl TrashState {
                     self.delete_tombstone(fs, &tomb_key).await?;
                     RestoreOutcome::Restored {
                         etag_mismatch: mismatched,
+                        multiple_versions,
                     }
                 }
             }

@@ -9023,7 +9023,8 @@ mod s3_mock_tests {
         assert_eq!(
             out,
             trash::RestoreOutcome::Restored {
-                etag_mismatch: false
+                etag_mismatch: false,
+                multiple_versions: false,
             }
         );
         let recorded = mock.recorded.lock().unwrap();
@@ -9046,7 +9047,8 @@ mod s3_mock_tests {
         assert_eq!(
             out,
             trash::RestoreOutcome::Restored {
-                etag_mismatch: false
+                etag_mismatch: false,
+                multiple_versions: false,
             }
         );
         assert!(fs.stat("/a.txt").await.unwrap().is_some());
@@ -9057,7 +9059,8 @@ mod s3_mock_tests {
         assert_eq!(
             out,
             trash::RestoreOutcome::Restored {
-                etag_mismatch: false
+                etag_mismatch: false,
+                multiple_versions: false,
             }
         );
         assert_eq!(fs.metrics().trash_index_entries, 0, "目录索引 remove");
@@ -9077,7 +9080,8 @@ mod s3_mock_tests {
         assert_eq!(
             out,
             trash::RestoreOutcome::Restored {
-                etag_mismatch: true
+                etag_mismatch: true,
+                multiple_versions: false,
             },
             "etag 不一致仍恢复,但必须标记"
         );
@@ -9152,38 +9156,163 @@ mod s3_mock_tests {
         let hit = trash_state
             .find_tombstone(&fs, "a.txt", None)
             .await
-            .unwrap()
-            .expect("文件墓碑命中");
-        assert_eq!(hit, (d, false));
+            .unwrap();
+        assert_eq!(hit, vec![(d, false)], "文件墓碑命中");
         // 目录形(输入无尾斜杠 → 匹配 key+"/")
-        let hit = trash_state
-            .find_tombstone(&fs, "docs", None)
-            .await
-            .unwrap()
-            .expect("目录墓碑命中");
-        assert_eq!(hit, (d, true));
+        let hit = trash_state.find_tombstone(&fs, "docs", None).await.unwrap();
+        assert_eq!(hit, vec![(d, true)], "目录墓碑命中");
         // 未命中
         assert!(
             trash_state
                 .find_tombstone(&fs, "nope.txt", None)
                 .await
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         // date 快速路径
         let hit = trash_state
             .find_tombstone(&fs, "a.txt", Some(d))
             .await
-            .unwrap()
-            .expect("date 快速路径");
-        assert_eq!(hit, (d, false));
+            .unwrap();
+        assert_eq!(hit, vec![(d, false)], "date 快速路径");
         assert!(
             trash_state
                 .find_tombstone(&fs, "a.txt", Some(days_before(29)))
                 .await
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "错误日期不命中"
+        );
+    }
+
+    /// L6 回归:同名多日期墓碑下 trash-restore 无 --date —— 恢复最旧一条
+    /// 并标记 multiple_versions(CLI 据此提示用 --date 指定版本),较新
+    /// 墓碑保留 —— 否则 CLI 报「已恢复」而 key 仍被较新墓碑隐藏。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_without_date_reports_multiple_versions() {
+        let d_old = days_before(20);
+        let d_new = days_before(3);
+        let entries = vec![
+            (format!(".trash/{d_old}/a.txt"), false),
+            (format!(".trash/{d_new}/a.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        for key in [
+            format!(".trash/{d_old}/a.txt"),
+            format!(".trash/{d_new}/a.txt"),
+        ] {
+            seed_tombstone(
+                &mock,
+                &key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 无 --date:恢复最旧一条 + multiple_versions 标记
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: true,
+            },
+            "多版本必须标记(L6)"
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "最旧墓碑被清"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_new}/a.txt")),
+            "较新墓碑保留(key 仍被隐藏,提示用户用 --date)"
+        );
+        // --date 精确指定:恢复较新版本,单命中无标记
+        let out = fs.trash_restore("/a.txt", Some(d_new)).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            }
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_new}/a.txt")),
+            "--date 指定的版本墓碑被清"
+        );
+        // 全部墓碑已清后 NoTombstone
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(out, trash::RestoreOutcome::NoTombstone);
+    }
+
+    /// L7 语义钉:--before 晚于默认保留期 → 无效(cutoff 仍为 today-
+    /// retention,只收紧不放松)—— 31 天前墓碑仍被清(30 天保留),29 天
+    /// 前保留;用户以为「清 8/1 前」实际只清保留期之前。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_before_later_than_retention_is_ignored() {
+        let d_31 = days_before(31);
+        let d_29 = days_before(29);
+        let entries = vec![
+            (format!(".trash/{d_31}/a.txt"), false),
+            (format!(".trash/{d_29}/b.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        for (obj, tomb_key) in [
+            ("a.txt", format!(".trash/{d_31}/a.txt")),
+            ("b.txt", format!(".trash/{d_29}/b.txt")),
+        ] {
+            mock.set_object(obj, vec![1]);
+            mock.set_etag(obj, "mock-etag");
+            seed_tombstone(
+                &mock,
+                &tomb_key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // before = 5 天前,晚于 30 天保留期 → 无效
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: Some(days_before(5)),
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            report.files_removed, 1,
+            "--before 晚于保留期无效:仍按 30 天保留期清理"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("a.txt"),
+            "31 天前(超保留期)被清"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "29 天前(保留期内)保留"
         );
     }
 
@@ -9691,7 +9820,8 @@ mod s3_mock_tests {
         assert_eq!(
             out,
             trash::RestoreOutcome::Restored {
-                etag_mismatch: false
+                etag_mismatch: false,
+                multiple_versions: false,
             },
             "单 permit 下 restore 必须完成且不二次 acquire 死锁(L2)"
         );

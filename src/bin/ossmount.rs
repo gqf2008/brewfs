@@ -51,8 +51,8 @@ fn usage_text() -> String {
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
          --trash-dir NAME:  trash (soft delete) directory, default ON as .trash\n\
-                           (deleted objects stay until GC, default 30-day retention;\n\
-                           restore / GC commands land in 0.2.0);\n\
+                           (deleted objects stay until GC: default 30-day retention,\n\
+                           --trash-retention-days N to override);\n\
                            --no-trash restores immediate permanent delete\n\
          --trash-refresh-mode lazy|eager:  trash refresh policy, default lazy\n\
                            (eager refreshes tombstones before every list/stat,\n\
@@ -66,6 +66,8 @@ subcommands:\n\
   trash-list [--json] [--trash-dir PATH] (connection args below)\n\
   trash-restore <path> [--date YYYY-MM-DD] [--trash-dir PATH]\n\
   trash-clean [--before YYYY-MM-DD] [--dry-run] [--trash-dir PATH]\n\
+                  (--before only tightens the default retention window:\n\
+                   dates later than today-N retention days are ignored)\n\
   trash options: --trash-dir PATH --trash-retention-days N\n\
                   --trash-refresh-interval-secs N --trash-refresh-mode lazy|eager\n\
                   --trash-gc-interval-secs N --no-trash (mount only)\n\
@@ -1165,9 +1167,19 @@ async fn run_trash_command(cmd: TrashCommand, conn_args: Vec<String>) -> anyhow:
             .await?;
         }
         TrashCommand::Restore { path, date } => match fs.trash_restore(&path, date).await? {
-            ossfs::trash::RestoreOutcome::Restored { etag_mismatch } => {
+            ossfs::trash::RestoreOutcome::Restored {
+                etag_mismatch,
+                multiple_versions,
+            } => {
                 if etag_mismatch {
                     eprintln!("警告:内容已被其他端修改,恢复的是当前内容");
+                }
+                if multiple_versions {
+                    // L6:同名多日期墓碑只清了最旧一条,key 可能仍被较新
+                    // 墓碑隐藏 —— 必须提示,否则用户以为已恢复。
+                    eprintln!(
+                        "警告:存在 {path} 的多个版本墓碑,仅清除了最旧一条;请用 --date 指定恢复特定版本"
+                    );
                 }
                 println!("已恢复 {path}");
             }
