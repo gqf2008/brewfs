@@ -1246,6 +1246,58 @@ impl TrashState {
         Ok(Some(out))
     }
 
+    /// $I 名 → 对应 $R 墓碑是否已在 by_name 反向索引(单元 4 捕获窗口
+    /// 判定,裁决 R11 ②:「$I 形态且对应 $R 墓碑存在」的零远程检查)。
+    /// 非 $I 形态恒 false;索引未覆盖(如跨客户端软删未刷新)返回 false,
+    /// 调用方退化为普通写路径(真实对象)。
+    pub(crate) fn i_entry_has_r_tombstone(&self, entry_name: &str) -> bool {
+        let Some(r_name) = i_to_r_name(entry_name) else {
+            return false;
+        };
+        self.recycle_names
+            .read()
+            .unwrap()
+            .by_name
+            .contains_key(&r_name)
+    }
+
+    /// $I 捕获落 body(单元 4,裁决 R8 捕获为主):`entry_name` 为 $I 名,
+    /// 反查对应 $R 墓碑 → GET body → 设 recycle_i(>MAX_RECYCLE_I_BYTES
+    /// 截断)→ PUT。update 式写:整 body 重写,etag/size 字段原样保留
+    /// (serde 往返,保 etag/size)。未命中(捕获丢失,如 $R 在另一客户端
+    /// 软删而本端索引未刷新)→ warn + no-op —— 不可因 $I 缺失拒绝
+    /// restore(Agent 2 risk 7)。幂等:重入再次捕获覆盖。
+    /// 调用方不持 limiter permit(resolve_entry 冷路径内部自持;此处再
+    /// 持一个覆盖 read_tombstone + write_tombstone,顺序 acquire 无死锁)。
+    pub(crate) async fn set_recycle_i(
+        &self,
+        fs: &ObjectFs,
+        entry_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let Some(r_name) = i_to_r_name(entry_name) else {
+            return Ok(()); // 非 $I 形态:防御性 no-op(调用方已限定)
+        };
+        let Some(resolved) = self.resolve_entry(fs, &r_name, true).await? else {
+            tracing::warn!(
+                entry_name,
+                "recycle bin $I capture: 对应 $R 墓碑未解析,recycle_i 不落 body(不阻塞 restore)"
+            );
+            return Ok(());
+        };
+        let _permit = fs.acquire().await?;
+        let Some(mut body) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+            tracing::warn!(
+                tomb_key = %resolved.tomb_key,
+                "recycle bin $I capture: 墓碑并发删除,丢弃捕获字节"
+            );
+            return Ok(());
+        };
+        body.recycle_i = Some(bytes.into_iter().take(MAX_RECYCLE_I_BYTES).collect());
+        self.write_tombstone(fs, &resolved.tomb_key, &body).await?;
+        Ok(())
+    }
+
     /// 墓碑删除的统一收尾:recycle_names 清理(by_name 中指向已删墓碑键
     /// 的条目;原 key 已无存活墓碑时移除 by_key 映射 —— 多日期墓碑清旧
     /// 留新时映射仍有效,裁决 R7)。seen_sids 不在此清理(条目与 SID 无
@@ -3447,5 +3499,235 @@ mod tests {
         );
         assert!(applied, "当前代际快照正常应用");
         assert!(state.index.read().unwrap().is_covered("y.txt"));
+    }
+
+    // ---------- 单元 4:$I 捕获落 body(set_recycle_i) ----------
+
+    /// 单元 4 统一种子:文件墓碑(索引 + by_name/by_key + mock 对象)。
+    /// recycle_name None 模拟「索引有、反向索引未填充」的跨端场景
+    /// (裁决 R3 ③ 冷路径)。
+    fn seed_win_tombstone(
+        mock: &crate::ossfs::MockS3,
+        trash: &TrashState,
+        original_key: &str,
+        recycle_name: Option<&str>,
+        etag: Option<&str>,
+        size: Option<u64>,
+    ) {
+        trash
+            .index
+            .write()
+            .unwrap()
+            .insert(original_key, false, d((2026, 8, 16)));
+        let tomb_key = encode_tombstone_key(&trash.prefix, d((2026, 8, 16)), original_key, false);
+        if let Some(name) = recycle_name {
+            trash
+                .recycle_names
+                .write()
+                .unwrap()
+                .by_name
+                .insert(name.to_string(), tomb_key.clone());
+            trash
+                .recycle_names
+                .write()
+                .unwrap()
+                .by_key
+                .insert(original_key.to_string(), name.to_string());
+        }
+        let body = TombstoneBody {
+            etag: etag.map(str::to_string),
+            size,
+            is_dir: false,
+            recycle_name: recycle_name.map(str::to_string),
+            recycle_i: None,
+        };
+        mock.set_object(&tomb_key, serde_json::to_vec(&body).unwrap());
+    }
+
+    fn plain_put_targets(mock: &crate::ossfs::MockS3) -> Vec<String> {
+        mock.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && {
+                    let q = r.target.to_lowercase();
+                    !q.contains("partnumber") && !q.contains("uploadid")
+                }
+            })
+            .map(|r| r.target.clone())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_recycle_i_updates_tombstone_body_preserving_etag_size() {
+        // 裁决 R8:捕获字节落墓碑 body(update 式写,保 etag/size);
+        // P8:桶中无真实 $I 对象(唯一 PUT 是墓碑)。
+        let (mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::ZERO).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let trash = win_state();
+        fs.trash = Some(trash.clone());
+        seed_win_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            Some("$R4de00001a.txt"),
+            Some("\"e-tag-1\""),
+            Some(42),
+        );
+        let bytes = vec![0x01u8, 0, 0, 0, 0x11, 0x22];
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", bytes.clone())
+            .await
+            .expect("set_recycle_i");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i.as_deref(), Some(&bytes[..]));
+        assert_eq!(back.etag.as_deref(), Some("\"e-tag-1\""), "etag 保留");
+        assert_eq!(back.size, Some(42), "size 保留");
+        assert_eq!(
+            back.recycle_name.as_deref(),
+            Some("$R4de00001a.txt"),
+            "recycle_name 保留"
+        );
+        let puts = plain_put_targets(&mock);
+        assert_eq!(puts.len(), 1, "仅墓碑一次 PUT");
+        assert!(
+            !puts[0].contains("$I4de00001a"),
+            "P8:桶中不得出现真实 $I 对象,got {puts:?}"
+        );
+        // 幂等:重入覆盖
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", vec![9, 9])
+            .await
+            .expect("重入覆盖");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i.as_deref(), Some(&[9, 9][..]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_recycle_i_truncates_over_4k() {
+        // 阈值验证:MAX_RECYCLE_I_BYTES 落地带测试(阈值规范)。
+        let (mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::ZERO).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let trash = win_state();
+        fs.trash = Some(trash.clone());
+        seed_win_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            Some("$R4de00001a.txt"),
+            None,
+            None,
+        );
+        let big = vec![0xABu8; MAX_RECYCLE_I_BYTES + 100];
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", big)
+            .await
+            .expect("set_recycle_i");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(
+            back.recycle_i.unwrap().len(),
+            MAX_RECYCLE_I_BYTES,
+            "超限截断"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_recycle_i_missing_tombstone_is_noop() {
+        // 捕获丢失:对应 $R 墓碑不可解析 → warn + no-op,零请求。
+        let (mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::ZERO).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let trash = win_state();
+        fs.trash = Some(trash.clone());
+        trash
+            .set_recycle_i(&fs, "$Ideadbeef.txt", vec![1, 2, 3])
+            .await
+            .expect("no-op Ok");
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            0,
+            "未命中必须零远程(不阻塞 restore)"
+        );
+        // 非 $I 形态:防御性 no-op
+        trash
+            .set_recycle_i(&fs, "random.txt", vec![1])
+            .await
+            .expect("非 $I no-op");
+        assert_eq!(mock.recorded.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_recycle_i_cold_scan_fills_by_key_uncovered() {
+        // 裁决 R3 ③:by_name 未填充(如另一客户端软删、本端未刷新)时,
+        // 冷路径按需 GET body 扫描填充后仍能落捕获。
+        let (mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::ZERO).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let trash = win_state();
+        fs.trash = Some(trash.clone());
+        // 模拟「索引有、body 带 recycle_name、反向索引未填充」的跨端
+        // 场景(裁决 R3 ③ 冷路径)
+        seed_win_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            Some("$R4de00001a.txt"),
+            None,
+            None,
+        );
+        trash.recycle_names.write().unwrap().by_name.clear();
+        trash.recycle_names.write().unwrap().by_key.clear();
+        let bytes = vec![7u8, 7, 7];
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", bytes.clone())
+            .await
+            .expect("冷路径仍应落捕获");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i.as_deref(), Some(&bytes[..]));
+        assert!(
+            trash
+                .recycle_names
+                .read()
+                .unwrap()
+                .by_name
+                .contains_key("$R4de00001a.txt"),
+            "冷路径填充 by_name"
+        );
+    }
+
+    #[test]
+    fn i_entry_has_r_tombstone_matrix() {
+        let trash = win_state();
+        assert!(!trash.i_entry_has_r_tombstone("$I4de00001a.txt"), "未种子");
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$R4de00001a.txt".into(), "k".into());
+        assert!(trash.i_entry_has_r_tombstone("$I4de00001a.txt"));
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$RDEADBEEF.bin".into(), "k".into());
+        assert!(
+            trash.i_entry_has_r_tombstone("$IDEADBEEF.bin"),
+            "hex 大小写均可"
+        );
+        assert!(
+            !trash.i_entry_has_r_tombstone("$R4de00001a.txt"),
+            "$R 非 $I 形态"
+        );
+        assert!(!trash.i_entry_has_r_tombstone("$Ixyz.txt"), "非 8 位 hex");
+        assert!(!trash.i_entry_has_r_tombstone("plain.txt"));
     }
 }
