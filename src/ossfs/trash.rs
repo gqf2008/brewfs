@@ -68,6 +68,29 @@ pub fn date_partition_utc(now: std::time::SystemTime) -> chrono::NaiveDate {
     dt.date_naive()
 }
 
+/// is_covered 复杂度断言插桩(test-only):比较次数计数。thread_local 保证
+/// 并行测试互不污染;cfg(test) 下编译,release 构建零开销。
+#[cfg(test)]
+thread_local! {
+    static COUNT_IS_COVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COUNT_VALUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// dirs(升序)中精确二分查找 prefix;每轮比较计数一次(裁决 #5 测试断言
+/// 复杂度上界用)。非 test 构建下闭包只做比较,零额外开销。
+fn dirs_binary_search_covered(dirs: &[String], prefix: &str) -> bool {
+    dirs.binary_search_by(|d| {
+        #[cfg(test)]
+        {
+            if COUNT_IS_COVERED.with(|c| c.get()) {
+                COUNT_VALUE.with(|c| c.set(c.get() + 1));
+            }
+        }
+        d.as_str().cmp(prefix)
+    })
+    .is_ok()
+}
+
 /// 被删 key 索引。精确命中(文件墓碑)或前缀覆盖(目录墓碑)。
 /// files 用 HashSet(精确匹配),dirs 用排序 Vec(前缀二分)—— 不用布隆过滤器的
 /// 理由见设计稿 D2:布隆不可删除(与恢复冲突),且误报方向是藏起活文件。
@@ -91,22 +114,32 @@ impl TombstoneIndex {
         if self.dirs.is_empty() {
             return false;
         }
-        let dir_key = if key.ends_with('/') {
-            key.to_string()
-        } else {
-            format!("{key}/")
-        };
-        let i = self.dirs.partition_point(|d| d.as_str() < dir_key.as_str());
-        // 二分正确性:覆盖 dir_key 的目录墓碑 D 满足 D <= dir_key(相等时 D == dir_key,
-        // 落在 partition_point 下标处)。D < dir_key 的全部在 [0..i);D == dir_key
-        // 在 dirs[i](当 i < len 时)—— 取 [0..=i],i == len 时退化为 [0..len)。
-        // 从尾部向前扫先命中最长前缀。最坏回扫长度 = 路径深度(通常 < 20)。
-        // 500k 条目 ≈ 19 次比较,纳秒级。
-        let end = if i < self.dirs.len() { i + 1 } else { i };
-        self.dirs[..end]
-            .iter()
-            .rev()
-            .any(|d| dir_key.starts_with(d.as_str()))
+        // 目录形态双探测:key 不以 '/' 结尾时必须再探测 key+"/"(stat("/docs")
+        // 得 key "docs",目录墓碑存 "docs/";只对 key 前缀匹配会漏,经 marker
+        // HEAD 把已删目录复活)。
+        //
+        // 算法(裁决 #5):对 dir_key 的每级路径前缀精确二分 —— dirs 中能覆盖
+        // dir_key 的墓碑 D 必等于某级路径前缀(含 dir_key 自身),逐级二分
+        // O(路径深度 × log n),取代「插入点 + 线性回扫」的最坏 O(n)(1000 个
+        // 共享公共前缀的墓碑会让回扫扫过全部条目才确认未覆盖)。500k 条目 ×
+        // 深度 5 ≈ 5×19 次比较,纳秒级;复杂度承诺由
+        // is_covered_comparisons_bounded_by_depth_log 断言执行化。
+        //
+        // 分配纪律(裁决 #12):浅层前缀是 key 的切片,零分配;仅当 key 不以
+        // '/' 结尾且浅层全部未命中时才分配 key+"/" 探测完整 dir_key ——
+        // 常规命中(文件直接位于被删目录下)路径零分配。
+        for (i, &b) in key.as_bytes().iter().enumerate() {
+            if b == b'/' && dirs_binary_search_covered(&self.dirs, &key[..=i]) {
+                return true;
+            }
+        }
+        if !key.ends_with('/') {
+            let full = format!("{key}/");
+            if dirs_binary_search_covered(&self.dirs, &full) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 插入墓碑。is_dir=true 归一化补尾斜杠并保 dirs 升序;重复插入幂等。
@@ -888,6 +921,45 @@ mod tests {
         assert!(!idx.is_covered("docs/a.txt"));
         assert!(!idx.is_covered("docs"));
         assert!(!idx.is_covered(""));
+    }
+
+    #[test]
+    fn is_covered_comparisons_bounded_by_depth_log() {
+        // 裁决 #5 复杂度承诺可执行化:dirs ~1000 的对抗数据(全部共享超长
+        // 公共前缀、查询无覆盖 —— 旧线性回扫需扫过全部 1000 条才确认未覆盖),
+        // is_covered 比较次数必须 ≤ 深度×log2(n) 上界且 ≥ 每级二分下界;
+        // 回归到 O(n) 回扫(比较量 ≈ n 或 ≈ 单次二分)时本断言红。
+        // 计数来自生产搜索闭包(thread_local 插桩,cfg(test) 下编译,
+        // release 零开销),而非镜像实现 —— 生产路径本身被断言。
+        let mut dirs = Vec::new();
+        for i in 0..1000 {
+            dirs.push(format!("common/prefix/shared/dir{i:04}/"));
+        }
+        let idx = TombstoneIndex {
+            files: HashSet::new(),
+            dirs,
+        };
+        // 查询落在公共前缀之下但无精确覆盖(最坏回扫场景)
+        let key = "common/prefix/shared/dir1000/x.txt";
+        let depth = key.matches('/').count(); // 4 级路径前缀
+        COUNT_IS_COVERED.with(|c| c.set(true));
+        assert!(!idx.is_covered(key));
+        COUNT_IS_COVERED.with(|c| c.set(false));
+        let comps = COUNT_VALUE.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v
+        });
+        // log2(1000)≈10:4 级 × 10 ≈ 40 次。上界 60 留 std 内部实现余量;
+        // 下界 28 远高于线性回扫回归的比较量(≈10 或 ≈1000 之外必低于此)。
+        assert!(
+            comps <= depth * 12 + 12,
+            "is_covered 比较次数 {comps} 超出 深度×log2(n) 上界(深度 {depth})"
+        );
+        assert!(
+            comps >= depth * 7,
+            "is_covered 比较次数 {comps} 过低 —— 疑似 O(n) 线性回扫回归(每级必须二分)"
+        );
     }
 
     #[test]
