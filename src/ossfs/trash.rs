@@ -1242,7 +1242,9 @@ impl TrashState {
     /// 留新时映射仍有效,裁决 R7)。seen_sids 不在此清理(条目与 SID 无
     /// 关联,空 SID 目录残留无害,文档化)。挂进 clear_tombstones_both_forms
     /// 收尾与 gc_partition_files/dirs、trash_restore 的删除路径,保证映射
-    /// 与索引同生命周期。
+    /// 与索引同生命周期。by_key 的目录键带尾斜杠(insert_recycle_names
+    /// 以 dir_key 写入),调用方传裸形态时双形态都移除(单元 3 清墓碑
+    /// 传 file_key = trim 后,否则目录映射残留成幽灵)。
     fn remove_tombstone_maps(&self, tombstone_keys: &[String], original_key: &str) {
         let mut names = self.recycle_names.write().unwrap();
         if !tombstone_keys.is_empty() {
@@ -1255,6 +1257,9 @@ impl TrashState {
             .is_covered(original_key.trim_end_matches('/'));
         if !still_covered {
             names.by_key.remove(original_key);
+            if !original_key.ends_with('/') {
+                names.by_key.remove(&format!("{original_key}/"));
+            }
         }
     }
 }
@@ -1269,6 +1274,13 @@ fn i_view_path(fs: &ObjectFs, original_key: &str) -> String {
         .strip_prefix(fs.prefix.as_str())
         .unwrap_or(original_key);
     format!("{}\\{}", SYNTHESIZED_I_DRIVE, rel.replace('/', "\\"))
+}
+
+/// 墓碑原 key(带命名空间前缀)→ 挂载视图路径(目录形态去尾斜杠;
+/// delete_dir_recursive_impl 以视图路径取 S3 前缀)。单元 3 永久删用。
+fn key_view_path(fs: &ObjectFs, key: &str) -> String {
+    let rel = key.strip_prefix(fs.prefix.as_str()).unwrap_or(key);
+    format!("/{}", rel.trim_end_matches('/'))
 }
 
 /// $I 合成长度(8B 头 + 8B size + 8B FILETIME + 4B 字符数 + UTF-16LE 路径)。
@@ -1805,6 +1817,125 @@ impl TrashState {
             etag_mismatch: false,
             multiple_versions: false,
         })
+    }
+
+    // ---------- 单元 3:回收站内删除 = 永久删 ----------
+
+    /// 回收站内单条永久删(裁决 R6 顺序:先原对象后墓碑):
+    ///
+    ///    1. 结构解析 → Entry{entry_name};$I 形态 → Ok(())(no-op,测试 2)。
+    ///    2. resolve_entry(暖路径零远程;Windows 冷路径内部 acquire 兜底)
+    ///       → None → Err(NotFound)。
+    ///    3. 文件:GET 墓碑 body 取 etag → HEAD 原 key:一致或 404 →
+    ///       DELETE 原对象;不一致 → warn + 跳过(原对象孤儿化,不销毁
+    ///       可能存活的数据)。目录:delete_dir_recursive_impl(原位置视图
+    ///       路径)(无条件,镜像 rmdir —— 隐式目录无 marker 可校验)。
+    ///    4. clear_tombstones_both_forms(清全部版本,裁决 R7)+ 视图条目
+    ///       缓存失效。
+    ///
+    /// 全程持一个 limiter permit(镜像 delete 的并发上限不可回归;
+    /// resolve_entry 冷路径的 acquire 在返回前已释放)。
+    pub(crate) async fn permanent_delete_entry(&self, fs: &ObjectFs, path: &str) -> Result<()> {
+        // 1. 结构解析;$I 形态 no-op(捕获字节随对应 $R 的永久删一并清除,
+        //    零远程,测试 2 断言)
+        let Some(SystemTrashMatch::Entry { entry_name }) = self.match_system_trash(path) else {
+            anyhow::bail!("permanent delete: not a system recycle bin entry: {path}");
+        };
+        if is_i_entry(&entry_name) {
+            return Ok(());
+        }
+        // 2. 条目 → 原 key + 墓碑 key + 目录形态
+        let Some(resolved) = self.resolve_entry(fs, &entry_name, true).await? else {
+            anyhow::bail!("permanent delete: recycle bin entry not found: {entry_name}");
+        };
+        let _permit = fs.acquire().await?;
+        // 3. 先原对象后墓碑(裁决 R6)
+        if resolved.is_dir {
+            // 目录:无条件递归删(镜像 rmdir 语义)
+            let view = key_view_path(fs, &resolved.original_key);
+            fs.delete_dir_recursive_impl(&view).await?;
+        } else {
+            self.permanent_delete_file(fs, &resolved.original_key, &resolved.tomb_key)
+                .await?;
+        }
+        // 4. 清全部版本墓碑(裁决 R7)+ 索引/反向索引收尾 + 视图条目缓存
+        // 失效(目录额外清后代;read 缓存镜像 soft_delete)
+        self.clear_tombstones_both_forms(fs, &resolved.original_key)
+            .await?;
+        fs.invalidate_trash_cached(path, resolved.is_dir);
+        fs.invalidate_read_cache(path);
+        Ok(())
+    }
+
+    /// 文件条目永久删主体(调用方已持 permit;单条与 purge_all 复用):
+    /// GET 墓碑 body 取 etag → HEAD 原 key → etag 一致或 HEAD 404 →
+    /// DELETE 原对象;不一致 → warn + 跳过原对象(原对象孤儿化,不销毁
+    /// 可能存活的数据,裁决 R6)。墓碑 body 404(并发删除,无法校验)→
+    /// 跳过原对象(L5 口径:绝不动无法核验的原对象)。
+    async fn permanent_delete_file(
+        &self,
+        fs: &ObjectFs,
+        original_key: &str,
+        tomb_key: &str,
+    ) -> Result<()> {
+        let head = self.head_original(fs, original_key).await?;
+        match head {
+            // 原对象不存在(已 GC/其他端删):DELETE 幂等兜底
+            None => self.delete_object(fs, original_key).await,
+            Some(current_etag) => {
+                let mismatched = match self.read_tombstone(fs, tomb_key).await? {
+                    None => {
+                        // 墓碑并发删除:无法校验 etag,不动原对象
+                        tracing::warn!(
+                            original_key,
+                            "trash system view: 永久删时墓碑已不存在,跳过原对象删除"
+                        );
+                        true
+                    }
+                    Some(body) => match (body.etag.as_deref(), current_etag.as_deref()) {
+                        (Some(a), Some(b)) => !etag_eq(a, b),
+                        (Some(_), None) => true, // 墓碑有 etag、当前无 → 视为不一致
+                        _ => false,
+                    },
+                };
+                if mismatched {
+                    tracing::warn!(
+                        original_key,
+                        "trash system view: 原对象 etag 与墓碑不一致,跳过原对象删除(孤儿化)"
+                    );
+                    return Ok(());
+                }
+                self.delete_object(fs, original_key).await
+            }
+        }
+    }
+
+    /// 清空整个系统回收站(delete_dir_recursive 命中 Dir{level:0}):
+    /// 快照索引 entries() → 逐条永久删(文件:HEAD etag 校验 + DELETE;
+    /// 目录:无条件递归删)→ 清全部版本墓碑。只清"有墓碑的条目"对应的
+    /// 原对象+墓碑,不触碰桶中真实(非墓碑)对象(风险 6 口径)。
+    /// 幂等:索引空 → 零远程;条目删除后重入安全(清墓碑扫描无命中即
+    /// 幽灵,索引无条件移除)。全程持一个 limiter permit。
+    pub(crate) async fn purge_all(&self, fs: &ObjectFs) -> Result<()> {
+        let entries = self.index.read().unwrap().entries();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let _permit = fs.acquire().await?;
+        for (original_key, is_dir, date) in entries {
+            if is_dir {
+                let view = key_view_path(fs, &original_key);
+                fs.delete_dir_recursive_impl(&view).await?;
+            } else {
+                // 该 key 最新墓碑的 etag(索引 date = 最新,裁决 R7)
+                let tomb_key = encode_tombstone_key(&self.prefix, date, &original_key, false);
+                self.permanent_delete_file(fs, &original_key, &tomb_key)
+                    .await?;
+            }
+            // 逐条先原对象后墓碑(裁决 R6);清全部版本(裁决 R7)
+            self.clear_tombstones_both_forms(fs, &original_key).await?;
+        }
+        Ok(())
     }
 
     /// 重建入口统一清墓碑挂点(write / write_from_file / mkdir):门控 =
