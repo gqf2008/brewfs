@@ -1044,8 +1044,12 @@ impl FileSystemContext for OssMountContext {
             return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
         }
         // 单元 4(裁决 R11 ②):Windows 回收站条目写拒绝($R)/捕获($I)。
-        // 捕获条件:$I 形态(8 位 hex)且对应 $R 墓碑已在反向索引(零远程);
-        // $R 形态 open-for-write → ACCESS_DENIED(只读预览放行)。
+        // 捕获条件:$I 形态(8 位 hex);$R 形态 open-for-write →
+        // ACCESS_DENIED(只读预览放行)。
+        // F5(medium):$I 捕获未命中(对应 $R 墓碑不在反向索引 —— 重启后
+        // by_name 空、或他端完成软删本端未刷新)同样拒绝写:捕获 miss 若
+        // 走普通写路径会把 $I 字节真实落桶,成为不可删除的幽灵条目
+        // (列出、合成 stat、delete no-op,restore 后孤儿残留)。
         let mut capture_i = false;
         if write {
             if let Some(trash) = &self.fs.trash {
@@ -1057,7 +1061,10 @@ impl FileSystemContext for OssMountContext {
                         return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
                     }
                     if is_i_entry(&entry_name) {
-                        capture_i = trash.i_entry_has_r_tombstone(&entry_name);
+                        if !trash.i_entry_has_r_tombstone(&entry_name) {
+                            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                        }
+                        capture_i = true;
                     }
                 }
             }
@@ -1113,6 +1120,7 @@ impl FileSystemContext for OssMountContext {
         // 单元 4(裁决 R11 ②):回收站内 $R 创建拒绝(只读条目);
         // $I 创建进入捕获模式 —— 不落 S3(P8:桶中无真实 $I 对象),
         // close 时经 set_recycle_i 落墓碑 body。
+        // F5(medium):$I 捕获未命中同 open() 口径拒绝(见 open 注释)。
         let mut capture_i = false;
         if !is_dir {
             if let Some(trash) = &self.fs.trash {
@@ -1124,7 +1132,10 @@ impl FileSystemContext for OssMountContext {
                         return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
                     }
                     if is_i_entry(&entry_name) {
-                        capture_i = trash.i_entry_has_r_tombstone(&entry_name);
+                        if !trash.i_entry_has_r_tombstone(&entry_name) {
+                            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                        }
+                        capture_i = true;
                     }
                 }
             }
@@ -2819,6 +2830,60 @@ mod tests {
             back.recycle_i.unwrap().len(),
             crate::ossfs::trash::MAX_RECYCLE_I_BYTES,
             "超限截断"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recycle_i_write_rejected_when_r_tombstone_unresolved() {
+        // F5:by_name 空(重启后 / 他端完成软删本端未刷新)时 $I 捕获未
+        // 命中必须拒绝写 —— 修复前 create 退化为普通写路径真实落桶,
+        // 成为不可删除的幽灵条目(列出、合成 stat、delete no-op)。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        fs.trash = Some(system_trash_state()); // 索引空、by_name 空
+        let (_fs, ctx) = test_mount(fs);
+        let mut fi = open_info();
+        let err = ctx
+            .create(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                0,
+                0,
+                0,
+                None,
+                0,
+                None,
+                false,
+                &mut fi,
+            )
+            .expect_err("$I create 捕获未命中必须拒绝写");
+        assert!(matches!(err, FspError::NTSTATUS(5)), "got {err:?}");
+        // open-for-write 同口径:合成 stat 未命中 → FILE_NOT_FOUND,
+        // 真实 $I 对象(经单元 1 真实对象回退)→ ACCESS_DENIED ——
+        // 两种拒绝均不得真实落桶
+        let err = ctx
+            .open(
+                w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
+                0,
+                0x2,
+                &mut fi,
+            )
+            .expect_err("$I open-for-write 必须拒绝");
+        assert!(
+            matches!(err, FspError::NTSTATUS(5) | FspError::NTSTATUS(2)),
+            "got {err:?}"
+        );
+        // P8:桶中无真实 $I 对象,被拒路径零 S3 请求
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.contains("$I4de00001a")),
+            "捕获未命中不得真实落桶"
+        );
+        assert!(
+            mock.recorded.lock().unwrap().is_empty(),
+            "被拒路径零 S3 请求"
         );
     }
 

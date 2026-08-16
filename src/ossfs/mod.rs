@@ -3972,21 +3972,26 @@ impl ObjectFs {
                     trash.record_seen_sid(new);
                     return trash.soft_delete_via_system(self, old, &entry_name).await;
                 }
+                // F3(medium):涉及回收站目录层本身的 rename(源或目标为
+                // $Recycle.Bin / SID 目录)一律拒绝 —— 必须位于还原分支
+                // 之前:修复前 (Some(Entry), Some(Dir)) 被 (Some(Entry), _)
+                // 还原分支吞掉,restore_via_system 把原对象 copy 到
+                // "$Recycle.Bin" 真实键,根列表以真实文件形态覆盖合成目录,
+                // Explorer 回收站探测失效(实现与规格 §2.1 同款 bug,裁决 F3)。
+                (Some(trash::SystemTrashMatch::Dir { .. }), _)
+                | (_, Some(trash::SystemTrashMatch::Dir { .. })) => {
+                    anyhow::bail!("rename: cannot move the system recycle bin directory");
+                }
                 // 源在回收站条目层 → 还原(目标也在回收站 = WithinRecycle,
                 // 裁决 R5:虚拟视图内 rename 不改变任何状态,no-op 成功)
                 (
                     Some(trash::SystemTrashMatch::Entry { .. }),
                     Some(trash::SystemTrashMatch::Entry { .. }),
                 ) => return Ok(()),
-                (Some(trash::SystemTrashMatch::Entry { .. }), _) => {
+                (Some(trash::SystemTrashMatch::Entry { .. }), None) => {
                     // 还原(Result<RestoreOutcome> 丢弃 —— rename 契约是
                     // Result<()>,失败语义已含于 Err)
                     return trash.restore_via_system(self, old, new).await.map(|_| ());
-                }
-                // 涉及回收站目录层本身的 rename:拒绝
-                (Some(trash::SystemTrashMatch::Dir { .. }), _)
-                | (_, Some(trash::SystemTrashMatch::Dir { .. })) => {
-                    anyhow::bail!("rename: cannot move the system recycle bin directory");
                 }
                 (None, None) => {}
             }
@@ -5475,6 +5480,11 @@ mod s3_mock_tests {
         /// and returns every key (simulates stores that do not honor it —
         /// the trash refresh must detect and degrade, unit 3).
         pub(crate) ignore_start_after: std::sync::atomic::AtomicBool,
+        /// When set, PUT with an If-Match header answers 412 PreconditionFailed
+        /// regardless of the stored etag (simulates the GET→PUT window of
+        /// `set_recycle_i` being raced by a concurrent restore/permanent-delete
+        /// — F8: a conditional write must not resurrect a deleted tombstone).
+        pub(crate) force_precondition_failed: std::sync::atomic::AtomicBool,
     }
 
     impl MockS3 {
@@ -5541,6 +5551,7 @@ mod s3_mock_tests {
                 list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
                 fail_put: AtomicUsize::new(0),
                 ignore_start_after: std::sync::atomic::AtomicBool::new(false),
+                force_precondition_failed: std::sync::atomic::AtomicBool::new(false),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -5581,6 +5592,7 @@ mod s3_mock_tests {
         let mut storage_class_header: Option<String> = None;
         let mut content_md5_header: Option<String> = None;
         let mut copy_source_header: Option<String> = None;
+        let mut if_match_header: Option<String> = None;
         let mut checksum_headers: Vec<(String, String)> = Vec::new();
         for line in head.lines() {
             let lower = line.to_ascii_lowercase();
@@ -5604,6 +5616,9 @@ mod s3_mock_tests {
             }
             if lower.strip_prefix("x-amz-copy-source:").is_some() {
                 copy_source_header = line.split_once(':').map(|(_, v)| v.trim().to_string());
+            }
+            if let Some(v) = lower.strip_prefix("if-match:") {
+                if_match_header = Some(v.trim().to_string());
             }
         }
         let mut parts = head.lines().next().unwrap_or("").split_whitespace();
@@ -5754,8 +5769,17 @@ mod s3_mock_tests {
                             None => (0, len),
                         };
                         get_body = Some(object[start..end].to_vec());
+                        // per-key etag 覆盖(同 HEAD 分支口径;read_tombstone_
+                        // with_etag 的条件写 F8 依赖 GET 响应带 ETag)。
+                        let etag = mock
+                            .etags
+                            .lock()
+                            .unwrap()
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| mock.head_etag.lock().unwrap().clone());
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             end - start
                         )
                     }
@@ -5961,6 +5985,46 @@ mod s3_mock_tests {
                     mock.fail_put.fetch_sub(1, Ordering::SeqCst);
                     let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
                     http_response(500, "application/xml", Some(&body.to_string()))
+                } else if let Some(im) = &if_match_header {
+                    // if-match 条件写(F8:set_recycle_i 的「无墓碑不复活」):
+                    // etag 失配或对象缺失 → 412 PreconditionFailed;force 开关
+                    // 模拟 GET→PUT 窗口内的并发删除/改写。真实 S3/OSS 对
+                    // If-Match 条件 PUT 返回 412(对象缺失同样 412)。
+                    let etag = mock
+                        .etags
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| mock.head_etag.lock().unwrap().clone());
+                    let matched = !mock.force_precondition_failed.load(Ordering::SeqCst)
+                        && mock.objects.lock().unwrap().contains_key(&key)
+                        && etag == im.trim_matches('"');
+                    if matched {
+                        mock.objects
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), body.clone());
+                        mock.last_modified
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), mock_now_lm());
+                        let mut entries = mock.entries.lock().unwrap();
+                        if !entries.iter().any(|(k, _)| *k == key) {
+                            entries.push((key, false));
+                        }
+                        drop(entries);
+                        let crc = *mock.crc64.lock().unwrap();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>";
+                        format!(
+                            "HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
                 } else {
                     mock.objects
                         .lock()
@@ -9821,6 +9885,267 @@ mod s3_mock_tests {
         assert!(
             mock.objects.lock().unwrap().contains_key("docs/dir/a.txt"),
             "还原到祖先被拒:文件不得拷贝到 /docs/dir 覆盖原 key"
+        );
+    }
+
+    /// F3(medium):rename 拦截分派顺序 —— (Some(Entry), Some(Dir)) 必须被
+    /// 「回收站目录层拒绝」分支拦下(修复前被 (Some(Entry), _) 还原分支
+    /// 吞掉,restore_via_system 把原对象 copy 到 "$Recycle.Bin" 真实键,
+    /// 根列表以真实文件形态覆盖合成目录,Explorer 回收站探测失效)。
+    /// 注:entry → 同前缀 SID 目录($R 名所在 SID)会被 rename_impl 更早
+    /// 的子树检查拦下,此处用跨 SID 目录(子树检查不命中)触发分派缺陷。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_rename_entry_into_recycle_dir_level_rejected() {
+        let entries = vec![
+            (".trash/2026-08-16/docs/a.txt".into(), false),
+            ("docs/a.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object(
+            ".trash/2026-08-16/docs/a.txt",
+            tombstone_json(Some("$R4de00001a.txt"), Some(1), None),
+        );
+        mock.set_object("docs/a.txt", b"a".to_vec());
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        seed_system_tombstone(&fs, &trash, "docs/a.txt", "$R4de00001a.txt");
+        let err = fs
+            .rename(
+                "/$Recycle.Bin/S-1-5-21-1/$R4de00001a.txt",
+                "/$Recycle.Bin/S-1-5-21-2",
+                false,
+            )
+            .await
+            .expect_err("条目 → 回收站目录层必须拒绝");
+        assert!(
+            err.to_string().contains("recycle bin directory"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("docs/a.txt"),
+            "拒绝后零 copy:原对象仍在"
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("$Recycle.Bin/S-1-5-21-2"),
+            "不得把原对象 copy 到回收站目录真实键"
+        );
+    }
+
+    /// F4(medium):macOS .Trashes 视图内真实对象(.DS_Store,无墓碑)删除
+    /// 回退普通 delete —— 修复前 resolve 失败 bail → Finder 清空废纸篓
+    /// EIO(stat/read 已有真实对象回退,删除侧补齐对称)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_macos_real_object_in_trash_deletable() {
+        let (mock, port) = MockS3::start(
+            vec![(".Trashes/501/.DS_Store".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.set_object(".Trashes/501/.DS_Store", b"ds".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(system_trash_state(".trash/", mac_sys()));
+
+        fs.delete("/.Trashes/501/.DS_Store")
+            .await
+            .expect("macOS 视图内真实对象可删");
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(".Trashes/501/.DS_Store"),
+            "真实对象已删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with(".trash/")),
+            "真实对象删除不产生墓碑"
+        );
+    }
+
+    /// F4(medium):Windows 同构 —— 桶中真实 $Recycle.Bin 条目可删除。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_win_real_object_in_recycle_bin_deletable() {
+        let (mock, port) = MockS3::start(
+            vec![("$Recycle.Bin/S-1-5-21-1/real.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.set_object("$Recycle.Bin/S-1-5-21-1/real.txt", b"real".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(system_trash_state(".trash/", win_sys()));
+
+        fs.delete("/$Recycle.Bin/S-1-5-21-1/real.txt")
+            .await
+            .expect("Windows 真实条目可删");
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("$Recycle.Bin/S-1-5-21-1/real.txt"),
+            "真实对象已删"
+        );
+    }
+
+    /// F5(medium):$I 捕获未解析(历史遗留/捕获丢失的真实 $I 幽灵对象)
+    /// delete 回退删除同键真实对象 —— 修复前恒 no-op,幽灵条目不可删。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_delete_ghost_i_entry_removes_real_object() {
+        let (mock, port) = MockS3::start(
+            vec![("$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.set_object("$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt", b"ghost".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(system_trash_state(".trash/", win_sys()));
+
+        fs.delete("/$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt")
+            .await
+            .expect("幽灵 $I 可删");
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt"),
+            "幽灵真实对象已删"
+        );
+    }
+
+    /// F5 守卫:对应 $R 墓碑已解析 → $I delete 保持 no-op(捕获字节随
+    /// $R 永久删一并清除,零远程)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_delete_i_entry_noop_when_r_tombstone_resolved() {
+        let entries = vec![(".trash/2026-08-16/docs/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object(
+            ".trash/2026-08-16/docs/a.txt",
+            tombstone_json(Some("$R4de00001a.txt"), Some(5), None),
+        );
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        seed_system_tombstone(&fs, &trash, "docs/a.txt", "$R4de00001a.txt");
+
+        let before = mock.recorded.lock().unwrap().len();
+        fs.delete("/$Recycle.Bin/S-1-5-21-1/$I4de00001a.txt")
+            .await
+            .expect("$I delete no-op");
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            before,
+            "已解析 $I 删除零 S3 请求"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(".trash/2026-08-16/docs/a.txt"),
+            "墓碑不动"
+        );
+    }
+
+    /// F6(medium):还原目标各级祖先被墓碑覆盖 → bail(规格 §2.4:还原进
+    /// 已删目录会失败;修复前清墓碑/拷贝静默成功但结果被祖先墓碑隐藏
+    /// —— 条目从视图与回收站双消失)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_restore_into_deleted_ancestor_rejected() {
+        // 多端:A 删 /docs(目录墓碑仍在)、B 删 /docs/a.txt 并还原 same_place
+        let entries = vec![
+            (".trash/2026-08-16/docs/".into(), true),
+            (".trash/2026-08-16/docs/a.txt".into(), false),
+            ("docs/a.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object(".trash/2026-08-16/docs/", tombstone_dir_json(None));
+        mock.set_object(
+            ".trash/2026-08-16/docs/a.txt",
+            tombstone_json(Some("$Rf"), Some(1), None),
+        );
+        mock.set_object("docs/a.txt", b"a".to_vec());
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert("docs/", true, sys_date());
+            idx.insert("docs/a.txt", false, sys_date());
+            trash.store_index_entries(idx.len());
+        }
+        let tomb_key = trash::encode_tombstone_key(".trash/", sys_date(), "docs/a.txt", false);
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$Rf".into(), tomb_key);
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_key
+            .insert("docs/a.txt".into(), "$Rf".into());
+
+        let err = fs
+            .rename("/$Recycle.Bin/S-1-5-21-1/$Rf", "/docs/a.txt", false)
+            .await
+            .expect_err("还原进被删祖先必须拒绝");
+        assert!(
+            err.to_string().contains("trash"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            trash.index.read().unwrap().is_covered("docs/a.txt"),
+            "拒绝后墓碑不动"
+        );
+    }
+
+    /// F7(medium):full_rebuild diff 新增墓碑读 body 填充 recycle_names
+    /// (裁决 R3②)—— 远端软删后本端首次 list 回收站暖路径零逐个 GET。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_full_rebuild_fills_recycle_names_then_list_warm() {
+        let entries = vec![(".trash/2026-08-16/docs/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object(
+            ".trash/2026-08-16/docs/a.txt",
+            tombstone_json(Some("$R4de00001a.txt"), Some(5), None),
+        );
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        // 远端软删:本端索引空、反向索引空(未刷新)
+        trash.full_rebuild(&fs).await.expect("full_rebuild");
+        assert_eq!(
+            trash
+                .recycle_names
+                .read()
+                .unwrap()
+                .by_name
+                .get("$R4de00001a.txt")
+                .map(String::as_str),
+            Some(".trash/2026-08-16/docs/a.txt"),
+            "F7:diff 新增墓碑读 body 填充 by_name"
+        );
+        let before_gets = count_object_gets(&mock);
+        let list = fs.list("/$Recycle.Bin/S-1-5-21-1").await.unwrap();
+        assert_eq!(
+            count_object_gets(&mock) - before_gets,
+            0,
+            "F7:暖路径零 body GET(P1)"
+        );
+        assert!(
+            list.iter().any(|e| e.name == "$R4de00001a.txt"),
+            "条目可见: {list:?}"
         );
     }
 

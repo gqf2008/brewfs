@@ -477,17 +477,45 @@ impl TrashState {
     /// 期间 trash_gc 已完成(代际推进)则本轮快照已陈旧 —— 其中可能含
     /// GC 刚删掉的墓碑,整体丢弃返回 false(游标不推进,下轮重试),绝不
     /// 把已删墓碑重插回索引。
-    fn apply_added(
+    /// F7(裁决 R3②):Windows 平台对 diff 新增墓碑按需 GET body 填充
+    /// recycle_names —— 请求数 = 新增数,天然有界;兑现「远端软删后本端
+    /// 首次 list 回收站暖路径零逐个 GET」。远端 I/O 全部在锁外完成、仅
+    /// 收集(不 mutate),提交前二次代际校验 —— GET 期间 GC 并发完成则
+    /// 整体丢弃(任何状态未变更)。macOS 恒零额外请求(basename 扫描
+    /// 不需要反向索引,裁决 P1)。与 poll_incremental 的刷新路径约定
+    /// 一致:不 acquire limiter permit(eager 挂点调用方已持,双 acquire
+    /// 违背 #55 纪律;刷新并发由 poll_inflight 天然限 1)。
+    async fn apply_added(
         &self,
         fs: &ObjectFs,
         added: &[(String, bool, chrono::NaiveDate)],
         gen_snapshot: u64,
-    ) -> bool {
+    ) -> Result<bool> {
         if self.generation.load(Ordering::SeqCst) != gen_snapshot {
-            return false; // GC 并发完成:陈旧快照整体丢弃(L4)
+            return Ok(false);
         }
         if added.is_empty() {
-            return true;
+            return Ok(true);
+        }
+        // F7:新增墓碑的 recycle_names 填充候选(仅 Windows;锁外 GET)。
+        let mut name_fills: Vec<(String, String, String)> = Vec::new();
+        if self
+            .system
+            .as_ref()
+            .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
+        {
+            for (key, is_dir, date) in added {
+                let tomb_key = encode_tombstone_key(&self.prefix, *date, key, *is_dir);
+                if let Some(body) = self.read_tombstone(fs, &tomb_key).await?
+                    && let Some(name) = &body.recycle_name
+                {
+                    name_fills.push((tomb_key, name.clone(), key.clone()));
+                }
+            }
+            // GET 期间 GC 并发完成 → 陈旧快照整体丢弃(任何状态未变更)
+            if self.generation.load(Ordering::SeqCst) != gen_snapshot {
+                return Ok(false);
+            }
         }
         {
             let mut idx = self.index.write().unwrap();
@@ -536,10 +564,19 @@ impl TrashState {
             }
             self.store_index_entries(idx.len());
         }
+        // 提交点后:recycle_names 与墓碑同生命周期(裁决 R3 ②;仅插入
+        // 未被覆盖的 key —— 本地软删的映射优先,裁决 R7 最新优先)。
+        for (tomb_key, name, key) in name_fills {
+            let mut names = self.recycle_names.write().unwrap();
+            if !names.by_key.contains_key(&key) {
+                names.by_name.insert(name.clone(), tomb_key);
+                names.by_key.insert(key, name);
+            }
+        }
         for (key, is_dir, _) in added {
             invalidate_key(fs, key, *is_dir);
         }
-        true
+        Ok(true)
     }
 
     /// 增量刷新,两阶段(裁决 #2):
@@ -581,7 +618,7 @@ impl TrashState {
             // 保证同日删除 ≤1s 内可见)。
             // 今天分区新增始终应用(游标无关,已由阶段一保证同日删除 ≤1s
             // 内可见);代际变化(GC 并发)时丢弃本轮,下轮重试。
-            if self.apply_added(fs, &added, gen_snapshot) {
+            if self.apply_added(fs, &added, gen_snapshot).await? {
                 if self.full_rebuild_due() {
                     self.full_rebuild(fs).await?;
                 } else {
@@ -631,7 +668,7 @@ impl TrashState {
 
         // 代际校验(L4):GC 并发完成 → 丢弃本轮(游标不推进,下轮从旧
         // 游标重扫,避免把 GC 刚删的墓碑重插回索引)。
-        if !self.apply_added(fs, &added, gen_snapshot) {
+        if !self.apply_added(fs, &added, gen_snapshot).await? {
             return Ok(());
         }
         // 游标推进:阶段二有非今天分区的最后 key 用它,否则用阶段一最后
@@ -695,6 +732,29 @@ impl TrashState {
         removed.extend(prev_sorted.into_iter().skip(i));
         added.extend(new_sorted.into_iter().skip(j));
         let diff_total = removed.len() + added.len();
+        // F7(裁决 R3②):新增墓碑读 body 填充 recycle_names(仅 Windows,
+        // 请求数 = 新增数,天然有界;兑现远端软删后本端首次 list 回收站
+        // 暖路径零逐个 GET)。与刷新路径约定一致不 acquire permit(见
+        // apply_added 注释)。新增墓碑读 body 之前已过代际校验(第 661 行),
+        // 填充失败仅 warn 级影响(下次冷路径兜底),不 fail 重建。
+        if self
+            .system
+            .as_ref()
+            .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
+        {
+            for (key, is_dir, date) in &added {
+                let tomb_key = encode_tombstone_key(&self.prefix, *date, key, *is_dir);
+                if let Ok(Some(body)) = self.read_tombstone(fs, &tomb_key).await
+                    && let Some(name) = &body.recycle_name
+                {
+                    let mut names = self.recycle_names.write().unwrap();
+                    if !names.by_key.contains_key(key) {
+                        names.by_name.insert(name.clone(), tomb_key);
+                        names.by_key.insert(key.clone(), name.clone());
+                    }
+                }
+            }
+        }
         // 短写锁整体换入:diff 计算期间不持锁
         *self.index.write().unwrap() = index;
         self.store_index_entries(self.index.read().unwrap().len());
@@ -1263,10 +1323,11 @@ impl TrashState {
 
     /// $I 捕获落 body(单元 4,裁决 R8 捕获为主):`entry_name` 为 $I 名,
     /// 反查对应 $R 墓碑 → GET body → 设 recycle_i(>MAX_RECYCLE_I_BYTES
-    /// 截断)→ PUT。update 式写:整 body 重写,etag/size 字段原样保留
-    /// (serde 往返,保 etag/size)。未命中(捕获丢失,如 $R 在另一客户端
-    /// 软删而本端索引未刷新)→ warn + no-op —— 不可因 $I 缺失拒绝
-    /// restore(Agent 2 risk 7)。幂等:重入再次捕获覆盖。
+    /// 截断)→ 条件 PUT(if-match 墓碑 etag,F8:窗口内墓碑被并发删除
+    /// → 412 → 丢弃字节不复活幽灵)。update 式写:整 body 重写,etag/size
+    /// 字段原样保留(serde 往返,保 etag/size)。未命中(捕获丢失,如 $R
+    /// 在另一客户端软删而本端索引未刷新)→ warn + no-op —— 不可因 $I
+    /// 缺失拒绝 restore(Agent 2 risk 7)。幂等:重入再次捕获覆盖。
     /// 调用方不持 limiter permit(resolve_entry 冷路径内部自持;此处再
     /// 持一个覆盖 read_tombstone + write_tombstone,顺序 acquire 无死锁)。
     pub(crate) async fn set_recycle_i(
@@ -1286,7 +1347,10 @@ impl TrashState {
             return Ok(());
         };
         let _permit = fs.acquire().await?;
-        let Some(mut body) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+        let (maybe_body, etag) = self
+            .read_tombstone_with_etag(fs, &resolved.tomb_key)
+            .await?;
+        let Some(mut body) = maybe_body else {
             tracing::warn!(
                 tomb_key = %resolved.tomb_key,
                 "recycle bin $I capture: 墓碑并发删除,丢弃捕获字节"
@@ -1294,8 +1358,24 @@ impl TrashState {
             return Ok(());
         };
         body.recycle_i = Some(bytes.into_iter().take(MAX_RECYCLE_I_BYTES).collect());
-        self.write_tombstone(fs, &resolved.tomb_key, &body).await?;
-        Ok(())
+        // F8:条件写(if-match 墓碑 etag)—— GET→PUT 窗口内墓碑被并发
+        // restore/永久删/清空删除 → 412(或部分存储以 404 表达)→ 丢弃
+        // 捕获字节,不复活幽灵墓碑。修复前无条件 PUT 会把已删墓碑重新
+        // 写回,条目以幽灵形态残留(stat 可合成但 read/restore 404)。
+        match self
+            .write_tombstone_if_match(fs, &resolved.tomb_key, &body, etag.as_deref())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if is_conditional_write_failed(&e) => {
+                tracing::warn!(
+                    tomb_key = %resolved.tomb_key,
+                    "recycle bin $I capture: 墓碑在捕获窗口内被删除(条件写失败),丢弃捕获字节,不复活幽灵墓碑"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 墓碑删除的统一收尾:recycle_names 清理(by_name 中指向已删墓碑键
@@ -1366,6 +1446,25 @@ fn i_to_r_name(name: &str) -> Option<String> {
         Some(format!("$R{}", &name[2..]))
     } else {
         None
+    }
+}
+
+/// SDK 错误是否为 412 PreconditionFailed 或 404(if-match 条件写失败
+/// —— set_recycle_i 的 F8「无墓碑不复活」判定;S3/OSS 对条件 PUT 的
+/// 失配响应为 412,部分兼容存储以 404 表达)。anyhow 链内查找(write_
+/// tombstone_if_match 以 context 包装)。
+fn is_conditional_write_failed(e: &anyhow::Error) -> bool {
+    let Some(sdk) = e.downcast_ref::<aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::put_object::PutObjectError,
+    >>() else {
+        return false;
+    };
+    match sdk {
+        aws_sdk_s3::error::SdkError::ServiceError(err) => {
+            let status = err.raw().status().as_u16();
+            status == 412 || status == 404
+        }
+        _ => false,
     }
 }
 
@@ -1821,6 +1920,12 @@ impl TrashState {
         {
             anyhow::bail!("restore: cannot restore a path into its own subtree");
         }
+        // F6(medium):目标各级祖先被墓碑覆盖 → bail(规格 §2.4:还原进
+        // 已删目录会失败;修复前清墓碑/拷贝静默成功但结果被祖先墓碑
+        // 隐藏 —— 条目从视图与回收站双消失)。零远程(本地索引判定)。
+        if self.is_ancestor_covered(&new_key) {
+            anyhow::bail!("restore: target is inside a directory that is in the trash");
+        }
 
         // 还原主体(HEAD/copy/清墓碑):持一个 permit(镜像 trash_restore
         // 入口;resolve_entry_original 的冷路径 acquire 已先行释放)。
@@ -1910,14 +2015,16 @@ impl TrashState {
 
     /// 回收站内单条永久删(裁决 R6 顺序:先原对象后墓碑):
     ///
-    ///    1. 结构解析 → Entry{entry_name};$I 形态 → Ok(())(no-op,测试 2)。
-    ///    2. resolve_entry(暖路径零远程;Windows 冷路径内部 acquire 兜底)
-    ///       → None → Err(NotFound)。
-    ///    3. 文件:GET 墓碑 body 取 etag → HEAD 原 key:一致或 404 →
+    ///    1. 结构解析 → Entry{entry_name}。
+    ///    2. $I 形态(F5):对应 $R 墓碑已解析 → no-op(捕获字节随 $R 的
+    ///       永久删一并清除,测试 2);未解析 → 回退删除同键真实对象。
+    ///    3. resolve_entry(暖路径零远程;Windows 冷路径内部 acquire 兜底)
+    ///       → None → F4 回退删除视图路径真实对象(macOS .DS_Store 等)。
+    ///    4. 文件:GET 墓碑 body 取 etag → HEAD 原 key:一致或 404 →
     ///       DELETE 原对象;不一致 → warn + 跳过(原对象孤儿化,不销毁
-    ///       可能存活的数据)。目录:delete_dir_recursive_impl(原位置视图
-    ///       路径)(无条件,镜像 rmdir —— 隐式目录无 marker 可校验)。
-    ///    4. clear_tombstones_both_forms(清全部版本,裁决 R7)+ 视图条目
+    ///       可能存活的数据)。目录:F1 先重查墓碑 body,已消失 → 仅清
+    ///       墓碑;仍在 → delete_dir_recursive_impl(无条件递归删)。
+    ///    5. clear_tombstones_both_forms(清全部版本,裁决 R7)+ 视图条目
     ///       缓存失效。
     ///
     /// 全程持一个 limiter permit(镜像 delete 的并发上限不可回归;
@@ -1928,12 +2035,31 @@ impl TrashState {
         let Some(SystemTrashMatch::Entry { entry_name }) = self.match_system_trash(path) else {
             anyhow::bail!("permanent delete: not a system recycle bin entry: {path}");
         };
+        // 2. $I 形态:F5 —— 对应 $R 墓碑已解析 → no-op(捕获字节随 $R
+        // 永久删一并清除,零远程);未解析(历史遗留/捕获丢失的真实 $I
+        // 对象)→ 回退删除同键真实对象(修复前恒 no-op,幽灵条目不可删)。
         if is_i_entry(&entry_name) {
+            let r_name = i_to_r_name(&entry_name).expect("is_i_entry ⇒ i_to_r_name");
+            if self.resolve_entry(fs, &r_name, true).await?.is_some() {
+                return Ok(());
+            }
+            fs.invalidate_stat(path);
+            fs.invalidate_read_cache(path);
+            let _permit = fs.acquire().await?;
+            self.delete_object(fs, &fs.key_for(path)).await?;
             return Ok(());
         }
-        // 2. 条目 → 原 key + 墓碑 key + 目录形态
+        // 3. 条目 → 原 key + 墓碑 key + 目录形态;未解析(桶中真实对象 ——
+        // macOS .DS_Store、Windows 历史遗留真实条目)→ F4 回退删除视图
+        // 路径真实对象(修复前 bail → Finder 清空废纸篓 EIO;stat/read
+        // 已有真实对象回退,删除侧补齐对称)。DELETE 幂等:无真实对象
+        // 即 no-op 成功。
         let Some(resolved) = self.resolve_entry(fs, &entry_name, true).await? else {
-            anyhow::bail!("permanent delete: recycle bin entry not found: {entry_name}");
+            fs.invalidate_stat(path);
+            fs.invalidate_read_cache(path);
+            let _permit = fs.acquire().await?;
+            self.delete_object(fs, &fs.key_for(path)).await?;
+            return Ok(());
         };
         let _permit = fs.acquire().await?;
         // 3. 先原对象后墓碑(裁决 R6)
@@ -2076,6 +2202,22 @@ impl TrashState {
             return Ok(());
         }
         self.clear_tombstones_both_forms(fs, key).await
+    }
+
+    /// 目标路径各级祖先(不含自身)是否被墓碑覆盖(F6)。零远程 —— 本地
+    /// 索引判定(读锁瞬时持有,不跨 await)。裸形态 is_covered(文件精确
+    /// + 目录前缀双形态)。
+    fn is_ancestor_covered(&self, key: &str) -> bool {
+        let bare = key.trim_end_matches('/');
+        let idx = self.index.read().unwrap();
+        let mut rest = bare;
+        while let Some(pos) = rest.rfind('/') {
+            rest = &rest[..pos];
+            if idx.is_covered(rest) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 清双形态墓碑(跨形态同名重建统一扫描,F1 裁决):文件形态(key 精确、
@@ -2729,6 +2871,17 @@ impl TrashState {
     /// GC 调用方跳过该墓碑绝不动原对象[L5],restore 调用方按「本已
     /// 恢复」处理,list 调用方跳过该条目);调用方已持 limiter permit。
     async fn read_tombstone(&self, fs: &ObjectFs, tomb_key: &str) -> Result<Option<TombstoneBody>> {
+        Ok(self.read_tombstone_with_etag(fs, tomb_key).await?.0)
+    }
+
+    /// GET 墓碑 body + 响应 e_tag(条件写用 —— set_recycle_i 的 F8
+    /// 「无墓碑不复活」判定)。语义同 [`Self::read_tombstone`];调用方
+    /// 已持 limiter permit。
+    async fn read_tombstone_with_etag(
+        &self,
+        fs: &ObjectFs,
+        tomb_key: &str,
+    ) -> Result<(Option<TombstoneBody>, Option<String>)> {
         let resp = match fs
             .client
             .get_object()
@@ -2738,21 +2891,56 @@ impl TrashState {
             .await
         {
             Ok(r) => r,
-            Err(e) if is_s3_not_found(&e) => return Ok(None),
+            Err(e) if is_s3_not_found(&e) => return Ok((None, None)),
             Err(e) => {
                 fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
                 return Err(e).context("s3 get tombstone");
             }
         };
+        let etag = resp.e_tag().map(|s| s.to_string());
         let bytes = resp
             .body
             .collect()
             .await
             .context("read tombstone body")?
             .into_bytes();
-        Ok(Some(
-            serde_json::from_slice(&bytes).context("parse tombstone body")?,
+        Ok((
+            Some(serde_json::from_slice(&bytes).context("parse tombstone body")?),
+            etag,
         ))
+    }
+
+    /// 条件写墓碑(if-match 墓碑 etag;F8「无墓碑不复活」)。etag 失配 /
+    /// 对象缺失 → 存储返回 412,调用方按「墓碑已被并发删除」丢弃捕获
+    /// 字节(不复活幽灵墓碑)。错误计数与 [`Self::write_tombstone`] 对齐。
+    /// 调用方已持 limiter permit。
+    async fn write_tombstone_if_match(
+        &self,
+        fs: &ObjectFs,
+        tomb_key: &str,
+        body: &TombstoneBody,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        let json = serde_json::to_vec(body).context("serialize tombstone body")?;
+        let mut put = fs
+            .client
+            .put_object()
+            .bucket(&fs.bucket)
+            .key(tomb_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(json.clone()))
+            .content_type("application/json");
+        if let Some(e) = etag {
+            put = put.if_match(e);
+        }
+        if fs.content_md5 {
+            put = put.content_md5(crate::ossfs::content_md5(&json));
+        }
+        if let Err(e) = put.send().await {
+            fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            fs.metrics.s3_put_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(e).context("s3 put tombstone (if-match)");
+        }
+        Ok(())
     }
 
     /// DeleteObjects 批删(≤1000 键/请求,复用 DeleteObjectsContentMd5
@@ -3513,11 +3701,14 @@ mod tests {
         // GC 并发完成:代际推进(trash_gc 收尾的同一操作)
         state.generation.fetch_add(1, Ordering::SeqCst);
         // refresh 把陈旧快照(含 GC 刚删的墓碑 x.txt)交给 apply
-        let applied = state.apply_added(
-            &fs,
-            &[("x.txt".to_string(), false, d((2026, 8, 16)))],
-            stale_gen,
-        );
+        let applied = state
+            .apply_added(
+                &fs,
+                &[("x.txt".to_string(), false, d((2026, 8, 16)))],
+                stale_gen,
+            )
+            .await
+            .unwrap();
         assert!(!applied, "旧代际快照必须被丢弃(L4)");
         assert!(
             !state.index.read().unwrap().is_covered("x.txt"),
@@ -3525,11 +3716,14 @@ mod tests {
         );
         // 当前代际的 apply 正常工作
         let cur_gen = state.generation.load(Ordering::SeqCst);
-        let applied = state.apply_added(
-            &fs,
-            &[("y.txt".to_string(), false, d((2026, 8, 16)))],
-            cur_gen,
-        );
+        let applied = state
+            .apply_added(
+                &fs,
+                &[("y.txt".to_string(), false, d((2026, 8, 16)))],
+                cur_gen,
+            )
+            .await
+            .unwrap();
         assert!(applied, "当前代际快照正常应用");
         assert!(state.index.read().unwrap().is_covered("y.txt"));
     }
@@ -3590,6 +3784,46 @@ mod tests {
             })
             .map(|r| r.target.clone())
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_recycle_i_condition_failed_does_not_resurrect_ghost() {
+        // F8:GET→PUT 窗口内墓碑被并发 restore/永久删/清空删除(force
+        // 412 模拟)→ 条件写失败 → 丢弃捕获字节、不复活幽灵墓碑。
+        // 修复前无条件 PUT 把已删墓碑重新写回,条目以幽灵形态残留
+        // (stat 可合成但 read/restore 404)。
+        let (mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::ZERO).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let trash = win_state();
+        fs.trash = Some(trash.clone());
+        seed_win_tombstone(
+            &mock,
+            &trash,
+            "docs/a.txt",
+            Some("$R4de00001a.txt"),
+            None,
+            None,
+        );
+        mock.force_precondition_failed.store(true, Ordering::SeqCst);
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", vec![0x01, 0x02])
+            .await
+            .expect("条件写失败必须吞掉为 no-op(不阻塞 restore)");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i, None, "捕获字节不得写入(不复活幽灵墓碑)");
+        // 正向对照:无并发删除时捕获正常落 body
+        mock.force_precondition_failed
+            .store(false, Ordering::SeqCst);
+        trash
+            .set_recycle_i(&fs, "$I4de00001a.txt", vec![0x03])
+            .await
+            .expect("无并发删除捕获落 body");
+        let back: TombstoneBody =
+            serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
+                .unwrap();
+        assert_eq!(back.recycle_i.as_deref(), Some(&[0x03][..]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
