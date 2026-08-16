@@ -1218,6 +1218,8 @@ async fn main() -> anyhow::Result<()> {
                     crc64_mismatches = m.crc64_mismatches,
                     upload_bytes_total = m.upload_bytes_total,
                     download_bytes_total = m.download_bytes_total,
+                    trash_index_entries = m.trash_index_entries,
+                    trash_gc_etag_skips = m.trash_gc_etag_skips,
                     "ossfs metrics snapshot"
                 );
             }
