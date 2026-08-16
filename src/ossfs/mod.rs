@@ -572,6 +572,10 @@ pub const TRASH_REFRESH_INTERVAL_SECS: u64 = 30;
 /// 回收站全量重建周期秒:兜底「被恢复 / 被 GC 移除的墓碑」—— 增量游标
 /// 只增不减,全量重建 diff 解决索引只增不减的问题(规格 C5 阈值,同上)。
 pub const TRASH_REBUILD_INTERVAL_SECS: u64 = 600;
+/// 回收站索引条目数告警阈值:超过此值 → 仅 warn、行为不变(full_rebuild
+/// 的 diff 内存尖峰可见,缓解手段是 GC/trash-clean,见裁决 #6)。
+/// 规格 C5 新阈值落地(无旧值);变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_INDEX_ALERT_THRESHOLD: usize = 500_000;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -4685,6 +4689,11 @@ mod tests {
         // 与理由;此断言引用常量本身防漂移。
         assert_eq!(TRASH_REFRESH_INTERVAL_SECS, 30, "增量刷新周期 30s");
         assert_eq!(TRASH_REBUILD_INTERVAL_SECS, 600, "全量重建周期 10min");
+        assert_eq!(
+            TRASH_INDEX_ALERT_THRESHOLD,
+            500_000,
+            "索引规模告警阈值 500k(裁决 #6 新阈值,无旧值)"
+        );
         assert_eq!(
             trash::TRASH_EAGER_MIN_POLL_INTERVAL,
             Duration::from_secs(1),
