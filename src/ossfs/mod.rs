@@ -2196,6 +2196,17 @@ impl ObjectFs {
         trash.index.read().unwrap().is_covered(key)
     }
 
+    /// 分页过滤专用(裁决 #12):调用方持**每页一次**读锁快照,本方法不再
+    /// 取锁。语义与 [`Self::hidden_key`] 相同(.trash 自隐藏双形态 + 索引
+    /// 覆盖);前提是过滤循环内无 await —— 见 `list_impl` 快照注释。
+    fn hidden_key_with(&self, snapshot: &trash::TombstoneIndex, key: &str) -> bool {
+        let Some(trash) = &self.trash else {
+            return false;
+        };
+        let p = trash.prefix.as_str();
+        key.starts_with(p) || key == p.trim_end_matches('/') || snapshot.is_covered(key)
+    }
+
     /// 全量重建索引:分页 ListObjectsV2(prefix = trash.prefix)经 decode 出
     /// (original_key, is_dir);离线构建新集合,短写锁整体换入(遍历期间不持写锁,
     /// 否则刷新/GC 与挂载 list 相互饿死);末尾全清 stat/negative 缓存;
@@ -2393,12 +2404,20 @@ impl ObjectFs {
                     return Err(e).context("s3 list");
                 }
             };
+            // 回收站过滤(裁决 #12):每页一次读锁快照包整页两个过滤循环
+            // —— 10 万条目页面由逐条目 10 万次锁往返降为每页 1 次(读锁
+            // 与增量刷新写锁互斥,锁往返是热路径常数因子)。快照只覆盖
+            // 本页循环:循环内无 await(纯内存比较、零远程),读守卫不得
+            // 跨 await 存活(阻塞写者且使 future !Send),随页释放。
+            let snapshot = self.trash.as_ref().map(|t| t.index.read().unwrap());
             for cp in resp.common_prefixes() {
                 if let Some(p) = cp.prefix() {
-                    // 回收站过滤:在分页循环内过滤,不触发重分页,continuation
-                    // token 不受影响(目录墓碑覆盖的 common_prefix 一并跳过)。
-                    if self.hidden_key(p) {
-                        continue;
+                    if let Some(snap) = &snapshot {
+                        // 目录墓碑覆盖的 common_prefix 一并跳过;在分页
+                        // 循环内过滤,continuation token 不受影响。
+                        if self.hidden_key_with(snap, p) {
+                            continue;
+                        }
                     }
                     let name = p
                         .strip_prefix(&prefix)
@@ -2421,9 +2440,12 @@ impl ObjectFs {
                 if key == prefix {
                     continue;
                 }
-                // 回收站过滤:marker 跳过之后、裁剪之前 —— 隐藏 key 免一次裁剪分配。
-                if self.hidden_key(key) {
-                    continue;
+                if let Some(snap) = &snapshot {
+                    // 回收站过滤:marker 跳过之后、裁剪之前 —— 隐藏 key
+                    // 免一次裁剪分配。
+                    if self.hidden_key_with(snap, key) {
+                        continue;
+                    }
                 }
                 let Some(name) = key.strip_prefix(&prefix) else {
                     continue;
@@ -2441,6 +2463,7 @@ impl ObjectFs {
                     mtime_secs: obj.last_modified().map(|d| d.secs()).unwrap_or(0),
                 });
             }
+            drop(snapshot);
             match next_page_token(&resp)? {
                 Some(tok) => token = Some(tok),
                 None => break,
