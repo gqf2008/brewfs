@@ -2239,25 +2239,21 @@ impl ObjectFs {
     }
 
     /// 索引变更后的缓存失效接缝(单元 2 的调用点;本单元由其测试驱动):
-    /// 内部:key_for → index.write().insert → 失效目标路径(目录墓碑额外按
-    /// `path.trim_end_matches('/') + "/"` 前缀扫掉 stats/negative 后代条目,
-    /// 有界 map ≤4096 一次扫描可忽略)。同步,不 await。
+    /// 内部:key_for → index.write().insert → gauge 同步(裁决 #9:测试
+    /// 用 trash_insert 建索引后断言 trash_index_entries 此前会得 0)→
+    /// 失效目标路径(目录墓碑额外按 `path.trim_end_matches('/') + "/"`
+    /// 前缀扫掉 stats/negative 后代条目,有界 map ≤4096 一次扫描可忽略)。
+    /// 同步,不 await。仅测试驱动(生产写入路径走 TrashState 方法)。
     pub(crate) fn trash_insert(&self, path: &str, is_dir: bool) {
         let Some(trash) = &self.trash else {
             return;
         };
         let key = self.key_for(path);
-        trash.index.write().unwrap().insert(&key, is_dir);
-        self.invalidate_trash_cached(path, is_dir);
-    }
-
-    /// 索引移除 + 缓存失效(与 [`Self::trash_insert`] 对称)。不存在 no-op。
-    pub(crate) fn trash_remove(&self, path: &str, is_dir: bool) {
-        let Some(trash) = &self.trash else {
-            return;
-        };
-        let key = self.key_for(path);
-        trash.index.write().unwrap().remove(&key, is_dir);
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert(&key, is_dir);
+            trash.store_index_entries(idx.len());
+        }
         self.invalidate_trash_cached(path, is_dir);
     }
 
@@ -7332,6 +7328,23 @@ mod s3_mock_tests {
     fn crc64ecma_matches_known_vectors() {
         assert_eq!(crc64ecma(b"123456789"), 0x995DC9BBDF1939FA);
         assert_eq!(crc64ecma(b"a"), 0x330284772E652B05);
+    }
+
+    /// 裁决 #9:trash_insert 必须同步 index_entries gauge(修复前:测试
+    /// 用 trash_insert 建索引后断言 gauge 会得 0 —— 既有集成测试未断言
+    /// 故未暴露;trash_remove 无生产调用点,已删除,trash_insert 为仅存
+    /// 测试驱动接缝)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_insert_updates_gauge() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        assert_eq!(fs.metrics().trash_index_entries, 1, "文件墓碑 gauge=1");
+        fs.trash_insert("/docs", true);
+        assert_eq!(fs.metrics().trash_index_entries, 2, "目录墓碑 gauge=2");
+        fs.trash_insert("/a.txt", false); // 幂等
+        assert_eq!(fs.metrics().trash_index_entries, 2, "重复插入不涨 gauge");
     }
 
     /// 回收站集成测试统一手法:直接构造 ObjectFs 不走 connect,手置
