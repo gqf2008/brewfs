@@ -17,6 +17,7 @@
 //! [`crate::ossfs::winfsp`] (Windows only) and [`crate::ossfs::fuse`] (macOS/Linux).
 
 pub mod admin;
+pub mod trash;
 
 #[cfg(all(not(windows), feature = "fuse"))]
 pub mod fuse;
