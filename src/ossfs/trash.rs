@@ -692,7 +692,11 @@ impl TrashState {
                 })
                 .context("s3 delete tombstone")?;
         }
-        if !to_delete.is_empty() {
+        // 扫描成功 = 远端已无该墓碑(命中已删,或外部客户端先删 → 幽灵):
+        // 无条件移除索引条目并同步 gauge —— 扫描无命中即幽灵,立即解除
+        // 隐藏(裁决 #4;修复前跳过后同名重建文件最长 600s 不可见)。
+        // 不存在时 remove 为 no-op(祖先墓碑覆盖下的 mkdir 等,安全)。
+        {
             let mut idx = self.index.write().unwrap();
             idx.remove(target, is_dir);
             self.index_entries

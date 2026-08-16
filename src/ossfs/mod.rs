@@ -7786,6 +7786,43 @@ mod s3_mock_tests {
         assert_eq!(after.s3_heads - before.s3_heads, 0);
     }
 
+    /// 裁决 #4 回归:外部客户端直接删远端墓碑后(其他挂载端恢复/管理命令),
+    /// 本地索引条目成「幽灵」;同名 write 必须立即可见 —— 清墓碑扫描无命中
+    /// 也要无条件移除索引条目(修复前:扫描为空跳过 index.remove,同名重建
+    /// 文件最长 600s 全量重建周期后才解除隐藏)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recreate_after_external_tombstone_deleted_is_visible() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+
+        // 外部客户端直接删除远端墓碑(mock 移除墓碑对象;索引仍覆盖)
+        mock.entries
+            .lock()
+            .unwrap()
+            .retain(|(k, _)| !k.starts_with(".trash/"));
+        mock.objects
+            .lock()
+            .unwrap()
+            .retain(|k, _| !k.starts_with(".trash/"));
+
+        fs.write("/a.txt", b"new").await.expect("同名重建");
+
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_some(),
+            "外部删墓碑后同名 write 必须立即可见(幽灵索引不得持续隐藏)"
+        );
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            0,
+            "幽灵索引条目必须移除并同步 gauge"
+        );
+    }
+
     /// rename 源被墓碑覆盖 → Err 且零 copy 请求(隐藏对象不得被搬出)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rename_source_covered_bails() {
