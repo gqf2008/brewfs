@@ -38,9 +38,20 @@ use aws_smithy_runtime_api::client::interceptors::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+
+/// Remote trash refresh mode (唯一定义在本模块;单元 3 起启用 eager)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrashRefreshMode {
+    /// 周期刷新(默认):本端删除即时隐藏,远端变更 ≤ 刷新周期感知。
+    #[default]
+    Lazy,
+    /// 每次 list/stat 前先增量刷一遍 `.trash`,窗口缩到 OSS 最终一致量级,
+    /// 代价是枚举类请求的远程成本翻倍。
+    Eager,
+}
 
 /// S3-compatible object store configuration.
 #[derive(Debug, Clone)]
@@ -193,6 +204,20 @@ pub struct OssConfig {
     pub stat_cache_ttl_secs: u64,
     /// Maximum positive-stat cache entries (default 4096).
     pub stat_cache_max_entries: usize,
+    /// Trash (soft delete) directory name relative to the namespace root.
+    /// `Some(".trash")` enables the trash; `None` disables it (hard delete).
+    /// The CLI defaults to `Some`; the library API to `None` — `normalize`
+    /// never fills it, so the gate is never overridden by defaulting.
+    pub trash_dir: Option<String>,
+    /// Retention days before the GC may clear a tombstone (unit 4 lands the
+    /// default; `None` = unset for now).
+    pub trash_retention_days: Option<u32>,
+    /// Remote trash refresh interval in seconds (unit 3 lands the default).
+    pub trash_refresh_interval_secs: Option<u64>,
+    /// `Lazy` (default) | `Eager` remote trash refresh (unit 3 enables eager).
+    pub trash_refresh_mode: Option<TrashRefreshMode>,
+    /// GC interval in seconds (unit 4 lands the default).
+    pub trash_gc_interval_secs: Option<u64>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -1718,6 +1743,8 @@ pub struct ObjectFs {
     stats: Mutex<HashMap<String, (Instant, DirEntry)>>,
     /// Negative stat cache: path -> cached_at (path known missing).
     negative: Mutex<HashMap<String, Instant>>,
+    /// Trash (soft-delete) index; `None` = trash disabled (hard delete).
+    trash: Option<Arc<trash::TrashState>>,
     /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
     limiter: Arc<Semaphore>,
     /// Optional directory-enumeration rate limiter (see [OssConfig::list_rate_limit]).
@@ -1789,6 +1816,27 @@ pub struct ObjectFs {
     operation_timeout: std::time::Duration,
 }
 
+/// Build the trash state from config: `trash_dir` is a single path segment
+/// (rejecting empty / '/' / '.' / '..'), and the tombstone prefix is
+/// `{prefix}{trash_dir}/` (`prefix` is normalized to end with '/'; an empty
+/// prefix yields `.trash/`). `None` → trash disabled, no state.
+/// 启动重建(rebuild_trash_index)不在此处 spawn —— 由挂载钩子在单元 3 落地
+/// (connect 内无 Arc<ObjectFs>,后台任务无法 invalidate 缓存)。
+fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>>> {
+    let Some(dir) = &config.trash_dir else {
+        return Ok(None);
+    };
+    if dir.is_empty() || dir.contains('/') || dir == "." || dir == ".." {
+        anyhow::bail!(
+            "trash-dir must be a single path segment (no '/', '.' or '..'): got `{dir}`"
+        );
+    }
+    Ok(Some(Arc::new(trash::TrashState {
+        prefix: format!("{}{}/", config.prefix, dir),
+        index: RwLock::new(trash::TombstoneIndex::default()),
+    })))
+}
+
 impl ObjectFs {
     /// Build the S3 client from environment credentials
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or the shared config
@@ -1839,6 +1887,8 @@ impl ObjectFs {
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         let ignore_fsync = config.ignore_fsync;
         let dirty_budget = DirtyBudget::new(max_dirty_bytes.unwrap_or(0));
+        // 回收站状态必须在 struct 字面量之前构建(config 字段随后被 move)。
+        let trash = build_trash_state(&config)?;
         let disk_cache = match &config.disk_cache_dir {
             Some(dir) if config.disk_cache_max_bytes > 0 => Some(Arc::new(DiskCache::new(
                 dir.clone(),
@@ -1912,6 +1962,7 @@ impl ObjectFs {
             operation_timeout: std::time::Duration::from_secs(
                 configured_readwrite.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
             ),
+            trash,
         };
         // Fail fast on a missing bucket: every later request would 404, which
         // is indistinguishable from "empty bucket" and would surface as a
@@ -2068,6 +2119,83 @@ impl ObjectFs {
         }
     }
 
+    /// 统一过滤入口(私有,同步,不 await)。None 时只多一次判空 → 零行为变化。
+    /// .trash 自隐藏双形态:`key.starts_with(prefix)` 覆盖 ".trash/..." 与根 list 的
+    /// common_prefix;`key == prefix.trim_end_matches('/')` 覆盖 stat("/.trash") 的裸 key
+    /// 形态(否则经 marker HEAD 复活)。尾斜杠边界保证 ".trashx" 不误伤。
+    fn hidden_key(&self, key: &str) -> bool {
+        let Some(trash) = &self.trash else {
+            return false;
+        };
+        let p = trash.prefix.as_str();
+        if key.starts_with(p) || key == p.trim_end_matches('/') {
+            return true;
+        }
+        trash.index.read().unwrap().is_covered(key)
+    }
+
+    /// 全量重建索引:分页 ListObjectsV2(prefix = trash.prefix)经 decode 出
+    /// (original_key, is_dir);离线构建新集合,短写锁整体换入(遍历期间不持写锁,
+    /// 否则刷新/GC 与挂载 list 相互饿死);末尾全清 stat/negative 缓存;
+    /// 全程持一个 limiter permit(并发上限不可回归)。返回条目数(测试/指标用)。
+    pub(crate) async fn rebuild_trash_index(&self) -> Result<usize> {
+        let Some(trash) = &self.trash else {
+            return Ok(0);
+        };
+        let _permit = self.acquire().await?;
+        let mut index = trash::TombstoneIndex::default();
+        let mut count = 0usize;
+        let trash_prefix = trash.prefix.clone();
+        trash::list_trash_keys(self, None, |page| {
+            for key in page {
+                if let Some(t) = trash::decode_tombstone_key(&trash_prefix, &key) {
+                    index.insert(&t.original_key, t.is_dir);
+                    count += 1;
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        // 短写锁整体换入:离线构建期间读路径继续用旧索引
+        *trash.index.write().unwrap() = index;
+        self.stats.lock().unwrap().clear();
+        self.negative.lock().unwrap().clear();
+        Ok(count)
+    }
+
+    /// 索引变更后的缓存失效接缝(单元 2 的调用点;本单元由其测试驱动):
+    /// 内部:key_for → index.write().insert → 失效目标路径(目录墓碑额外按
+    /// `path.trim_end_matches('/') + "/"` 前缀扫掉 stats/negative 后代条目,
+    /// 有界 map ≤4096 一次扫描可忽略)。同步,不 await。
+    pub(crate) fn trash_insert(&self, path: &str, is_dir: bool) {
+        let Some(trash) = &self.trash else {
+            return;
+        };
+        let key = self.key_for(path);
+        trash.index.write().unwrap().insert(&key, is_dir);
+        self.invalidate_trash_cached(path, is_dir);
+    }
+
+    /// 索引移除 + 缓存失效(与 [`Self::trash_insert`] 对称)。不存在 no-op。
+    pub(crate) fn trash_remove(&self, path: &str, is_dir: bool) {
+        let Some(trash) = &self.trash else {
+            return;
+        };
+        let key = self.key_for(path);
+        trash.index.write().unwrap().remove(&key, is_dir);
+        self.invalidate_trash_cached(path, is_dir);
+    }
+
+    /// 墓碑索引变更的缓存失效:精确路径 + 目录后代前缀扫描。
+    fn invalidate_trash_cached(&self, path: &str, is_dir: bool) {
+        self.invalidate_stat(path);
+        if is_dir {
+            let dir = format!("{}/", path.trim_end_matches('/'));
+            self.stats.lock().unwrap().retain(|p, _| !p.starts_with(&dir));
+            self.negative.lock().unwrap().retain(|p, _| !p.starts_with(&dir));
+        }
+    }
+
     /// List the immediate children of `dir`.
     pub async fn list(&self, dir: &str) -> Result<Vec<DirEntry>> {
         self.acquire_list_permit().await;
@@ -2111,6 +2239,11 @@ impl ObjectFs {
             };
             for cp in resp.common_prefixes() {
                 if let Some(p) = cp.prefix() {
+                    // 回收站过滤:在分页循环内过滤,不触发重分页,continuation
+                    // token 不受影响(目录墓碑覆盖的 common_prefix 一并跳过)。
+                    if self.hidden_key(p) {
+                        continue;
+                    }
                     let name = p
                         .strip_prefix(&prefix)
                         .unwrap_or(p)
@@ -2130,6 +2263,10 @@ impl ObjectFs {
                 let Some(key) = obj.key() else { continue };
                 // The directory marker (key == list prefix) is the dir itself.
                 if key == prefix {
+                    continue;
+                }
+                // 回收站过滤:marker 跳过之后、裁剪之前 —— 隐藏 key 免一次裁剪分配。
+                if self.hidden_key(key) {
                     continue;
                 }
                 let Some(name) = key.strip_prefix(&prefix) else {
@@ -2247,11 +2384,16 @@ impl ObjectFs {
                 mtime_secs: 0,
             }));
         }
+        // 回收站过滤:根路径守卫之后、HEAD 计数之前 —— 被删路径的 stat
+        // 零远程请求(head 都不发);None 经 `stat()` 走 negative 缓存。
+        let key = self.key_for(path);
+        if self.hidden_key(&key) {
+            return Ok(None);
+        }
         // One request counted per request actually issued below: the initial
         // HEAD, plus the marker HEAD / prefix probe on the miss path.
         self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
-        let key = self.key_for(path);
         match self
             .client
             .head_object()
@@ -3822,6 +3964,7 @@ mod tests {
             dirty_budget: None,
             operation_timeout: std::time::Duration::from_secs(60),
             prefix: String::new(),
+            trash: None,
         }
     }
 
@@ -3837,6 +3980,45 @@ mod tests {
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
         assert_eq!(fs2.list_prefix("/docs"), "docs/");
         assert_eq!(fs2.list_prefix("/"), "");
+    }
+
+    #[test]
+    fn hidden_key_gate() {
+        let trash_state = |prefix: &str| {
+            Arc::new(trash::TrashState {
+                prefix: prefix.to_string(),
+                index: RwLock::new(trash::TombstoneIndex::default()),
+            })
+        };
+        // trash None → 恒 false(零行为变化)
+        let fs = test_fs();
+        assert!(!fs.hidden_key(".trash"));
+        assert!(!fs.hidden_key(".trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key("docs/a.txt"));
+        // ".trash" 裸形态与 ".trash/" 前缀
+        let mut fs = test_fs();
+        fs.trash = Some(trash_state(".trash/"));
+        assert!(fs.hidden_key(".trash"));
+        assert!(fs.hidden_key(".trash/"));
+        assert!(fs.hidden_key(".trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key(".trashx"), "尾斜杠边界:.trashx 不误伤");
+        assert!(!fs.hidden_key(".trashx/a.txt"));
+        // prefix 变体
+        let mut fs = test_fs();
+        fs.prefix = "ossfs/".into();
+        fs.trash = Some(trash_state("ossfs/.trash/"));
+        assert!(fs.hidden_key("ossfs/.trash"));
+        assert!(fs.hidden_key("ossfs/.trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key("ossfs/docs/a.txt"));
+        // 索引覆盖(files + dirs)
+        let mut fs = test_fs();
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        assert!(fs.hidden_key("a.txt"));
+        assert!(!fs.hidden_key("b.txt"));
+        fs.trash_insert("/docs", true);
+        assert!(fs.hidden_key("docs/x.txt"));
+        assert!(!fs.hidden_key("docsx/x.txt"));
     }
 
     #[test]
@@ -4144,9 +4326,18 @@ mod tests {
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
             credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
+        assert!(
+            cfg.trash_dir.is_none(),
+            "normalize 绝不填 trash_dir(None = 回收站关闭,门控不被默认值覆盖)"
+        );
     }
 
     #[test]
@@ -4227,6 +4418,11 @@ mod tests {
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
             credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
         };
         let cfg = base().normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(DEFAULT_CONNECT_TIMEOUT_SECS));
@@ -4885,6 +5081,7 @@ mod s3_mock_tests {
             metrics: Arc::new(Metrics::default()),
             dirty_budget: DirtyBudget::new(max_dirty_bytes.unwrap_or(0)),
             operation_timeout: std::time::Duration::from_secs(60),
+            trash: None,
         }
     }
 
@@ -6684,6 +6881,251 @@ mod s3_mock_tests {
     fn crc64ecma_matches_known_vectors() {
         assert_eq!(crc64ecma(b"123456789"), 0x995DC9BBDF1939FA);
         assert_eq!(crc64ecma(b"a"), 0x330284772E652B05);
+    }
+
+    /// 回收站集成测试统一手法:直接构造 ObjectFs 不走 connect,手置
+    /// `fs.trash`(避免 connect 的 spawn/head-bucket 干扰 metrics 增量)。
+    fn trash_state(prefix: &str) -> Arc<trash::TrashState> {
+        Arc::new(trash::TrashState {
+            prefix: prefix.to_string(),
+            index: RwLock::new(trash::TombstoneIndex::default()),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_filter_keeps_remote_cost() {
+        // 性能守卫:trash 开启后普通 list 的远程请求数与关闭时一致。
+        let entries = vec![
+            ("a.txt".into(), false),
+            ("docs/".into(), true),
+            ("docs/b.txt".into(), false),
+            (".trash/2026-08-16/a.txt".into(), false), // 墓碑对象
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        // trash 关闭基线
+        let fs = test_fs(port, 32);
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(after.s3_lists - before.s3_lists, 1, "基线 list = 1 次 s3 list");
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        assert!(root.iter().any(|e| e.name == "docs"));
+        // trash 开启 + rebuild
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let count = fs.rebuild_trash_index().await.unwrap();
+        assert_eq!(count, 1, "只有文件墓碑被索引");
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "trash 开启 list 的 s3_lists 增量与关闭时一致(过滤零额外远程成本)"
+        );
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "list 无 HEAD");
+        assert!(!root.iter().any(|e| e.name == "a.txt"), "被删文件隐藏");
+        assert!(!root.iter().any(|e| e.name == ".trash"), ".trash 自隐藏");
+        assert!(root.iter().any(|e| e.name == "docs"), "docs 可见");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_hides_tombstoned_dir() {
+        let entries = vec![("docs/".into(), true), ("docs/b.txt".into(), false)];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/docs", true);
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.is_empty(),
+            "docs common_prefix 与 marker 均隐藏: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let before = fs.metrics();
+        let docs = fs.list("/docs").await.unwrap();
+        let after = fs.metrics();
+        assert!(docs.is_empty(), "被删目录内容为空: {:?}", docs);
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "过滤在分页循环内,零重分页"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_hidden_is_local() {
+        // 性能守卫:被删路径 stat 零远程请求(head 都不发),negative cache 续零。
+        let entries = vec![("a.txt".into(), false), ("b.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("b.txt", b"b".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "被删路径 stat 零 HEAD");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // negative cache:再次 stat 仍零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 正向对照:活文件仍走一次 HEAD
+        let before = fs.metrics();
+        assert!(fs.stat("/b.txt").await.unwrap().is_some());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_dir_tombstone_covers_both_forms() {
+        // 回归 stat 复活 bug:目录墓碑存 "docs/",stat("/docs") 得 key "docs"。
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        assert!(fs.stat("/docs").await.unwrap().is_none());
+        assert!(fs.stat("/docs/").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "双形态均零请求");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_self_hiding() {
+        let entries = vec![
+            (".trash/2026-08-16/a.txt".into(), false),
+            ("a.txt".into(), false),
+            ("ossfs/.trash/2026-08-16/a.txt".into(), false),
+            ("ossfs/a.txt".into(), false),
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        // 无命名空间变体
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().all(|e| e.name != ".trash"),
+            "根 list 隐藏 .trash: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        let before = fs.metrics();
+        assert!(fs.stat("/.trash").await.unwrap().is_none(), "stat 裸 key 形态");
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 命名空间 prefix 变体
+        let mut fs = test_fs(port, 32);
+        fs.prefix = "ossfs/".into();
+        fs.trash = Some(trash_state("ossfs/.trash/"));
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().all(|e| e.name != ".trash"),
+            "prefix 变体同样隐藏: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let before = fs.metrics();
+        assert!(fs.stat("/.trash").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuild_from_mock() {
+        // 特殊字符 key、目录墓碑、垃圾对象(坏日期/裸日期分区/非 trash 前缀)
+        let entries = vec![
+            (".trash/2026-08-16/a b+c%23.txt".into(), false), // 文件墓碑(特殊字符)
+            (".trash/2026-08-16/docs/".into(), true),          // 目录墓碑
+            (".trash/bad-date/x.txt".into(), false),           // 垃圾:坏日期
+            (".trash/2026-08-16/".into(), false),              // 垃圾:裸日期分区
+            ("other/2026-08-16/x.txt".into(), false),          // 非 trash 前缀(列表前缀之外)
+            ("a b+c%23.txt".into(), false),                    // 原对象
+            ("docs/b.txt".into(), false),                      // 原对象
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let before = fs.metrics();
+        let count = fs.rebuild_trash_index().await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(count, 2, "文件+目录墓碑各一条,垃圾跳过");
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "s3_lists 增量 = 分页数"
+        );
+        // 过滤生效
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            !root.iter().any(|e| e.name == "a b+c%23.txt"),
+            "特殊字符 key 被隐藏"
+        );
+        assert!(!root.iter().any(|e| e.name == "docs"), "docs 目录被隐藏");
+        // 索引内容精确(垃圾未入索引)
+        let idx = fs.trash.as_ref().unwrap().index.read().unwrap();
+        assert_eq!(idx.files.len(), 1);
+        assert!(idx.files.contains("a b+c%23.txt"));
+        assert_eq!(idx.dirs, vec!["docs/".to_string()]);
+        drop(idx);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_trash_zero_change() {
+        // --no-trash 语义:同一 bucket 含 .trash 内容,trash None → list 返回
+        // 全部(回收站关闭则软删除语义不存在),远程成本不变。
+        let entries = vec![
+            ("a.txt".into(), false),
+            (".trash/2026-08-16/a.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        let fs = test_fs(port, 32); // trash = None
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(after.s3_lists - before.s3_lists, 1);
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        assert!(
+            root.iter().any(|e| e.name.contains(".trash")),
+            "关闭时 .trash 内容可见: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // stat 不隐藏
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_cache_invalidation() {
+        let entries = vec![("a.txt".into(), false), ("docs/b.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("docs/b.txt", b"b".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 正值缓存命中
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert!(fs.stat("/a.txt").await.unwrap().is_some(), "第二次走正值缓存");
+        // trash_insert 后立即 None 且零请求
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "失效后不复活");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 目录墓碑 insert 后,先前缓存的 "/docs/b.txt" 正值条目被前缀扫描失效
+        assert!(fs.stat("/docs/b.txt").await.unwrap().is_some());
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        assert!(fs.stat("/docs/b.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "目录后代缓存被扫掉");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
     }
 }
 

@@ -7,8 +7,11 @@
 //!
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
+use crate::ossfs::{next_page_token, ObjectFs};
+use anyhow::{Context as _, Result};
 use std::collections::HashSet;
 use std::sync::RwLock;
+use std::sync::atomic::Ordering;
 
 /// 墓碑 key 结构:`<date>` 为删除时 UTC 日期分区;original_key 为完整原对象 key
 /// (含命名空间 prefix,与 `key_for()` / `obj.key()` 零转换);is_dir 由 original_key
@@ -163,6 +166,57 @@ pub(crate) struct TrashState {
     pub prefix: String,
     /// 本地索引(files + dirs)
     pub index: RwLock<TombstoneIndex>,
+}
+
+/// 以 trash_prefix 分页枚举墓碑对象 key。start_after 传 Some 时携带
+/// ListObjectsV2 start-after 参数(单元 3);None 为从头全量。
+/// 分页间续 token 处理复用 next_page_token 的 truncated 护栏(#60)。
+/// 不 acquire limiter permit:调用方决定(rebuild 全程持一个 permit,
+/// eager 挂点靠 poll_inflight 互斥,均见各调用点注释)。
+/// s3_lists 计数与 list_impl 对齐(每页 +1)。
+pub(crate) async fn list_trash_keys(
+    fs: &ObjectFs,
+    start_after: Option<&str>,
+    mut on_page: impl FnMut(Vec<String>) -> Result<()>,
+) -> Result<()> {
+    let Some(trash) = &fs.trash else {
+        return Ok(());
+    };
+    let trash_prefix = trash.prefix.clone();
+    let mut token: Option<String> = None;
+    loop {
+        fs.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
+        let mut req = fs
+            .client
+            .list_objects_v2()
+            .bucket(&fs.bucket)
+            .prefix(&trash_prefix);
+        if let Some(sa) = start_after {
+            req = req.start_after(sa);
+        }
+        if let Some(tok) = token.as_deref() {
+            req = req.continuation_token(tok);
+        }
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                fs.metrics.s3_list_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e).context("s3 list trash");
+            }
+        };
+        let page: Vec<String> = resp
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        on_page(page)?;
+        match next_page_token(&resp)? {
+            Some(tok) => token = Some(tok),
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
