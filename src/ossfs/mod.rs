@@ -7866,6 +7866,34 @@ mod s3_mock_tests {
         );
     }
 
+    /// 裁决 #8:stat("/d/") 尾斜杠形态先入正值缓存 → soft_delete_dir 后
+    /// 双形态都必须立即失效(修复前:soft_delete_dir 只失效裸形态
+    /// invalidate_stat("/d") + clear_read_cache,stat("/d/") 缓存条目
+    /// 存活至 TTL ≤3s,期间 stat("/d/") 短暂返回存在)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_dir_invalidates_both_stat_forms() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("d/", Vec::new()); // 隐式目录 marker
+        let mut fs = test_fs(port, 32);
+        fs.stat_ttl = Duration::from_secs(3600); // 冻结 TTL:缓存不自然过期,确定性
+        fs.trash = Some(trash_state(".trash/"));
+        // 尾斜杠形态正值缓存(远程 marker 存在)
+        assert!(fs.stat("/d/").await.unwrap().is_some());
+        fs.delete_dir_recursive("/d")
+            .await
+            .expect("soft delete dir");
+        let before = fs.metrics();
+        assert!(
+            fs.stat("/d/").await.unwrap().is_none(),
+            "soft_delete_dir 后 stat(\"/d/\") 尾斜杠形态必须立即失效"
+        );
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "失效后零请求");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 裸形态同样失效
+        assert!(fs.stat("/d").await.unwrap().is_none());
+    }
+
     /// 裁决 #3 回归:同名重建 write 的 PUT 失败 → 墓碑必须保留(软删除
     /// 不被静默撤销)。修复前:先清墓碑再 PUT,PUT 失败后已删文件带旧内容
     /// 永久可见、trash 索引/GC 追踪丢失。

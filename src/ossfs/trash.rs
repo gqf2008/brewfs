@@ -741,7 +741,13 @@ impl TrashState {
             idx.insert(&dir_key, true);
             self.store_index_entries(idx.len());
         }
-        fs.invalidate_stat(dir);
+        // 双形态缓存失效(裁决 #8):invalidate_trash_cached 覆盖裸形态
+        // "/d" 与 "/d/" 尾斜杠形态及后代前缀(stat("/d") 与 stat("/d/")
+        // 是不同缓存键 —— 只失效裸形态会让 "/d/" 正值条目存活至 TTL,
+        // 期间 stat("/d/") 短暂返回存在);clear_read_cache 保持子树
+        // read-ahead 清理(镜像 delete_dir_recursive_impl)。
+        fs.invalidate_trash_cached(dir, true);
+        fs.invalidate_stat(dir.trim_end_matches('/'));
         fs.clear_read_cache();
         fs.metrics
             .trash_tombstones_written
