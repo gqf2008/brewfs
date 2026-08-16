@@ -8,8 +8,8 @@
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
 use crate::ossfs::{
-    DeleteObjectsContentMd5, MAX_DELETE_OBJECTS_PER_REQUEST, ObjectFs, TrashRefreshMode,
-    is_s3_not_found, next_page_token,
+    DeleteObjectsContentMd5, DirEntry, MAX_DELETE_OBJECTS_PER_REQUEST, ObjectFs, TrashRefreshMode,
+    basename, is_s3_not_found, next_page_token,
 };
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
@@ -202,10 +202,7 @@ impl TombstoneIndex {
 
     /// 整体替换;dirs 按 key sort + 去重(保留最新 date);files 由 HashMap
     /// 天然按 key 去重(同名多日期墓碑只留最新 date)。
-    pub fn rebuild(
-        &mut self,
-        tombstones: impl Iterator<Item = (String, bool, chrono::NaiveDate)>,
-    ) {
+    pub fn rebuild(&mut self, tombstones: impl Iterator<Item = (String, bool, chrono::NaiveDate)>) {
         let mut files = HashMap::new();
         let mut dirs: Vec<(String, chrono::NaiveDate)> = Vec::new();
         for (key, is_dir, date) in tombstones {
@@ -272,7 +269,10 @@ pub(crate) enum SystemTrashPlatform {
 pub(crate) struct SystemTrash {
     /// "$Recycle.Bin" | ".Trashes"(挂载根下可见目录名)
     pub dir_name: String,
-    /// 完整 key 前缀,含 namespace prefix,尾斜杠,如 "ossfs/$Recycle.Bin/"
+    /// 完整 key 前缀,含 namespace prefix,尾斜杠,如 "ossfs/$Recycle.Bin/"。
+    /// 单元 1 无消费点(渲染/识别走视图路径 + 墓碑索引);单元 2(软删/还原)
+    /// /3(永久删/清空)/4 以键空间判定消费 —— 界面先行,防漂移。
+    #[allow(dead_code)]
     pub key_prefix: String,
     pub platform: SystemTrashPlatform,
     /// macOS 渲染/拦截范围;空 = 当前挂载用户 uid(裁决 R17)
@@ -291,12 +291,13 @@ pub(crate) enum SystemTrashMatch {
 /// Windows $R 名 ↔ 墓碑的反向索引(裁决 R3:① 本地软删写入;② 增量/全量
 /// 重建 diff 读 body 填充;③ 渲染/读取未命中按需 GET 兜底)。派生缓存,
 /// 非独立事实源;与墓碑同生命周期(remove_tombstone_maps 收尾)。
+/// 字段 pub(crate):单元 2(soft_delete_via_system 写入)/3/4 消费。
 #[derive(Debug, Default)]
 pub(crate) struct RecycleNameIndex {
     /// recycle_name -> 墓碑 key(".trash/<date>/<orig>",带前缀)
-    by_name: HashMap<String, String>,
+    pub(crate) by_name: HashMap<String, String>,
     /// original_key(带前缀) -> recycle_name(最新,裁决 R7)
-    by_key: HashMap<String, String>,
+    pub(crate) by_key: HashMap<String, String>,
 }
 
 /// 回收站运行状态:墓碑前缀 + 本地索引 + 多端同步调度字段。挂在
@@ -469,7 +470,12 @@ impl TrashState {
     /// 期间 trash_gc 已完成(代际推进)则本轮快照已陈旧 —— 其中可能含
     /// GC 刚删掉的墓碑,整体丢弃返回 false(游标不推进,下轮重试),绝不
     /// 把已删墓碑重插回索引。
-    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool, chrono::NaiveDate)], gen_snapshot: u64) -> bool {
+    fn apply_added(
+        &self,
+        fs: &ObjectFs,
+        added: &[(String, bool, chrono::NaiveDate)],
+        gen_snapshot: u64,
+    ) -> bool {
         if self.generation.load(Ordering::SeqCst) != gen_snapshot {
             return false; // GC 并发完成:陈旧快照整体丢弃(L4)
         }
@@ -484,13 +490,18 @@ impl TrashState {
             // 期间全部 list/stat 读锁被阻塞)。mem::take 零克隆换出原 Vec,
             // 排序期间读侧被写锁遮挡;files 由 HashMap 批量 entry(O(m))。
             let mut dirs = std::mem::take(&mut idx.dirs);
-            dirs.extend(added.iter().filter(|(_, is_dir, _)| *is_dir).map(|(k, _, date)| {
-                if k.ends_with('/') {
-                    (k.clone(), *date)
-                } else {
-                    (format!("{k}/"), *date)
-                }
-            }));
+            dirs.extend(
+                added
+                    .iter()
+                    .filter(|(_, is_dir, _)| *is_dir)
+                    .map(|(k, _, date)| {
+                        if k.ends_with('/') {
+                            (k.clone(), *date)
+                        } else {
+                            (format!("{k}/"), *date)
+                        }
+                    }),
+            );
             dirs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             let mut deduped: Vec<(String, chrono::NaiveDate)> = Vec::with_capacity(dirs.len());
             for (k, date) in dirs {
@@ -776,6 +787,481 @@ impl TrashState {
             }
         }
     }
+
+    /// 条目名 → (原 key, 墓碑 key, is_dir)。反查顺序(裁决 R3):
+    /// ① by_name 命中 → 墓碑 key → decode(零远程);
+    /// ② macOS:索引内 basename 扫描(同名多日期/重名取最新,裁决 R7;
+    ///    重名歧义 warn;零远程);
+    /// ③ Windows 冷路径(cold_scan=true):对 by_key 未覆盖的索引条目按需
+    ///    GET 墓碑 body 扫描填充(请求数 ≤ 未命中条目数,天然有界)。
+    /// **调用方已持 limiter permit**(冷路径 GET 走 read_tombstone);
+    /// read_range 的系统分支在调用前 acquire。
+    async fn resolve_entry(
+        &self,
+        fs: &ObjectFs,
+        entry_name: &str,
+        cold_scan: bool,
+    ) -> Result<Option<ResolvedEntry>> {
+        let Some(sys) = &self.system else {
+            return Ok(None);
+        };
+        // ① by_name 命中:零远程
+        if let Some(tomb_key) = self
+            .recycle_names
+            .read()
+            .unwrap()
+            .by_name
+            .get(entry_name)
+            .cloned()
+        {
+            if let Some(t) = decode_tombstone_key(&self.prefix, &tomb_key) {
+                return Ok(Some(ResolvedEntry {
+                    original_key: t.original_key,
+                    tomb_key,
+                    is_dir: t.is_dir,
+                }));
+            }
+        }
+        // 索引快照(锁不跨 await)
+        let entries: Vec<(String, chrono::NaiveDate, bool)> = {
+            let index = self.index.read().unwrap();
+            let mut v: Vec<(String, chrono::NaiveDate, bool)> = index
+                .files
+                .iter()
+                .map(|(k, d)| (k.clone(), *d, false))
+                .collect();
+            v.extend(index.dirs.iter().map(|(k, d)| (k.clone(), *d, true)));
+            v
+        };
+        match sys.platform {
+            SystemTrashPlatform::MacOsTrashes => {
+                // ② basename 扫描:同名多日期/不同原 key 同名都取最新(裁决 R7)
+                let mut best: Option<ResolvedEntry> = None;
+                let mut best_date: Option<chrono::NaiveDate> = None;
+                let mut candidates: usize = 0;
+                for (key, date, is_dir) in &entries {
+                    if basename(key) == entry_name {
+                        candidates += 1;
+                        if best_date.is_none_or(|bd| *date > bd) {
+                            best = Some(ResolvedEntry {
+                                original_key: key.clone(),
+                                tomb_key: encode_tombstone_key(&self.prefix, *date, key, *is_dir),
+                                is_dir: *is_dir,
+                            });
+                            best_date = Some(*date);
+                        }
+                    }
+                }
+                if candidates > 1 {
+                    tracing::warn!(
+                        entry_name,
+                        "trash system view: 同名条目存在多个墓碑,取最新(date),还原/读取可能命中重名文件"
+                    );
+                }
+                Ok(best)
+            }
+            SystemTrashPlatform::WindowsRecycleBin => {
+                if !cold_scan {
+                    return Ok(None); // stat 路径:未知条目按不存在(P3 零远程)
+                }
+                // ③ 冷路径:按需 GET body 扫描填充(裁决 R3 ③)
+                let _permit = fs.acquire().await?;
+                let mut found: Option<ResolvedEntry> = None;
+                for (key, date, is_dir) in &entries {
+                    let tomb_key = encode_tombstone_key(&self.prefix, *date, key, *is_dir);
+                    let Some(body) = self.read_tombstone(fs, &tomb_key).await? else {
+                        continue; // 墓碑并发删除:跳过
+                    };
+                    let Some(name) = body.recycle_name else {
+                        continue; // 非系统视图墓碑(普通软删):不填充
+                    };
+                    let mut names = self.recycle_names.write().unwrap();
+                    if !names.by_key.contains_key(key) {
+                        names.by_name.insert(name.clone(), tomb_key.clone());
+                        names.by_key.insert(key.clone(), name.clone());
+                    }
+                    drop(names);
+                    if name == entry_name {
+                        found = Some(ResolvedEntry {
+                            original_key: key.clone(),
+                            tomb_key,
+                            is_dir: *is_dir,
+                        });
+                        break;
+                    }
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    /// 条目 → 原 key(带命名空间前缀)。Windows:by_name 命中零远程;未命中
+    /// 按需 GET 墓碑 body 扫描填充(裁决 R3 ③)。macOS:索引内 basename 扫描
+    /// (同名多版本取最新,裁决 R7;重名歧义 warn)。None = 反查失败。
+    /// **调用方已持 limiter permit**(冷路径 GET);read_range 在调用前 acquire。
+    pub(crate) async fn resolve_entry_original(
+        &self,
+        fs: &ObjectFs,
+        entry_name: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .resolve_entry(fs, entry_name, true)
+            .await?
+            .map(|r| r.original_key))
+    }
+
+    /// 目录层列表合成(裁决 R9:目录条目为叶)。Dir level 0 → Windows 渲染
+    /// seen_sids(裁决 R14)/macOS 渲染 macos_uid_dirs(空 = 当前用户 uid,
+    /// 裁决 R17);level 1 → 遍历索引,条目名 = by_key 命中则用之,否则
+    /// basename(original_key);Windows 额外成对生成 $I 条目(裁决 R8,
+    /// $R 名换 $I 前缀,size = 合成长度)。Windows 冷路径对 by_key 未覆盖
+    /// 条目 GET body 填充(裁决 R3 ③,GET 数 ≤ 未命中条目数,天然有界);
+    /// 暖路径零 GET(P1 守卫)。**调用方(list_impl)已持 limiter permit**。
+    pub(crate) async fn synthesize_dir_entries(
+        &self,
+        fs: &ObjectFs,
+        dir: &str,
+    ) -> Result<Vec<DirEntry>> {
+        let Some(sys) = &self.system else {
+            return Ok(Vec::new());
+        };
+        match self.match_system_trash(dir) {
+            Some(SystemTrashMatch::Dir { level: 0 }) => {
+                let mut out: Vec<DirEntry> = Vec::new();
+                match sys.platform {
+                    SystemTrashPlatform::WindowsRecycleBin => {
+                        // 裁决 R14:seen_sids ∪ 当前用户 SID(尽力)。当前用户
+                        // SID 获取(GetTokenInformation)[待验证],非 Windows
+                        // 平台降级为仅 seen_sids(重启后根目录只显示新记录
+                        // 的 SID,条目仍可直接访问 SID 路径)。
+                        for sid in self.seen_sids.read().unwrap().iter() {
+                            out.push(DirEntry {
+                                name: sid.clone(),
+                                is_dir: true,
+                                size: 0,
+                                mtime_secs: 0,
+                            });
+                        }
+                    }
+                    SystemTrashPlatform::MacOsTrashes => {
+                        let uids: Vec<u32> = if sys.macos_uid_dirs.is_empty() {
+                            vec![current_uid()]
+                        } else {
+                            sys.macos_uid_dirs.clone()
+                        };
+                        for uid in uids {
+                            out.push(DirEntry {
+                                name: uid.to_string(),
+                                is_dir: true,
+                                size: 0,
+                                mtime_secs: 0,
+                            });
+                        }
+                    }
+                }
+                out.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(out)
+            }
+            Some(SystemTrashMatch::Dir { level: 1 }) => {
+                // 索引快照(锁不跨 await;锁纪律见模块头)
+                let entries: Vec<(String, chrono::NaiveDate, bool)> = {
+                    let index = self.index.read().unwrap();
+                    let mut v: Vec<(String, chrono::NaiveDate, bool)> = index
+                        .files
+                        .iter()
+                        .map(|(k, d)| (k.clone(), *d, false))
+                        .collect();
+                    v.extend(index.dirs.iter().map(|(k, d)| (k.clone(), *d, true)));
+                    v
+                };
+                // 第一遍:条目名 = by_key 命中则用之,否则 basename(裁决
+                // R7 最新优先);Windows 对 by_key 未覆盖条目标记冷路径候选。
+                let mut pending: Vec<(String, String, chrono::NaiveDate, bool)> =
+                    Vec::with_capacity(entries.len());
+                let mut cold: Vec<(String, String, bool)> = Vec::new();
+                for (key, date, is_dir) in &entries {
+                    let by_key = self.recycle_names.read().unwrap().by_key.get(key).cloned();
+                    let name = by_key.clone().unwrap_or_else(|| basename(key));
+                    if sys.platform == SystemTrashPlatform::WindowsRecycleBin && by_key.is_none() {
+                        cold.push((
+                            key.clone(),
+                            encode_tombstone_key(&self.prefix, *date, key, *is_dir),
+                            *is_dir,
+                        ));
+                    }
+                    pending.push((key.clone(), name, *date, *is_dir));
+                }
+                // Windows 冷路径:GET body 填充(请求数 ≤ 未命中条目数,
+                // P1 守卫);recycle_name None 的墓碑保持 basename 渲染。
+                // macOS 恒零额外请求(裁决 P1)。
+                if sys.platform == SystemTrashPlatform::WindowsRecycleBin && !cold.is_empty() {
+                    for (key, tomb_key, is_dir) in &cold {
+                        let Some(body) = self.read_tombstone(fs, tomb_key).await? else {
+                            continue; // 墓碑并发删除:保持 basename 渲染
+                        };
+                        let Some(name) = &body.recycle_name else {
+                            continue; // 非系统视图墓碑(普通软删)
+                        };
+                        let mut names = self.recycle_names.write().unwrap();
+                        if !names.by_key.contains_key(key) {
+                            names.by_name.insert(name.clone(), tomb_key.clone());
+                            names.by_key.insert(key.clone(), name.clone());
+                        }
+                        drop(names);
+                        if let Some(e) = pending
+                            .iter_mut()
+                            .find(|(k, _, _, d)| k == key && *d == *is_dir)
+                        {
+                            e.1 = name.clone();
+                        }
+                    }
+                }
+                let mut out: Vec<DirEntry> = pending
+                    .into_iter()
+                    .map(|(_, name, _, is_dir)| DirEntry {
+                        name,
+                        is_dir,
+                        size: 0,
+                        mtime_secs: 0,
+                    })
+                    .collect();
+                // Windows 额外成对生成 $I 条目(裁决 R8):$R 名换 $I 前缀,
+                // size = 合成长度(确定性,零远程)。目录无 $I。
+                if sys.platform == SystemTrashPlatform::WindowsRecycleBin {
+                    let pairs: Vec<(String, usize)> = out
+                        .iter()
+                        .filter(|e| !e.is_dir && e.name.starts_with("$R"))
+                        .map(|e| {
+                            (
+                                format!("$I{}", &e.name[2..]),
+                                synthesized_i_len(&self.i_path(fs, &e.name)),
+                            )
+                        })
+                        .collect();
+                    for (name, size) in pairs {
+                        out.push(DirEntry {
+                            name,
+                            is_dir: false,
+                            size: size as u64,
+                            mtime_secs: 0,
+                        });
+                    }
+                }
+                out.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// $I 路径字段(挂载盘符 + original_key 视图形态;`/` → `\`)。由条目名
+    /// 反查原 key(by_name),未命中退化为条目名本身(仅影响合成长度与字节
+    /// 内容;捕获为主时无影响)。
+    fn i_path(&self, fs: &ObjectFs, entry_name: &str) -> String {
+        let orig = self
+            .recycle_names
+            .read()
+            .unwrap()
+            .by_name
+            .get(entry_name)
+            .and_then(|tk| decode_tombstone_key(&self.prefix, tk))
+            .map(|t| t.original_key);
+        match orig {
+            Some(orig) => i_view_path(fs, &orig),
+            None => format!("{}\\{}", SYNTHESIZED_I_DRIVE, entry_name.replace('/', "\\")),
+        }
+    }
+
+    /// 系统前缀内 stat(裁决 P3):Dir 层合成目录条目(零远程);Entry 层
+    /// Windows $I → size = recycle_i 长度(无捕获字节时合成长度);$R/macOS
+    /// 条目 → 按需 GET 墓碑 body 取 size(≤1 次,裁决 P3);目录条目零远程
+    /// (size 恒 0)。by_name 未命中的条目按不存在处理(cold_scan=false,
+    /// 未知条目 stat 零远程 —— P3 的 ≤1 次 GET 只覆盖「已解析」条目)。
+    /// **调用方(stat_uncached_impl)已持 limiter permit**。
+    pub(crate) async fn synthesize_stat(
+        &self,
+        fs: &ObjectFs,
+        path: &str,
+    ) -> Result<Option<DirEntry>> {
+        let Some(sys) = &self.system else {
+            return Ok(None);
+        };
+        match self.match_system_trash(path) {
+            Some(SystemTrashMatch::Dir { .. }) => Ok(Some(DirEntry {
+                name: basename(path),
+                is_dir: true,
+                size: 0,
+                mtime_secs: 0,
+            })),
+            Some(SystemTrashMatch::Entry { entry_name }) => {
+                // Windows $I:size = 捕获字节长度,缺失时合成长度(裁决 R8)。
+                // 反查 $R 同名条目(by_name 键是 $R 名),GET ≤1(裁决 P3)。
+                if sys.platform == SystemTrashPlatform::WindowsRecycleBin && is_i_entry(&entry_name)
+                {
+                    let r_name = format!("$R{}", &entry_name[2..]);
+                    let Some(resolved) = self.resolve_entry(fs, &r_name, false).await? else {
+                        return Ok(None);
+                    };
+                    let Some(body) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+                        return Ok(None);
+                    };
+                    let size = body.recycle_i.map(|b| b.len() as u64).unwrap_or_else(|| {
+                        synthesized_i_len(&i_view_path(fs, &resolved.original_key)) as u64
+                    });
+                    return Ok(Some(DirEntry {
+                        name: entry_name,
+                        is_dir: false,
+                        size,
+                        mtime_secs: 0,
+                    }));
+                }
+                // $R / macOS 条目:解析(≤1 body GET 由 read_tombstone 承担)
+                let Some(resolved) = self.resolve_entry(fs, &entry_name, false).await? else {
+                    return Ok(None);
+                };
+                if resolved.is_dir {
+                    return Ok(Some(DirEntry {
+                        name: entry_name,
+                        is_dir: true,
+                        size: 0,
+                        mtime_secs: 0,
+                    }));
+                }
+                let Some(body) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(DirEntry {
+                    name: entry_name,
+                    is_dir: false,
+                    size: body.size.unwrap_or(0),
+                    mtime_secs: 0,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Windows $I 合成(裁决 R8 回退,仅无捕获字节时用):8B 头(0x01)+
+    /// 8B size(LE,删除时 HEAD 的 content_length)+ 8B FILETIME(LE,删除
+    /// 日期 UTC 午夜)+ 4B 路径字符数(LE)+ UTF-16LE 路径(挂载盘符 +
+    /// original_key 视图形态)。长路径变体(8B 长度字段)触发条件
+    /// [待验证](捕获为主,风险低)。**调用方已持 limiter permit**
+    /// (read_range 系统分支);GET 数 ≤1(反查墓碑 body)。
+    pub(crate) async fn synthesize_i_file(
+        &self,
+        fs: &ObjectFs,
+        entry_name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        // $I 名 → $R 名(反向索引键)
+        let r_name = format!("$R{}", &entry_name[2..]);
+        let Some(resolved) = self.resolve_entry(fs, &r_name, true).await? else {
+            return Ok(None);
+        };
+        let Some(body) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+            return Ok(None);
+        };
+        // 捕获字节优先(裁决 R8:捕获保真,含盘符原始路径)
+        if let Some(captured) = &body.recycle_i {
+            return Ok(Some(captured.clone()));
+        }
+        let Some(date) = decode_tombstone_key(&self.prefix, &resolved.tomb_key).map(|t| t.date)
+        else {
+            return Ok(None);
+        };
+        // 合成:8B 头(0x01)+ 8B size + 8B FILETIME + 4B 字符数 + UTF-16LE 路径
+        let path = i_view_path(fs, &resolved.original_key);
+        let size = body.size.unwrap_or(0);
+        let filetime = filenum_100ns(date);
+        let mut out = Vec::with_capacity(28 + 2 * path.chars().count());
+        out.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0, 0]); // 8B 头
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&filetime.to_le_bytes());
+        let chars = path.chars().count() as u32;
+        out.extend_from_slice(&chars.to_le_bytes());
+        for u in path.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        Ok(Some(out))
+    }
+
+    /// 墓碑删除的统一收尾:recycle_names 清理(by_name 中指向已删墓碑键
+    /// 的条目;原 key 已无存活墓碑时移除 by_key 映射 —— 多日期墓碑清旧
+    /// 留新时映射仍有效,裁决 R7)。seen_sids 不在此清理(条目与 SID 无
+    /// 关联,空 SID 目录残留无害,文档化)。挂进 clear_tombstones_both_forms
+    /// 收尾与 gc_partition_files/dirs、trash_restore 的删除路径,保证映射
+    /// 与索引同生命周期。
+    fn remove_tombstone_maps(&self, tombstone_keys: &[String], original_key: &str) {
+        let mut names = self.recycle_names.write().unwrap();
+        if !tombstone_keys.is_empty() {
+            names.by_name.retain(|_, tk| !tombstone_keys.contains(tk));
+        }
+        let still_covered = self
+            .index
+            .read()
+            .unwrap()
+            .is_covered(original_key.trim_end_matches('/'));
+        if !still_covered {
+            names.by_key.remove(original_key);
+        }
+    }
+}
+
+/// $I 合成的挂载盘符占位(裁决 R8 回退;WinFsp 适配器单元 4 以真实捕获
+/// 字节为主,合成仅兜底 —— 盘符不影响 $I 结构字节断言)。
+const SYNTHESIZED_I_DRIVE: &str = "C:";
+
+/// $I 路径字段:挂载盘符 + original_key 视图形态(`/` → `\`)。
+fn i_view_path(fs: &ObjectFs, original_key: &str) -> String {
+    let rel = original_key
+        .strip_prefix(fs.prefix.as_str())
+        .unwrap_or(original_key);
+    format!("{}\\{}", SYNTHESIZED_I_DRIVE, rel.replace('/', "\\"))
+}
+
+/// $I 合成长度(8B 头 + 8B size + 8B FILETIME + 4B 字符数 + UTF-16LE 路径)。
+/// 供目录列表的 $I 条目 size(确定性,零远程)。
+fn synthesized_i_len(path: &str) -> usize {
+    8 + 8 + 8 + 4 + 2 * path.chars().count()
+}
+
+/// $I 名称判定:`$I` + 8 位十六进制(单元 4 捕获窗口;单元 1 合成/转发
+/// 用)。"$I" 前缀 + 前 8 位 hex 即视为 $I 形态。
+pub(crate) fn is_i_entry(name: &str) -> bool {
+    name.len() >= 10
+        && name.starts_with("$I")
+        && name.as_bytes()[2..10].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// 删除日期 → FILETIME(100ns 步进,1601-01-01 起;UTC 午夜)。$I 合成的
+/// FILETIME 字段(裁决 R8 回退;捕获为主时不用)。
+fn filenum_100ns(date: chrono::NaiveDate) -> u64 {
+    let unix = date
+        .and_hms_opt(0, 0, 0)
+        .map(|d| d.and_utc().timestamp())
+        .unwrap_or(0);
+    ((unix as u128 + 11_644_473_600u128) * 10_000_000u128) as u64
+}
+
+/// 当前挂载用户 uid(macOS 视图渲染;空 macos_uid_dirs = 当前 uid,裁决
+/// R17)。Windows 平台不渲染 MacOsTrashes 视图(平台形态由 cfg 决定),
+/// 兜底 0。
+#[cfg(not(windows))]
+fn current_uid() -> u32 {
+    // SAFETY:geteuid 无参数、无副作用、无失败。
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(windows)]
+fn current_uid() -> u32 {
+    0
+}
+
+/// 条目解析结果:原 key + 墓碑 key + 目录形态(全部带命名空间前缀)。
+#[derive(Debug, Clone)]
+struct ResolvedEntry {
+    original_key: String,
+    tomb_key: String,
+    is_dir: bool,
 }
 
 /// poll_inflight 的 RAII 复位(防 await 取消后互斥位永久置位)。
@@ -931,11 +1417,7 @@ impl TombstoneIndex {
     /// 系统回收站视图渲染(单元 1)。
     pub fn entries(&self) -> Vec<(String, bool, chrono::NaiveDate)> {
         let mut out = Vec::with_capacity(self.files.len() + self.dirs.len());
-        out.extend(
-            self.files
-                .iter()
-                .map(|(k, d)| (k.clone(), false, *d)),
-        );
+        out.extend(self.files.iter().map(|(k, d)| (k.clone(), false, *d)));
         out.extend(self.dirs.iter().map(|(k, d)| (k.clone(), true, *d)));
         out
     }
@@ -1159,6 +1641,10 @@ impl TrashState {
             idx.remove(&dir_key, true);
             self.store_index_entries(idx.len());
         }
+        // 统一收尾:recycle_names 与墓碑同生命周期(单元 1;幽灵场景
+        // tombstone_keys 为空 —— by_name 中指向已删墓碑键的条目随下次
+        // 反查 404 自然失效,by_key 映射按「已无存活墓碑」移除)。
+        self.remove_tombstone_maps(&to_delete, file_key);
         Ok(())
     }
 
@@ -1370,6 +1856,8 @@ impl TrashState {
         }
         fs.invalidate_trash_cached(path, is_dir);
         fs.invalidate_stat(path.trim_end_matches('/'));
+        // 统一收尾:recycle_names 与墓碑同生命周期(单元 1)
+        self.remove_tombstone_maps(&[tomb_key], &key);
         Ok(outcome)
     }
 
@@ -1577,6 +2065,10 @@ impl TrashState {
             for (key, is_dir) in &removed {
                 invalidate_key(fs, key, *is_dir);
             }
+            // 统一收尾:recycle_names 与墓碑同生命周期(单元 1)
+            for (tomb_key, file_key) in tomb_keys.iter().zip(removed.iter()) {
+                self.remove_tombstone_maps(std::slice::from_ref(tomb_key), &file_key.0);
+            }
         }
         Ok(())
     }
@@ -1671,6 +2163,8 @@ impl TrashState {
                     self.store_index_entries(idx.len());
                 }
                 invalidate_key(fs, &dir_key, true);
+                // 统一收尾:recycle_names 与墓碑同生命周期(单元 1)
+                self.remove_tombstone_maps(&[tomb_key], &dir_key);
             }
         }
         Ok(())
@@ -1955,7 +2449,11 @@ mod tests {
         // 前缀边界不误伤
         assert_eq!(s.match_system_trash("/$Recycle.Binx"), None, "前缀边界");
         assert_eq!(s.match_system_trash("/x$Recycle.Bin"), None);
-        assert_eq!(s.match_system_trash("/.trash/2026-08-16/a.txt"), None, "与 .trash 前缀互不干扰");
+        assert_eq!(
+            s.match_system_trash("/.trash/2026-08-16/a.txt"),
+            None,
+            "与 .trash 前缀互不干扰"
+        );
         assert_eq!(s.match_system_trash("/docs/a.txt"), None);
         // macOS 形态同构
         let m = mac_state();
@@ -2021,7 +2519,10 @@ mod tests {
         drop(sids);
         let m = mac_state();
         m.record_seen_sid("/.Trashes/501");
-        assert!(m.seen_sids.read().unwrap().is_empty(), "macOS 不使用 seen_sids");
+        assert!(
+            m.seen_sids.read().unwrap().is_empty(),
+            "macOS 不使用 seen_sids"
+        );
     }
 
     #[test]

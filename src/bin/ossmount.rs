@@ -603,11 +603,7 @@ fn parse_args_from(
                 let v = iter.next().unwrap_or_else(|| usage());
                 system_trash_uids = v
                     .split(',')
-                    .map(|s| {
-                        s.trim()
-                            .parse::<u32>()
-                            .map_err(|_| ())
-                    })
+                    .map(|s| s.trim().parse::<u32>().map_err(|_| ()))
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap_or_else(|_| usage());
             }
@@ -1771,7 +1767,9 @@ mod tests {
             "CustomBin".to_string(),
             "Z:".to_string(),
         ]);
-        let sys = cfg.system_trash.expect("--system-trash-dir 必须开启系统视图");
+        let sys = cfg
+            .system_trash
+            .expect("--system-trash-dir 必须开启系统视图");
         assert_eq!(sys.dir_name.as_deref(), Some("CustomBin"));
 
         // --system-trash-uids 逗号分隔(全平台接受,macOS 消费;macOS 下
@@ -1785,7 +1783,9 @@ mod tests {
             "501,502".to_string(),
             "Z:".to_string(),
         ]);
-        let sys = cfg.system_trash.expect("--system-trash-dir 必须开启系统视图");
+        let sys = cfg
+            .system_trash
+            .expect("--system-trash-dir 必须开启系统视图");
         assert_eq!(
             sys.macos_uid_dirs,
             vec![501, 502],
@@ -1826,7 +1826,10 @@ mod tests {
             ".Trashes".to_string(),
             "Z:".to_string(),
         ]);
-        assert!(cfg.system_trash.is_some(), "macOS --system-trash-dir 显式开启");
+        assert!(
+            cfg.system_trash.is_some(),
+            "macOS --system-trash-dir 显式开启"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1838,8 +1841,13 @@ mod tests {
             "b".to_string(),
             "Z:".to_string(),
         ]);
-        let sys = cfg.system_trash.expect("Windows/Linux 默认开启系统回收站视图");
-        assert_eq!(sys.dir_name, None, "默认目录名由 build_trash_state 按平台注入");
+        let sys = cfg
+            .system_trash
+            .expect("Windows/Linux 默认开启系统回收站视图");
+        assert_eq!(
+            sys.dir_name, None,
+            "默认目录名由 build_trash_state 按平台注入"
+        );
         assert!(sys.macos_uid_dirs.is_empty());
     }
 
@@ -1861,7 +1869,6 @@ mod tests {
         let i = args.iter().position(|a| a == "--system-trash-dir").unwrap();
         assert_eq!(args[i + 1], "CustomBin");
     }
-
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -1898,5 +1905,4 @@ mod stack_tests {
             "SizeOfStackReserve {reserve:#x} < {MIN_RESERVE:#x}; build.rs stack widening missing?"
         );
     }
-
 }
