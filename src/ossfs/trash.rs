@@ -7,7 +7,7 @@
 //!
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
-use crate::ossfs::{next_page_token, ObjectFs};
+use crate::ossfs::{ObjectFs, next_page_token};
 use anyhow::{Context as _, Result};
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -394,13 +394,13 @@ mod tests {
         assert_eq!(enc, ".trash/2026-08-16/docs/");
         // decode 失败矩阵
         for bad in [
-            "x/2026-08-16/a.txt",     // 非 trash 前缀
-            "2026-08-16/a.txt",       // 前缀完全不符
-            ".trash/2026-08-16",      // 缺 '/'、无 original key
+            "x/2026-08-16/a.txt",      // 非 trash 前缀
+            "2026-08-16/a.txt",        // 前缀完全不符
+            ".trash/2026-08-16",       // 缺 '/'、无 original key
             ".trash/2026-13-99/a.txt", // 坏日期(月越界)
-            ".trash/today/a.txt",     // 非日期
-            ".trash/2026-08-16/",     // 空 original_key(裸日期分区)
-            ".trash/",                // 空余
+            ".trash/today/a.txt",      // 非日期
+            ".trash/2026-08-16/",      // 空 original_key(裸日期分区)
+            ".trash/",                 // 空余
         ] {
             assert!(
                 decode_tombstone_key(".trash/", bad).is_none(),

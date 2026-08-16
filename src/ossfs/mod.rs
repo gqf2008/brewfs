@@ -1827,9 +1827,7 @@ fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>
         return Ok(None);
     };
     if dir.is_empty() || dir.contains('/') || dir == "." || dir == ".." {
-        anyhow::bail!(
-            "trash-dir must be a single path segment (no '/', '.' or '..'): got `{dir}`"
-        );
+        anyhow::bail!("trash-dir must be a single path segment (no '/', '.' or '..'): got `{dir}`");
     }
     Ok(Some(Arc::new(trash::TrashState {
         prefix: format!("{}{}/", config.prefix, dir),
@@ -2191,8 +2189,14 @@ impl ObjectFs {
         self.invalidate_stat(path);
         if is_dir {
             let dir = format!("{}/", path.trim_end_matches('/'));
-            self.stats.lock().unwrap().retain(|p, _| !p.starts_with(&dir));
-            self.negative.lock().unwrap().retain(|p, _| !p.starts_with(&dir));
+            self.stats
+                .lock()
+                .unwrap()
+                .retain(|p, _| !p.starts_with(&dir));
+            self.negative
+                .lock()
+                .unwrap()
+                .retain(|p, _| !p.starts_with(&dir));
         }
     }
 
@@ -6907,7 +6911,11 @@ mod s3_mock_tests {
         let before = fs.metrics();
         let root = fs.list("/").await.unwrap();
         let after = fs.metrics();
-        assert_eq!(after.s3_lists - before.s3_lists, 1, "基线 list = 1 次 s3 list");
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "基线 list = 1 次 s3 list"
+        );
         assert!(root.iter().any(|e| e.name == "a.txt"));
         assert!(root.iter().any(|e| e.name == "docs"));
         // trash 开启 + rebuild
@@ -7016,7 +7024,10 @@ mod s3_mock_tests {
         );
         assert!(root.iter().any(|e| e.name == "a.txt"));
         let before = fs.metrics();
-        assert!(fs.stat("/.trash").await.unwrap().is_none(), "stat 裸 key 形态");
+        assert!(
+            fs.stat("/.trash").await.unwrap().is_none(),
+            "stat 裸 key 形态"
+        );
         let after = fs.metrics();
         assert_eq!(after.s3_heads - before.s3_heads, 0);
         assert_eq!(after.s3_lists - before.s3_lists, 0);
@@ -7041,12 +7052,12 @@ mod s3_mock_tests {
         // 特殊字符 key、目录墓碑、垃圾对象(坏日期/裸日期分区/非 trash 前缀)
         let entries = vec![
             (".trash/2026-08-16/a b+c%23.txt".into(), false), // 文件墓碑(特殊字符)
-            (".trash/2026-08-16/docs/".into(), true),          // 目录墓碑
-            (".trash/bad-date/x.txt".into(), false),           // 垃圾:坏日期
-            (".trash/2026-08-16/".into(), false),              // 垃圾:裸日期分区
-            ("other/2026-08-16/x.txt".into(), false),          // 非 trash 前缀(列表前缀之外)
-            ("a b+c%23.txt".into(), false),                    // 原对象
-            ("docs/b.txt".into(), false),                      // 原对象
+            (".trash/2026-08-16/docs/".into(), true),         // 目录墓碑
+            (".trash/bad-date/x.txt".into(), false),          // 垃圾:坏日期
+            (".trash/2026-08-16/".into(), false),             // 垃圾:裸日期分区
+            ("other/2026-08-16/x.txt".into(), false),         // 非 trash 前缀(列表前缀之外)
+            ("a b+c%23.txt".into(), false),                   // 原对象
+            ("docs/b.txt".into(), false),                     // 原对象
         ];
         let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
         let mut fs = test_fs(port, 32);
@@ -7110,7 +7121,10 @@ mod s3_mock_tests {
         fs.trash = Some(trash_state(".trash/"));
         // 正值缓存命中
         assert!(fs.stat("/a.txt").await.unwrap().is_some());
-        assert!(fs.stat("/a.txt").await.unwrap().is_some(), "第二次走正值缓存");
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_some(),
+            "第二次走正值缓存"
+        );
         // trash_insert 后立即 None 且零请求
         fs.trash_insert("/a.txt", false);
         let before = fs.metrics();

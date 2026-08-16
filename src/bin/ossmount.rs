@@ -46,9 +46,13 @@ fn usage_text() -> String {
                  [--metrics-listen ADDR]\n\
                  [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
+                 [--trash-dir NAME] [--no-trash]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
+         --trash-dir NAME:  trash (soft delete) directory, default ON as .trash\n\
+                           (deleted objects stay until GC, default 30-day retention);\n\
+                           --no-trash restores immediate permanent delete\n\
          env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n\
          --config PATH:  JSON config file; keys are long option names (CLI\n\
                           args override file values). access_key_id /\n\
@@ -134,6 +138,8 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "log-dir",
     "log-level",
     "metrics-log-interval",
+    "trash-dir",
+    "no-trash",
 ];
 
 /// Expand a JSON config file into CLI arguments. Each top-level key maps
@@ -258,6 +264,8 @@ fn parse_args() -> (
     let mut disk_cache_reserve_diskfree: u64 = 0;
     let mut disk_cache_free_space_ratio: Option<f64> = None;
     let mut mount_point: Option<PathBuf> = None;
+    let mut trash_dir: Option<String> = None;
+    let mut no_trash = false;
 
     let mut raw: Vec<String> = env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("mount") {
@@ -539,6 +547,15 @@ fn parse_args() -> (
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            "--no-trash" => no_trash = true,
+            "--trash-dir" => {
+                let v = iter.next().unwrap_or_else(|| usage());
+                // 单段名校验(与 build_trash_state 一致):含 '/'、'.'、'..'、空 → usage()
+                if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                    usage();
+                }
+                trash_dir = Some(v);
+            }
             other if other.starts_with("--") => {
                 eprintln!("ossmount: unknown option: {other}");
                 usage();
@@ -598,7 +615,13 @@ fn parse_args() -> (
             retries,
             multipart_size,
             multipart_concurrency,
-            trash_dir: None,
+            // CLI 默认开启回收站(D5);--no-trash 优先级最高。其余四字段由
+            // 单元 3/4 落地(本单元仅声明,None = 未设置)。
+            trash_dir: if no_trash {
+                None
+            } else {
+                Some(trash_dir.unwrap_or_else(|| ".trash".to_string()))
+            },
             trash_retention_days: None,
             trash_refresh_interval_secs: None,
             trash_refresh_mode: None,
