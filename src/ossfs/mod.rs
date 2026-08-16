@@ -4631,6 +4631,13 @@ mod s3_mock_tests {
         /// `NextContinuationToken` — the unpaggable partial listing the
         /// client must refuse (#60).
         pub(crate) list_truncated_no_token: std::sync::atomic::AtomicBool,
+        /// Number of plain PUT requests to fail with 500 before succeeding
+        /// (exercises trash tombstone write failure semantics).
+        pub(crate) fail_put: AtomicUsize,
+        /// When set, the list branch ignores the `start-after` query param
+        /// and returns every key (simulates stores that do not honor it —
+        /// the trash refresh must detect and degrade, unit 3).
+        pub(crate) ignore_start_after: std::sync::atomic::AtomicBool,
     }
 
     impl MockS3 {
@@ -4675,6 +4682,8 @@ mod s3_mock_tests {
                 head_status: std::sync::atomic::AtomicU16::new(0),
                 complete_no_such_upload: std::sync::atomic::AtomicBool::new(false),
                 list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
+                fail_put: AtomicUsize::new(0),
+                ignore_start_after: std::sync::atomic::AtomicBool::new(false),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -4780,7 +4789,7 @@ mod s3_mock_tests {
         mock.recorded.lock().unwrap().push(MockRequest {
             method: method.clone(),
             target: target.clone(),
-            body,
+            body: body.clone(),
             storage_class: storage_class_header.clone(),
             content_md5: content_md5_header.clone(),
             copy_source: copy_source_header.clone(),
@@ -4805,6 +4814,17 @@ mod s3_mock_tests {
                 .replace("%2F", "/")
                 .replace("%20", " ")
                 .replace('+', " ");
+            // start-after filtering (ListObjectsV2): keys strictly greater
+            // than the cursor. The ignore switch simulates stores that do
+            // not honor the param (trash refresh degrades, unit 3).
+            let start_after: Option<String> = if mock.ignore_start_after.load(Ordering::SeqCst) {
+                None
+            } else {
+                query_raw
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("start-after="))
+                    .map(|v| v.replace("%2F", "/").replace("%20", " ").replace('+', " "))
+            };
             let entries = mock.entries.lock().unwrap().clone();
             // ObjectFs lists without a delimiter; mock entries marked as
             // directories then surface as plain (marker) objects in
@@ -4814,6 +4834,7 @@ mod s3_mock_tests {
             let filtered: Vec<(String, bool)> = entries
                 .into_iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
+                .filter(|(k, _)| start_after.as_deref().is_none_or(|sa| k.as_str() > sa))
                 .collect();
             let sizes = mock.sizes.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
@@ -4958,11 +4979,47 @@ mod s3_mock_tests {
                 }
             }
         } else {
-            // Plain PutObject / DeleteObject / ...
-            let crc = *mock.crc64.lock().unwrap();
-            format!(
-                "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
+            // Plain PutObject / DeleteObject / CopyObject / ... — really
+            // store/remove so multi-step flows (trash soft delete: HEAD →
+            // PUT tombstone → verify original survives) observe a coherent
+            // store. CopyObject (PUT + copy-source) is answered as before
+            // without materializing the copy; its result is never read back.
+            let path = target.split('?').next().unwrap_or(&target);
+            let key = path
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            if method == "PUT" && copy_source_header.is_none() {
+                if mock.fail_put.load(Ordering::SeqCst) > 0 {
+                    mock.fail_put.fetch_sub(1, Ordering::SeqCst);
+                    let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
+                    http_response(500, "application/xml", Some(&body.to_string()))
+                } else {
+                    mock.objects
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), body.clone());
+                    let mut entries = mock.entries.lock().unwrap();
+                    if !entries.iter().any(|(k, _)| *k == key) {
+                        entries.push((key, false));
+                    }
+                    drop(entries);
+                    let crc = *mock.crc64.lock().unwrap();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                }
+            } else if method == "DELETE" {
+                mock.objects.lock().unwrap().remove(&key);
+                mock.entries.lock().unwrap().retain(|(k, _)| *k != key);
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let crc = *mock.crc64.lock().unwrap();
+                format!(
+                    "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            }
         };
         let _ = stream.write_all(response.as_bytes()).await;
         if let Some(body) = get_body {
