@@ -264,6 +264,7 @@ mod tests {
             trash_refresh_errors: 0,
             trash_start_after_ignored: 0,
             trash_bootstrap_failures: 0,
+            trash_gc_etag_skips: 0,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
