@@ -236,7 +236,7 @@ impl TrashState {
         let mut index = TombstoneIndex::default();
         let mut last_key: Option<String> = None;
         let prefix = self.prefix.clone();
-        list_trash_keys(fs, None, |page| {
+        list_trash_keys(fs, None, None, |page| {
             for key in page {
                 if let Some(t) = decode_tombstone_key(&prefix, &key) {
                     index.insert(&t.original_key, t.is_dir);
@@ -259,48 +259,109 @@ impl TrashState {
 
     /// 一轮调度:距上次全量 >= rebuild_interval → full_rebuild,否则
     /// poll_incremental。测试与挂载 refresh_loop 共用(经
-    /// [`ObjectFs::trash_refresh_once`] 转发)。
+    /// [`ObjectFs::trash_refresh_once`] 转发)。全量重建只经此入口
+    /// (后台循环);eager 挂点直接调 poll_incremental,不触全量分支
+    /// (裁决 #1)。
     pub(crate) async fn refresh_once(&self, fs: &ObjectFs) -> Result<()> {
-        let rebuild_due = {
-            let last = self.last_full_rebuild.lock().unwrap();
-            last.elapsed() >= self.rebuild_interval
-        };
-        if rebuild_due {
+        if self.full_rebuild_due() {
             self.full_rebuild(fs).await
         } else {
             self.poll_incremental(fs).await
         }
     }
 
-    /// start-after 游标增量(list_trash_keys(start_after=cursor)):逐条
-    /// decode,新增 insert + 缓存失效;**探测 start-after 被忽略**(返回 key
-    /// 含 <= 游标者)→ start_after_supported=false + 当轮转全量重建 +
-    /// trash_start_after_ignored+1;成功 → cursor=最后 key、
-    /// trash_refresh_incrementals+1。start_after_supported 已为 false →
-    /// 直接退化为全量(每轮全量,正确性不损)。
-    pub(crate) async fn poll_incremental(&self, fs: &ObjectFs) -> Result<()> {
-        if !self.start_after_supported.load(Ordering::SeqCst) {
-            // 已探测到 store 不支持 start-after → 增量退化为全量
-            return self.full_rebuild(fs).await;
+    /// 全量重建是否到期(距上次全量 >= rebuild_interval)。
+    fn full_rebuild_due(&self) -> bool {
+        let last = self.last_full_rebuild.lock().unwrap();
+        last.elapsed() >= self.rebuild_interval
+    }
+
+    /// 应用新增墓碑:短写锁批量 insert + 锁外缓存失效 + gauge(锁不跨
+    /// await;insert 幂等,同名多日期墓碑只留一条)。
+    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool)]) {
+        if added.is_empty() {
+            return;
         }
-        let cursor = self.cursor.lock().unwrap().clone();
-        let mut last_key: Option<String> = None;
-        let mut ignored = false;
+        {
+            let mut idx = self.index.write().unwrap();
+            for (key, is_dir) in added {
+                idx.insert(key, *is_dir);
+            }
+            self.index_entries
+                .store(idx.len() as u64, Ordering::Relaxed);
+        }
+        for (key, is_dir) in added {
+            invalidate_key(fs, key, *is_dir);
+        }
+    }
+
+    /// 增量刷新,两阶段(裁决 #2):
+    /// 1) 当前 UTC 日期分区始终完整扫描(prefix = trash_prefix + today,
+    ///    无 start-after)—— 同日新墓碑的 key 字典序可能 ≤ 游标,游标
+    ///    增量永远追不上,分区全量扫描是唯一不漏的保证(分区 = 单日墓碑,
+    ///    成本有界);
+    /// 2) 其余分区走 start-after 游标增量(跳过今天分区,避免双扫)。
+    /// start-after 被忽略的探测:返回 key 含 ≤ 游标者即当轮转全量重建,
+    /// trash_start_after_ignored+1;此后退化为「今天分区扫描 + 受
+    /// last_full_rebuild 周期节流的全量兜底」(裁决 #1)。成功时游标推进
+    /// 到最后 key,trash_refresh_incrementals+1。
+    pub(crate) async fn poll_incremental(&self, fs: &ObjectFs) -> Result<()> {
+        let today = date_partition_utc(SystemTime::now());
+        let today_prefix = format!("{}{}/", self.prefix, today);
         let prefix = self.prefix.clone();
         let mut added: Vec<(String, bool)> = Vec::new();
-        list_trash_keys(fs, cursor.as_deref(), |page| {
+        let mut last_key_phase1: Option<String> = None;
+        // 阶段一:今天分区完整扫描(游标无关)
+        list_trash_keys(fs, None, Some(&today_prefix), |page| {
             for key in page {
-                // 探测:start-after 语义要求返回 key 全部 > 游标
+                if let Some(t) = decode_tombstone_key(&prefix, &key) {
+                    added.push((t.original_key, t.is_dir));
+                }
+                last_key_phase1 = Some(key);
+            }
+            Ok(())
+        })
+        .await?;
+
+        if !self.start_after_supported.load(Ordering::SeqCst) {
+            // 已探测到 store 不支持 start-after → 其余分区只能靠全量兜底,
+            // 且受 last_full_rebuild 周期节流(裁决 #1):eager 挂点每分钟
+            // 不再数百次全量,最坏每 rebuild_interval 一次(正确性不损,
+            // insert 幂等)。今天分区新增始终应用(游标无关,已由阶段一
+            // 保证同日删除 ≤1s 内可见)。
+            self.apply_added(fs, &added);
+            if self.full_rebuild_due() {
+                self.full_rebuild(fs).await?;
+            } else {
+                fs.metrics
+                    .trash_refresh_incrementals
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+
+        let cursor = self.cursor.lock().unwrap().clone();
+        let mut last_key_phase2: Option<String> = None;
+        let mut ignored = false;
+        // 阶段二:游标增量扫其余分区(跳过今天分区 —— 阶段一已完整覆盖)
+        list_trash_keys(fs, cursor.as_deref(), None, |page| {
+            for key in page {
+                // 探测必须先于分区跳过:返回任何 ≤ 游标的 key(含今天分区
+                // 新墓碑 —— 符合规范的 store 在 start-after=游标下不会
+                // 返回它们)即证明 store 忽略 start-after
                 if !ignored
                     && let Some(c) = &cursor
                     && key.as_str() <= c.as_str()
                 {
                     ignored = true;
                 }
+                if key.starts_with(&today_prefix) {
+                    continue; // 今天分区已由阶段一完整覆盖
+                }
                 if let Some(t) = decode_tombstone_key(&prefix, &key) {
                     added.push((t.original_key, t.is_dir));
                 }
-                last_key = Some(key);
+                last_key_phase2 = Some(key);
             }
             Ok(())
         })
@@ -315,22 +376,11 @@ impl TrashState {
             return self.full_rebuild(fs).await;
         }
 
-        // 应用新增:insert 幂等(同名多日期墓碑只留一条),逐一短写锁,
-        // 缓存失效在锁外做(不跨 await 持锁)。
-        if !added.is_empty() {
-            {
-                let mut idx = self.index.write().unwrap();
-                for (key, is_dir) in &added {
-                    idx.insert(key, *is_dir);
-                }
-                self.index_entries
-                    .store(idx.len() as u64, Ordering::Relaxed);
-            }
-            for (key, is_dir) in &added {
-                invalidate_key(fs, key, *is_dir);
-            }
-        }
-        if let Some(k) = last_key {
+        self.apply_added(fs, &added);
+        // 游标推进:阶段二有非今天分区的最后 key 用它,否则用阶段一最后
+        // key(今天分区尽头)—— 保证后续阶段二不重复扫描今天分区。
+        let new_cursor = last_key_phase2.or(last_key_phase1);
+        if let Some(k) = new_cursor {
             *self.cursor.lock().unwrap() = Some(k);
         }
         fs.metrics
@@ -349,7 +399,7 @@ impl TrashState {
         let mut index = TombstoneIndex::default();
         let mut last_key: Option<String> = None;
         let prefix = self.prefix.clone();
-        list_trash_keys(fs, None, |page| {
+        list_trash_keys(fs, None, None, |page| {
             for key in page {
                 if let Some(t) = decode_tombstone_key(&prefix, &key) {
                     index.insert(&t.original_key, t.is_dir);
@@ -387,8 +437,11 @@ impl TrashState {
 
     /// eager 入口(list/stat 挂点):节流(距上次 <
     /// TRASH_EAGER_MIN_POLL_INTERVAL 跳过)+ poll_inflight 互斥 + 错误仅
-    /// warn(不 fail 上层 list/stat);**不 acquire limiter permit** —— 调用
-    /// 方(list/stat)已持 permit,再等第二把会在饱和池死锁;靠 poll_inflight
+    /// warn(不 fail 上层 list/stat);**只做增量**(直接调 poll_incremental,
+    /// 剥离 refresh_once 的 rebuild_due 全量重建分支 —— 全量重建只留
+    /// 后台 refresh_loop,裁决 #1:热路径不得全量重建);降级时受
+    /// last_full_rebuild 周期节流;不 acquire limiter permit —— 调用方
+    /// (list/stat)已持 permit,再等第二把会在饱和池死锁;靠 poll_inflight
     /// 天然限 1。
     pub(crate) async fn poll_incremental_eager(&self, fs: &ObjectFs) {
         if self.mode != TrashRefreshMode::Eager {
@@ -409,7 +462,7 @@ impl TrashState {
         // RAII:中途被取消(drop 上层 list/stat future)也复位互斥位,
         // 避免永久卡死后续 eager 轮询
         let _guard = InflightGuard(&self.poll_inflight);
-        let result = self.refresh_once(fs).await;
+        let result = self.poll_incremental(fs).await;
         if let Err(e) = result {
             fs.metrics
                 .trash_refresh_errors
@@ -665,7 +718,7 @@ impl TrashState {
     ) -> Result<()> {
         let prefix = self.prefix.clone();
         let mut to_delete: Vec<String> = Vec::new();
-        list_trash_keys(fs, None, |page| {
+        list_trash_keys(fs, None, None, |page| {
             for k in page {
                 if let Some(t) = decode_tombstone_key(&prefix, &k)
                     && t.is_dir == is_dir
@@ -736,7 +789,8 @@ impl TrashState {
 }
 
 /// 以 trash_prefix 分页枚举墓碑对象 key。start_after 传 Some 时携带
-/// ListObjectsV2 start-after 参数(单元 3);None 为从头全量。
+/// ListObjectsV2 start-after 参数(单元 3);None 为从头全量。prefix 传
+/// Some 时覆盖默认 trash_prefix(如「当前 UTC 日期分区」完整扫描)。
 /// 分页间续 token 处理复用 next_page_token 的 truncated 护栏(#60)。
 /// 不 acquire limiter permit:调用方决定(rebuild 全程持一个 permit,
 /// eager 挂点靠 poll_inflight 互斥,均见各调用点注释)。
@@ -744,12 +798,15 @@ impl TrashState {
 pub(crate) async fn list_trash_keys(
     fs: &ObjectFs,
     start_after: Option<&str>,
+    prefix: Option<&str>,
     mut on_page: impl FnMut(Vec<String>) -> Result<()>,
 ) -> Result<()> {
     let Some(trash) = &fs.trash else {
         return Ok(());
     };
-    let trash_prefix = trash.prefix.clone();
+    let trash_prefix = prefix
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| trash.prefix.clone());
     let mut token: Option<String> = None;
     loop {
         fs.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);

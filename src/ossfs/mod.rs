@@ -2204,7 +2204,7 @@ impl ObjectFs {
         let mut index = trash::TombstoneIndex::default();
         let mut count = 0usize;
         let trash_prefix = trash.prefix.clone();
-        trash::list_trash_keys(self, None, |page| {
+        trash::list_trash_keys(self, None, None, |page| {
             for key in page {
                 if let Some(t) = trash::decode_tombstone_key(&trash_prefix, &key) {
                     index.insert(&t.original_key, t.is_dir);
@@ -3769,7 +3769,9 @@ impl ObjectFs {
             }
             // (b) 文件目标:copy 成功后清墓碑(与目录分支同语义,裁决 #3)
             if let Some(trash) = &self.trash {
-                if trash.index.read().unwrap().is_file_covered(&new_key) {
+                // 覆盖判定在作用域块内完成,索引读锁不跨 await(clippy 纪律)
+                let covered = { trash.index.read().unwrap().is_file_covered(&new_key) };
+                if covered {
                     trash.clear_file_tombstone(self, &new_key).await?;
                 }
             }
@@ -7861,11 +7863,7 @@ mod s3_mock_tests {
                 .any(|k| k.starts_with(".trash/")),
             "write PUT 失败后墓碑必须保留(软删除不得被静默撤销)"
         );
-        assert_eq!(
-            fs.metrics().trash_index_entries,
-            1,
-            "索引仍覆盖(墓碑未清)"
-        );
+        assert_eq!(fs.metrics().trash_index_entries, 1, "索引仍覆盖(墓碑未清)");
         assert!(
             fs.stat("/a.txt").await.unwrap().is_none(),
             "PUT 失败后已删文件不得复活"
@@ -7893,26 +7891,26 @@ mod s3_mock_tests {
         let mut fs = test_fs(port, 32);
         fs.trash = Some(trash_state(".trash/"));
         fs.rename_dir_limit = Some(1);
-        fs.delete_dir_recursive("/e").await.expect("soft delete dir e");
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir e");
         mock.recorded.lock().unwrap().clear();
 
         let err = fs.rename("/d", "/e", false).await.unwrap_err();
         assert!(err.to_string().contains("rename-dir-limit"), "{err:?}");
         // 失败检查在清墓碑之前:超限 bail 前不得发生任何 .trash DELETE
-        let recorded = mock.recorded.lock().unwrap();
-        assert!(
-            !recorded
-                .iter()
-                .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
-            "超限 bail 前不得清墓碑: {recorded:?}"
-        );
-        drop(recorded);
+        // (锁在作用域块内释放,不跨后续 await 持有)
+        {
+            let recorded = mock.recorded.lock().unwrap();
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
+                "超限 bail 前不得清墓碑: {recorded:?}"
+            );
+        }
         // 墓碑仍在 → 索引仍覆盖 → 视图仍隐藏(已删目录不得复活)
-        assert_eq!(
-            fs.metrics().trash_index_entries,
-            1,
-            "目录墓碑索引必须保留"
-        );
+        assert_eq!(fs.metrics().trash_index_entries, 1, "目录墓碑索引必须保留");
         assert!(
             fs.stat("/e").await.unwrap().is_none(),
             "rename 超限失败后已删目录不得复活"
@@ -8089,12 +8087,15 @@ mod s3_mock_tests {
     }
 
     /// 两个挂载实例共享同一 mock(各自独立 index/cursor):A 删除 → A 即时
-    /// 隐藏;B 未刷新仍可见;第一次增量后 B 隐藏;**第二次刷新的 list 请求
-    /// 断言 start-after == 第一次游标(游标推进正确)**。
+    /// 隐藏;B 未刷新仍可见;第一次增量后 B 隐藏;**第二次刷新的 start-after
+    /// 列表 == 第一轮游标(游标推进正确)**;**同分区先删 z 再删 a 的字典序
+    /// 逆序新墓碑不得被游标漏掉(裁决 #2:增量轮次对当前 UTC 日期分区
+    /// 始终完整扫描)**。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_instance_incremental_sync() {
         let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
-        mock.set_object("a.txt", b"hello".to_vec());
+        mock.set_object("z.txt", b"zz".to_vec());
+        mock.set_object("a.txt", b"aa".to_vec());
         let mut a = test_fs(port, 32);
         let mut b = test_fs(port, 32);
         a.trash = Some(trash_state(".trash/"));
@@ -8102,21 +8103,21 @@ mod s3_mock_tests {
         a.trash_bootstrap().await.expect("A bootstrap");
         b.trash_bootstrap().await.expect("B bootstrap");
 
-        // A 软删除:写墓碑 + 即时索引
-        a.delete("/a.txt").await.expect("A soft delete");
-        assert!(a.stat("/a.txt").await.unwrap().is_none(), "A 立即隐藏");
+        // 同分区先删 z 再删 a:游标推进到 z 墓碑后,字典序更小的 a 墓碑
+        // 不得被 start-after 游标永远跳过(修复前 a.txt 最长 600s 不可见)
+        a.delete("/z.txt").await.expect("A soft delete z");
+        assert!(a.stat("/z.txt").await.unwrap().is_none(), "A 立即隐藏");
         assert!(
-            b.stat("/a.txt").await.unwrap().is_some(),
+            b.stat("/z.txt").await.unwrap().is_some(),
             "B 未刷新前仍可见(多端窗口)"
         );
-
-        // B 第一次增量刷新(bootstrap 时桶空,游标 None → 全量拉取首轮)
+        // B 第一次增量刷新(bootstrap 时桶空,游标 None)
         b.trash_refresh_once().await.expect("B 第一次增量");
-        assert!(b.stat("/a.txt").await.unwrap().is_none(), "B 增量后隐藏");
+        assert!(b.stat("/z.txt").await.unwrap().is_none(), "B 增量后 z 隐藏");
         assert_eq!(b.metrics().trash_refresh_incrementals, 1);
 
         // 墓碑 key = A 的 PUT target(剥离查询串与桶前缀)
-        let tomb_key: String = {
+        let z_tomb_key: String = {
             let recorded = mock.recorded.lock().unwrap();
             let put = recorded
                 .iter()
@@ -8129,15 +8130,25 @@ mod s3_mock_tests {
                 .map(|k| format!(".trash/{k}"))
                 .expect("target 含 .trash 前缀")
         };
-        // 游标推进断言:第二次刷新的 list 携带 start-after == 墓碑 key
-        let lists_before = mock.requests.lock().unwrap().len();
-        b.trash_refresh_once().await.expect("B 第二次刷新");
-        let requests = mock.requests.lock().unwrap();
-        let second_lists: Vec<&String> = requests[lists_before..]
-            .iter()
-            .filter(|t| t.contains("list-type=2"))
-            .collect();
-        assert_eq!(second_lists.len(), 1, "第二次刷新恰好 1 次 list");
+        // 游标推进断言:第二轮刷新的 start-after 列表 == 第一轮游标(z 墓碑
+        // key);今天分区完整扫描的列表不带 start-after,不计入。锁在块内
+        // 释放,不得跨后续 await 持有(mock 请求记录锁由连接任务使用)。
+        let second_lists: Vec<String>;
+        {
+            let lists_before = mock.requests.lock().unwrap().len();
+            b.trash_refresh_once().await.expect("B 第二次刷新");
+            let requests = mock.requests.lock().unwrap();
+            second_lists = requests[lists_before..]
+                .iter()
+                .filter(|t| t.contains("list-type=2") && t.contains("start-after="))
+                .cloned()
+                .collect();
+        }
+        assert_eq!(
+            second_lists.len(),
+            1,
+            "第二轮刷新恰好 1 次 start-after 增量列表"
+        );
         let sa = second_lists[0]
             .split("start-after=")
             .nth(1)
@@ -8145,10 +8156,24 @@ mod s3_mock_tests {
             .unwrap_or("");
         let sa_decoded = sa.replace("%2F", "/").replace("%20", " ");
         assert_eq!(
-            sa_decoded, tomb_key,
-            "第二次刷新的 start-after == 第一次游标(墓碑 key)"
+            sa_decoded, z_tomb_key,
+            "第二轮刷新的 start-after == 第一轮游标(z 墓碑 key)"
         );
         assert_eq!(b.metrics().trash_refresh_incrementals, 2);
+
+        // 同分区新墓碑(字典序 ≤ 游标):A 再删 a.txt,B 必须感知 ——
+        // 增量轮次对当前 UTC 日期分区始终完整扫描(裁决 #2)
+        a.delete("/a.txt").await.expect("A soft delete a");
+        assert!(
+            b.stat("/a.txt").await.unwrap().is_some(),
+            "B 未刷新前仍可见(多端窗口)"
+        );
+        b.trash_refresh_once().await.expect("B 第三轮刷新");
+        assert!(
+            b.stat("/a.txt").await.unwrap().is_none(),
+            "同日新墓碑必须被 B 感知:游标不得漏掉字典序更小的新墓碑"
+        );
+        assert!(b.stat("/z.txt").await.unwrap().is_none());
     }
 
     /// 其他端恢复:远端墓碑被外部 DELETE → 全量重建 diff 移除 → 本端复活
@@ -8250,6 +8275,36 @@ mod s3_mock_tests {
             10,
             "lazy 下 list 无额外远程成本"
         );
+
+        // 阳性对照(裁决 #1):eager + ignore_start_after(降级)下,全量重建
+        // 次数受 last_full_rebuild 周期节流 —— 连续多轮 eager poll 至多
+        // 一次全量(修复前:降级分支每轮都 full_rebuild,5 轮 poll = 5 次
+        // 全量,每分钟 ~60 次全量 ≈ 3000 次 list/分)。
+        mock.ignore_start_after.store(true, Ordering::SeqCst);
+        let rebuilds_before = eager.metrics().trash_refresh_rebuilds;
+        {
+            let t = eager.trash.as_ref().unwrap();
+            *t.last_full_rebuild.lock().unwrap() = Instant::now()
+                .checked_sub(Duration::from_secs(601))
+                .unwrap();
+        }
+        let tick_start = Instant::now();
+        for _ in 0..5 {
+            // 手动拨快 eager 节流戳:绕过 1s 节流,保证 5 轮都真正执行 poll
+            {
+                let t = eager.trash.as_ref().unwrap();
+                *t.last_eager_poll.lock().unwrap() =
+                    Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+            }
+            let _ = eager.list("/").await.unwrap();
+        }
+        let rebuild_delta = eager.metrics().trash_refresh_rebuilds - rebuilds_before;
+        // 节流断言随真实墙钟缩放(LESSON):全量重建 ≤ 每 rebuild_interval 一次
+        let bound = tick_start.elapsed().as_secs() / TRASH_REBUILD_INTERVAL_SECS + 1;
+        assert!(
+            rebuild_delta <= bound,
+            "降级 eager 全量重建必须受周期节流:5 轮 poll 全量 {rebuild_delta} 次,上界 {bound}(修复前为 5)"
+        );
     }
 
     /// 刷新失败不拖垮挂载:强制 trash list 报错(分页无 token 护栏)→
@@ -8310,9 +8365,15 @@ mod s3_mock_tests {
                 .load(Ordering::SeqCst),
             "探测后 start_after_supported=false"
         );
-        // 后续刷新退化为全量(不依赖 start-after,仍正确隐藏)
+        // 后续刷新退化为「今天分区扫描 + 周期节流全量」(裁决 #1):
+        // 探测当轮的全量重建已重置 last_full_rebuild,非到期轮不再重复
+        // 全量(修复前:每轮都 full_rebuild,降级 eager 每分钟数百次全量)
         fs.trash_refresh_once().await.expect("降级后的刷新");
-        assert_eq!(fs.metrics().trash_refresh_rebuilds, 2);
+        assert_eq!(
+            fs.metrics().trash_refresh_rebuilds,
+            1,
+            "降级全量受 last_full_rebuild 周期节流(600s 内至多一次)"
+        );
         assert!(fs.stat("/a.txt").await.unwrap().is_none());
     }
 }
