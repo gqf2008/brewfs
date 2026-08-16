@@ -229,6 +229,10 @@ Known limitations:
   bucket data at those keys is shown as-is.
 - Moving a file into `.Trashes` from a terminal also soft-deletes it — the
   same behavior as real macOS.
+- **Windows is code-level verified only**: unit tests and the WinFsp
+  build gate cover the interception semantics; the real Explorer protocol
+  (disposition probe sequence, `$I`/`$R` interaction) still needs a live
+  Windows mount + ProcMon capture before the first Windows release.
 
 ## Operational notes
 

@@ -197,6 +197,7 @@ CLI 开关（同 `ossmount --help`）：
 - 系统前缀下的真实对象（如 `.Trashes/<uid>/.DS_Store`）保持可见，清空视图时**绝不触碰**——只有墓碑支撑的条目被永久删除。
 - 深于 `$Recycle.Bin/<sid>/<name>` 的路径不拦截；这些 key 上的真实桶数据原样可见。
 - 终端手动 mv 进 `.Trashes` 同样是软删——与真实 macOS 行为一致。
+- **Windows 侧目前为代码级验证**:拦截语义由单测与 WinFsp 构建门禁保障;Explorer 真实协议行为(探测序列、`$I`/`$R` 交互)仍需真实 Windows 挂载 + ProcMon 抓包确认,首次 Windows 发布前必做。
 
 ## 运维注意
 

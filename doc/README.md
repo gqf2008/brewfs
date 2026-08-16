@@ -96,10 +96,36 @@ documented here:
   Recreating a path with the same name first clears its tombstone, so the new
   content is immediately visible (overwrite semantics).
 
+## System recycle bin (issue #80)
+
+A **virtual** recycle-bin view at the mount root, synthesized from the trash
+tombstone index — no local metadata database, zero data copies. The OS delete
+protocol is intercepted in the `ObjectFs` layer: the shell's "move into the
+bin" becomes a soft delete (one tombstone object; the original never moves),
+the bin's contents render from tombstones, restore = rename out of the bin
+(delete the tombstone), empty = permanent delete (tombstone + original).
+
+- Windows: `$Recycle.Bin` (ON with trash) — the `$R` name is recorded in the
+  tombstone, the `$I` metadata file is captured byte-faithfully (≤ 4 KiB,
+  stored in the tombstone body, never a real object).
+- macOS: `.Trashes` (OFF — `--system-trash-dir` to enable) — needs **macFUSE**
+  and the `local` mount option (appended automatically); **FUSE-T mounts as an
+  NFS network volume: Finder trash unavailable, deletes take effect
+  immediately** (mount-time warning). `.Trashes/<uid>` mode `0700`.
+- Linux: `$Recycle.Bin` (ON with trash) — browsable view, no shell delete
+  integration.
+
+CLI: `--system-trash-dir NAME` / `--system-trash-uids N[,N...]` (macOS) /
+`--no-system-trash`. Full details and known limitations in the root README.
+
 ## Known POSIX / FUSE limitations
 
 - (Trash soft-delete further deviates from POSIX — see
   [Trash (soft delete)](#trash-soft-delete) above.)
+- (System recycle bin: Windows is code-level verified only — unit tests and
+  the WinFsp build gate cover interception semantics; the real Explorer
+  protocol needs a live Windows mount + ProcMon capture before first release.
+  macOS Finder behavior needs a live macFUSE mount check.)
 - `generic/075` (xfstests) and LTP `iogen01` remain excluded from default test
   profiles: buffered FUSE mmap after truncate/extend can expose stale
   page-cache data, and the tiny-overlap direct-I/O profile has a
