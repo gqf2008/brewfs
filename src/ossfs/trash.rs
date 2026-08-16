@@ -15,6 +15,11 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+/// eager 档的最小轮询间隔:每次 list/stat 前的增量拉取节流,防枚举类请求
+/// 远程成本翻倍放大(规格 C5 阈值,独立 commit 落地 + 断言;变更必须独立
+/// commit 写明新旧值与理由)。
+pub const TRASH_EAGER_MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 墓碑 key 结构:`<date>` 为删除时 UTC 日期分区;original_key 为完整原对象 key
 /// (含命名空间 prefix,与 `key_for()` / `obj.key()` 零转换);is_dir 由 original_key
 /// 尾斜杠推导(目录墓碑 key 以 '/' 结尾)。

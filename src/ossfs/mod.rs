@@ -465,6 +465,14 @@ impl OssConfig {
             // first attempt already distinguishes those from a dead link.
             self.retries = Some(1);
         }
+        // Trash refresh scheduling defaults (C4b: 阈值默认值随消费单元落地,
+        // 此处只填 refresh/mode —— trash_dir 绝不填,None = 回收站关闭)。
+        if self.trash_refresh_interval_secs.is_none() {
+            self.trash_refresh_interval_secs = Some(TRASH_REFRESH_INTERVAL_SECS);
+        }
+        if self.trash_refresh_mode.is_none() {
+            self.trash_refresh_mode = Some(TrashRefreshMode::Lazy);
+        }
         self
     }
 }
@@ -557,6 +565,13 @@ const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 const MULTIPART_COPY_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
 /// DeleteObjects batches at most this many keys per request (#60).
 const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1000;
+/// 回收站(soft delete)增量刷新周期秒:lazy 模式下本端感知远端删除的
+/// 延迟上界(规格 C5 阈值,独立 commit 落地 + 断言防漂移;变更必须独立
+/// commit 写明新旧值与理由)。
+pub const TRASH_REFRESH_INTERVAL_SECS: u64 = 30;
+/// 回收站全量重建周期秒:兜底「被恢复 / 被 GC 移除的墓碑」—— 增量游标
+/// 只增不减,全量重建 diff 解决索引只增不减的问题(规格 C5 阈值,同上)。
+pub const TRASH_REBUILD_INTERVAL_SECS: u64 = 600;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -4526,6 +4541,100 @@ mod tests {
         let cfg = cfg.normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(3));
         assert_eq!(cfg.readwrite_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn refresh_constants_pinned() {
+        // 阈值独立 commit 规范:TRASH_* 默认值变更必须独立 commit 写明新旧值
+        // 与理由;此断言引用常量本身防漂移。
+        assert_eq!(TRASH_REFRESH_INTERVAL_SECS, 30, "增量刷新周期 30s");
+        assert_eq!(TRASH_REBUILD_INTERVAL_SECS, 600, "全量重建周期 10min");
+        assert_eq!(
+            trash::TRASH_EAGER_MIN_POLL_INTERVAL,
+            Duration::from_secs(1),
+            "eager 最小轮询间隔 1s"
+        );
+    }
+
+    #[test]
+    fn normalize_refresh_defaults() {
+        // C4b:阈值默认值在消费单元落地 —— 单元 3 填 refresh_interval=30 /
+        // mode=Lazy;显式值不被覆盖;trash_dir 绝不填(门控不被默认值覆盖)。
+        let base = || OssConfig {
+            bucket: "b".into(),
+            region: "cn-shanghai".into(),
+            endpoint: None,
+            force_path_style: false,
+            prefix: String::new(),
+            max_concurrent_requests: None,
+            list_rate_limit: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
+            multipart_size: None,
+            multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
+        };
+        let cfg = base().normalize();
+        assert_eq!(
+            cfg.trash_refresh_interval_secs,
+            Some(TRASH_REFRESH_INTERVAL_SECS),
+            "None → 默认 30s"
+        );
+        assert_eq!(
+            cfg.trash_refresh_mode,
+            Some(TrashRefreshMode::Lazy),
+            "None → 默认 Lazy"
+        );
+        assert!(
+            cfg.trash_dir.is_none(),
+            "normalize 绝不填 trash_dir(None = 回收站关闭)"
+        );
+        // 显式值不被覆盖
+        let mut cfg = base();
+        cfg.trash_refresh_interval_secs = Some(7);
+        cfg.trash_refresh_mode = Some(TrashRefreshMode::Eager);
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.trash_refresh_interval_secs, Some(7));
+        assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Eager));
     }
 
     #[tokio::test]
