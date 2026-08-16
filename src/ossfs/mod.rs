@@ -2207,32 +2207,26 @@ impl ObjectFs {
         key.starts_with(p) || key == p.trim_end_matches('/') || snapshot.is_covered(key)
     }
 
-    /// 全量重建索引:分页 ListObjectsV2(prefix = trash.prefix)经 decode 出
-    /// (original_key, is_dir);离线构建新集合,短写锁整体换入(遍历期间不持写锁,
-    /// 否则刷新/GC 与挂载 list 相互饿死);末尾全清 stat/negative 缓存;
-    /// 全程持一个 limiter permit(并发上限不可回归)。返回条目数(测试/指标用)。
+    /// 挂载启动全量建索引(回收站开启时由 [`Self::trash_bootstrap`] 转发
+    /// —— 契约 C7,裁决 #11):全量列表统一走 `trash::fetch_all_tombstones`
+    /// (bootstrap/全量重建共用,消除三处全量逻辑并存);离线构建新集合、
+    /// 短写锁整体换入(遍历期间不持写锁,否则刷新/GC 与挂载 list 相互
+    /// 饿死);推进增量游标与全量重建时刻(bootstrap 即一次全量重建);
+    /// 末尾全清 stat/negative 缓存;全程持一个 limiter permit(并发上限
+    /// 不可回归)。返回条目数(测试/指标用)。
     pub(crate) async fn rebuild_trash_index(&self) -> Result<usize> {
         let Some(trash) = &self.trash else {
             return Ok(0);
         };
         let _permit = self.acquire().await?;
-        let mut index = trash::TombstoneIndex::default();
-        let mut count = 0usize;
-        let trash_prefix = trash.prefix.clone();
-        trash::list_trash_keys(self, None, None, |page| {
-            for key in page {
-                if let Some(t) = trash::decode_tombstone_key(&trash_prefix, &key) {
-                    index.insert(&t.original_key, t.is_dir);
-                    count += 1;
-                }
-            }
-            Ok(())
-        })
-        .await?;
+        let (index, last_key) = trash::fetch_all_tombstones(self, trash).await?;
+        let count = index.len();
         // 短写锁整体换入:离线构建期间读路径继续用旧索引
         *trash.index.write().unwrap() = index;
         // gauge 统一落点(裁决 #6/#9):整体换入后刷新条目数 + 超阈值告警
         trash.store_index_entries(trash.index.read().unwrap().len());
+        *trash.cursor.lock().unwrap() = last_key;
+        *trash.last_full_rebuild.lock().unwrap() = Instant::now();
         self.stats.lock().unwrap().clear();
         self.negative.lock().unwrap().clear();
         Ok(count)
@@ -2278,20 +2272,16 @@ impl ObjectFs {
         self.trash.is_some()
     }
 
-    /// 挂载启动全量建索引:转发 `TrashState::bootstrap`(等价于
-    /// [`Self::rebuild_trash_index`] + 游标推进)。失败仅 warn +
+    /// 挂载启动全量建索引:转发 [`Self::rebuild_trash_index`](契约 C7,
+    /// 裁决 #11 —— 内部即全量重建 + 游标/全量周期推进 + 缓存清空,
+    /// permit 由其内部持有,此处不重复 acquire)。失败仅 warn +
     /// trash_bootstrap_failures,**不阻塞挂载** —— 索引空则已删文件短暂
     /// 可见,周期刷新自愈(warn + continue,无重试)。
     pub async fn trash_bootstrap(&self) -> Result<()> {
-        let Some(trash) = &self.trash else {
+        if self.trash.is_none() {
             return Ok(());
-        };
-        let result = async {
-            let _permit = self.acquire().await?;
-            trash.bootstrap(self).await
         }
-        .await;
-        if let Err(e) = result {
+        if let Err(e) = self.rebuild_trash_index().await {
             self.metrics
                 .trash_bootstrap_failures
                 .fetch_add(1, Ordering::Relaxed);

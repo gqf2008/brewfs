@@ -233,6 +233,32 @@ pub(crate) struct TrashState {
     pub index_entries: AtomicU64,
 }
 
+/// 分页全量拉取 .trash 全部 key 并离线构建新索引(不换入、不失效缓存)。
+/// **单一全量列表逻辑**(裁决 #11:消除 bootstrap/rebuild 三处全量逻辑
+/// 并存;`ObjectFs::rebuild_trash_index` 与 [`TrashState::full_rebuild`]
+/// 共用,各自只做换入/游标/diff 等后续处理)。返回 (新索引, 最后 key)。
+/// 调用方负责持 limiter permit;列表期间不持 index 锁,读路径继续用
+/// 旧索引。
+pub(crate) async fn fetch_all_tombstones(
+    fs: &ObjectFs,
+    trash: &TrashState,
+) -> Result<(TombstoneIndex, Option<String>)> {
+    let prefix = trash.prefix.clone();
+    let mut index = TombstoneIndex::default();
+    let mut last_key: Option<String> = None;
+    list_trash_keys(fs, None, None, |page| {
+        for key in page {
+            if let Some(t) = decode_tombstone_key(&prefix, &key) {
+                index.insert(&t.original_key, t.is_dir);
+            }
+            last_key = Some(key);
+        }
+        Ok(())
+    })
+    .await?;
+    Ok((index, last_key))
+}
+
 impl TrashState {
     /// 索引规模是否超告警阈值(裁决 #6):超过 TRASH_INDEX_ALERT_THRESHOLD
     /// 仅告警不换行为 —— 不换入/清缓存会让已删文件可见性偏离远端(正确性
@@ -282,35 +308,6 @@ impl TrashState {
             poll_inflight: AtomicBool::new(false),
             index_entries: AtomicU64::new(0),
         })
-    }
-
-    /// 挂载启动全量建索引(可重入:降级/重挂载再调):分页 list 全量,
-    /// 离线构建新集合、短写锁整体换入(遍历期间不持写锁),cursor = 最后
-    /// key、last_full_rebuild = now、全清 stats/negative 缓存。
-    /// 锁纪律:调用方(ObjectFs::trash_bootstrap)持一个 limiter permit。
-    pub(crate) async fn bootstrap(&self, fs: &ObjectFs) -> Result<()> {
-        let mut index = TombstoneIndex::default();
-        let mut last_key: Option<String> = None;
-        let prefix = self.prefix.clone();
-        list_trash_keys(fs, None, None, |page| {
-            for key in page {
-                if let Some(t) = decode_tombstone_key(&prefix, &key) {
-                    index.insert(&t.original_key, t.is_dir);
-                }
-                last_key = Some(key);
-            }
-            Ok(())
-        })
-        .await?;
-        // 短写锁整体换入:离线构建期间读路径继续用旧索引
-        *self.index.write().unwrap() = index;
-        self.index_entries
-            .store(self.index.read().unwrap().len() as u64, Ordering::Relaxed);
-        *self.cursor.lock().unwrap() = last_key;
-        *self.last_full_rebuild.lock().unwrap() = Instant::now();
-        fs.stats.lock().unwrap().clear();
-        fs.negative.lock().unwrap().clear();
-        Ok(())
     }
 
     /// 一轮调度:距上次全量 >= rebuild_interval → full_rebuild,否则
@@ -476,19 +473,8 @@ impl TrashState {
     /// trash_refresh_rebuilds+1。
     pub(crate) async fn full_rebuild(&self, fs: &ObjectFs) -> Result<()> {
         let prev = self.index.read().unwrap().entries();
-        let mut index = TombstoneIndex::default();
-        let mut last_key: Option<String> = None;
-        let prefix = self.prefix.clone();
-        list_trash_keys(fs, None, None, |page| {
-            for key in page {
-                if let Some(t) = decode_tombstone_key(&prefix, &key) {
-                    index.insert(&t.original_key, t.is_dir);
-                }
-                last_key = Some(key);
-            }
-            Ok(())
-        })
-        .await?;
+        // 全量列表逻辑统一走 fetch_all_tombstones(裁决 #11)
+        let (index, last_key) = fetch_all_tombstones(fs, self).await?;
         // diff(裁决 #6 内存尖峰守卫):prev 与 new 各自 sort_unstable(原地、
         // 不分配)后归并扫描 —— 省两个 HashSet(500k 条目时每 HashSet 约
         // 16B/桶 + 哈希运算,归并扫描峰值约减半)。语义与 HashSet 差集
