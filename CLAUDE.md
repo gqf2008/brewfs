@@ -46,6 +46,9 @@ no FUSE-T needed to build).
 
 - `src/ossfs/mod.rs` — `ObjectFs`: S3 list/stat/read/write/delete, concurrency
   limiter, `max_keys=1` probes, notify snapshot budget
+- `src/ossfs/trash.rs` — trash (soft-delete) tombstones, index, GC, and the
+  system recycle bin virtual view (`SystemTrash` / `RecycleNameIndex` / system
+  entry synthesize; the `ObjectFs` hooks live in `mod.rs`)
 - `src/ossfs/winfsp.rs` — Windows WinFsp adapter (sync callbacks via
   `Handle::block_on`; keep thread stacks large)
 - `src/ossfs/fuse.rs` — macOS/Linux FUSE adapter
@@ -59,3 +62,7 @@ no FUSE-T needed to build).
   Never reintroduce a local metadata database.
 - The S3 concurrency/memory bounds and the 16 MiB WinFsp thread stack are
   deliberate anti-OOM / anti-stack-overflow measures — keep them.
+- The system recycle bin (issue #80) is a **virtual view** synthesized from
+  the tombstone index — it must never gain its own metadata database or copy
+  object data (soft delete writes one tombstone; `$I` capture bytes live in
+  the tombstone body, never as bucket objects).

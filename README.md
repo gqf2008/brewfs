@@ -189,6 +189,47 @@ Weak consistency — no locks, no atomic rename. Files are written whole-file on
 close/flush. This is a **cloud drive**, not a multi-writer POSIX filesystem;
 do not use it as a database backend or for concurrent editors on the same file.
 
+## System recycle bin
+
+A **virtual** recycle-bin view at the mount root (issue #80): entries are
+synthesized from the trash tombstone index, with **no local metadata database
+and zero data copies** — soft-deleting into the bin only writes one tombstone
+object (the original object never moves). The view shares the same tombstone
+set as the CLI trash commands (`trash-list` / `trash-restore` / `trash-clean`).
+
+| Platform | View | Default | Notes |
+|---|---|---|---|
+| Windows | `$Recycle.Bin` | **ON** with trash | Explorer's delete protocol is intercepted in the `ObjectFs` layer: the `$R` name is recorded in the tombstone and the `$I` metadata file is captured byte-faithfully (up to 4 KiB, stored in the tombstone body — never a real bucket object). No shell-side integration needed. |
+| macOS | `.Trashes` | **OFF** — enable with `--system-trash-dir` | Finder's volume trash only activates with **macFUSE** and the `local` mount option (OSSFS appends it automatically when the view is on). With **FUSE-T** the volume mounts as an NFS network volume: **Finder trash is unavailable and deletes take effect immediately** (a warning is logged at mount). `.Trashes` / `.Trashes/<uid>` are presented with mode `0700`. |
+| Linux | `$Recycle.Bin` | **ON** with trash | The view is browsable in any file manager; there is no desktop-shell delete integration (the view itself still works for rename/delete — it is a normal directory). |
+
+CLI switches (also in `ossmount --help`):
+
+- `--system-trash-dir NAME` — enable the view; `NAME` overrides the directory
+  name on any platform (defaults: `$Recycle.Bin` on Windows/Linux,
+  `.Trashes` on macOS).
+- `--system-trash-uids N[,N...]` — macOS only: render only these uid
+  directories under `.Trashes` (default: the mounting user's uid).
+- `--no-system-trash` — disable the view on any platform.
+
+Known limitations:
+
+- The view renders from the tombstone index, so a deletion made on another
+  machine can take up to one refresh cycle (~30 s; `--trash-refresh-mode eager`
+  polls before every list/stat) to appear or disappear.
+- A directory shows at most one entry per name: same-named tombstones from
+  different directories collapse into a single view entry, and reading or
+  restoring it resolves the **newest** tombstone (with a warning).
+- Only the newest version of a re-deleted path is shown in the view; older
+  versions remain accessible via `trash-restore --date`.
+- Real objects under the system prefix (e.g. Finder's `.DS_Store` under
+  `.Trashes/<uid>/`) stay visible and are **never** touched when emptying the
+  view — only tombstone-backed entries are permanently deleted.
+- Paths deeper than `$Recycle.Bin/<sid>/<name>` are not intercepted; real
+  bucket data at those keys is shown as-is.
+- Moving a file into `.Trashes` from a terminal also soft-deletes it — the
+  same behavior as real macOS.
+
 ## Operational notes
 
 - Every directory enumeration / stat is a **remote S3 request**. Avoid

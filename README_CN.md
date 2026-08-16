@@ -173,6 +173,31 @@ FUSE 目录读取使用 `readdirplus`，每个目录项同时返回属性，无�
 
 弱一致：无锁、无原子 rename；文件在 close/flush 时整文件写入。这是"云盘"，不是多写者 POSIX 文件系统——不要用作数据库后端或多人并发编辑同一文件。
 
+## 系统回收站
+
+挂载根下的**虚拟**回收站视图（issue #80）：条目由回收站墓碑索引合成，**无本地元数据库、零数据复制**——软删进回收站只写一条墓碑对象（原对象从未移动）。视图与 CLI 回收站命令（`trash-list` / `trash-restore` / `trash-clean`）共享同一墓碑集。
+
+| 平台 | 视图 | 默认 | 说明 |
+|---|---|---|---|
+| Windows | `$Recycle.Bin` | 随回收站**默认开启** | Explorer 删除协议在 ObjectFs 层拦截：`$R` 名记录进墓碑，`$I` 元数据文件按字节捕获（上限 4 KiB，存墓碑 body——**不落真实桶对象**）。无需任何 shell 侧集成。 |
+| macOS | `.Trashes` | **默认关闭**——需 `--system-trash-dir` 显式开启 | Finder 卷级废纸篓仅在 **macFUSE** + `local` 挂载选项下激活（视图开启时 OSSFS 自动追加）。**FUSE-T** 挂载为 NFS 网络卷：**Finder 废纸篓不可用，删除立即生效**（挂载时告警）。`.Trashes` / `.Trashes/<uid>` 以 mode `0700` 呈现。 |
+| Linux | `$Recycle.Bin` | 随回收站**默认开启** | 视图可在任意文件管理器浏览；无桌面 shell 删除集成（视图本身 rename/delete 照常可用——就是普通目录视图）。 |
+
+CLI 开关（同 `ossmount --help`）：
+
+- `--system-trash-dir NAME` — 开启视图；`NAME` 覆盖任意平台的目录名（默认：Windows/Linux `$Recycle.Bin`，macOS `.Trashes`）。
+- `--system-trash-uids N[,N...]` — 仅 macOS：只渲染 `.Trashes` 下这些 uid 目录（默认：挂载用户 uid）。
+- `--no-system-trash` — 任意平台显式关闭视图。
+
+已知限制：
+
+- 视图由墓碑索引渲染，远端删除最长需一个刷新周期（约 30s；`--trash-refresh-mode eager` 每次 list/stat 前轮询）才出现/消失。
+- 目录下每个名字最多一个条目：不同目录的同名墓碑合并为单个视图条目；读取/还原取**最新**墓碑（带告警）。
+- 重复删除同一路径时，视图只显示最新版本；旧版本仍可经 `trash-restore --date` 访问。
+- 系统前缀下的真实对象（如 `.Trashes/<uid>/.DS_Store`）保持可见，清空视图时**绝不触碰**——只有墓碑支撑的条目被永久删除。
+- 深于 `$Recycle.Bin/<sid>/<name>` 的路径不拦截；这些 key 上的真实桶数据原样可见。
+- 终端手动 mv 进 `.Trashes` 同样是软删——与真实 macOS 行为一致。
+
 ## 运维注意
 
 - 每个目录枚举/stat 都是一次**远程 S3 请求**；避免对挂载盘做全盘扫描（`find /`）。

@@ -79,6 +79,38 @@ cargo test --workspace --lib --bins --tests -- --test-threads=1
   `doc/README.md` and keep the whole-file-buffered write + close/flush push
   model.
 
+## System Recycle Bin (issue #80)
+
+A virtual recycle-bin view at the mount root, synthesized from the trash
+tombstone index — **no new metadata database, zero data copies** (soft delete
+writes one tombstone; the original object never moves). Shares the tombstone
+set with `trash-list` / `trash-restore` / `trash-clean`.
+
+| Platform | View | Default | Notes |
+|---|---|---|---|
+| Windows | `$Recycle.Bin` | ON with trash | Explorer's delete protocol intercepted in the `ObjectFs` layer: `$R` name recorded in the tombstone, `$I` captured byte-faithfully (≤ 4 KiB) into the tombstone body — never a real object (R8) |
+| macOS | `.Trashes` | OFF — explicit `--system-trash-dir` | Finder volume trash needs macFUSE + the `local` mount option (OSSFS appends it automatically when the view is on, R12). **FUSE-T mounts as an NFS network volume: Finder trash unavailable, deletes take effect immediately** (mount-time warning) |
+| Linux | `$Recycle.Bin` | ON with trash | View browsable in any file manager; no desktop-shell delete integration |
+
+CLI switches: `--system-trash-dir NAME` (enable + override dir name),
+`--system-trash-uids N[,N...]` (macOS uid filter, empty = mounting user,
+R17), `--no-system-trash` (disable).
+
+Guardrails:
+
+- Recognition, rendering, interception and permanent delete all live in the
+  `ObjectFs` layer (`trash.rs` + `mod.rs` hooks) — the FUSE/WinFsp adapters
+  pass through relative view paths unchanged (R13). The only macOS-specific
+  fuse.rs changes are the `local` mount option / FUSE-T warning
+  (`build_config`) and the `.Trashes` mode `0700` override (getattr).
+- `list`/`stat` on the system view must stay within the P1/P3 budgets: warm
+  path zero extra requests, entry stat ≤ 1 body GET (stat cache absorbs it).
+- Emptying the view permanently deletes only tombstone-backed entries; real
+  objects under the system prefix (e.g. `.Trashes/<uid>/.DS_Store`) stay
+  visible and are never touched.
+- macOS `.Trashes/<uid>/` real objects (`.DS_Store`) fall back to the normal
+  stat/read path when no tombstone resolves — never bail on them (unit 5).
+
 ## Known POSIX And FUSE Limitations
 
 - Keep `generic/075` (xfstests) and LTP `iogen01` excluded from default test
