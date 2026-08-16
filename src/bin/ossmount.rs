@@ -60,7 +60,18 @@ fn usage_text() -> String {
          env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n\
          --config PATH:  JSON config file; keys are long option names (CLI\n\
                           args override file values). access_key_id /\n\
-                          secret_access_key keys set the AWS env creds."
+                          secret_access_key keys set the AWS env creds.\n\
+subcommands:\n\
+  mount [options] MOUNT_POINT (default when first arg is not a subcommand)\n\
+  trash-list [--json] [--trash-dir PATH] (connection args below)\n\
+  trash-restore <path> [--date YYYY-MM-DD] [--trash-dir PATH]\n\
+  trash-clean [--before YYYY-MM-DD] [--dry-run] [--trash-dir PATH]\n\
+  trash options: --trash-dir PATH --trash-retention-days N\n\
+                  --trash-refresh-interval-secs N --trash-refresh-mode lazy|eager\n\
+                  --trash-gc-interval-secs N --no-trash (mount only)\n\
+  trash commands share the connection args (--bucket/--endpoint/--region/...)\n\
+  and ignore mount-only keys coming from a --config file; passing them on\n\
+  the command line is an error"
         .to_string()
 }
 
@@ -143,7 +154,10 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "log-level",
     "metrics-log-interval",
     "trash-dir",
+    "trash-retention-days",
+    "trash-refresh-interval-secs",
     "trash-refresh-mode",
+    "trash-gc-interval-secs",
     "no-trash",
 ];
 
@@ -208,20 +222,6 @@ fn expand_config_file(path: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-fn parse_args() -> (
-    OssConfig,
-    PathBuf,
-    u64,
-    Option<String>,
-    Option<PathBuf>,
-    Option<String>,
-    u64,
-) {
-    parse_args_from(env::args().skip(1).collect())
-}
-
-/// [`parse_args`] 的可测形态:参数显式传入(测试驱动,真实入口经
-/// env::args 收集后转发)。无效值仍走 usage() 退出,与 CLI 行为一致。
 fn parse_args_from(
     raw_args: Vec<String>,
 ) -> (
@@ -287,7 +287,10 @@ fn parse_args_from(
     let mut disk_cache_free_space_ratio: Option<f64> = None;
     let mut mount_point: Option<PathBuf> = None;
     let mut trash_dir: Option<String> = None;
+    let mut trash_retention_days: Option<u32> = None;
+    let mut trash_refresh_interval_secs: Option<u64> = None;
     let mut trash_refresh_mode: Option<TrashRefreshMode> = None;
+    let mut trash_gc_interval_secs: Option<u64> = None;
     let mut no_trash = false;
 
     if raw.first().map(String::as_str) == Some("mount") {
@@ -586,6 +589,27 @@ fn parse_args_from(
                     _ => usage(),
                 });
             }
+            "--trash-retention-days" => {
+                trash_retention_days = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--trash-refresh-interval-secs" => {
+                trash_refresh_interval_secs = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--trash-gc-interval-secs" => {
+                trash_gc_interval_secs = Some(
+                    iter.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
             other if other.starts_with("--") => {
                 eprintln!("ossmount: unknown option: {other}");
                 usage();
@@ -645,17 +669,16 @@ fn parse_args_from(
             retries,
             multipart_size,
             multipart_concurrency,
-            // CLI 默认开启回收站(D5);--no-trash 优先级最高。其余四字段由
-            // 单元 3/4 落地(本单元仅声明,None = 未设置)。
+            // CLI 默认开启回收站(D5);--no-trash 优先级最高。
             trash_dir: if no_trash {
                 None
             } else {
                 Some(trash_dir.unwrap_or_else(|| ".trash".to_string()))
             },
-            trash_retention_days: None,
-            trash_refresh_interval_secs: None,
+            trash_retention_days,
+            trash_refresh_interval_secs,
             trash_refresh_mode,
-            trash_gc_interval_secs: None,
+            trash_gc_interval_secs,
         },
         mount_point,
         refresh_secs,
@@ -666,10 +689,473 @@ fn parse_args_from(
     )
 }
 
+// ---------- 单元 4:回收站管理命令(trash-list / trash-restore / trash-clean) ----------
+
+/// trash 子命令(规格 4.2)。全字段 pub 测试可断言。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrashCommand {
+    List {
+        json: bool,
+    },
+    Restore {
+        path: String,
+        date: Option<chrono::NaiveDate>,
+    },
+    Clean {
+        before: Option<chrono::NaiveDate>,
+        dry_run: bool,
+    },
+}
+
+/// --before / --date 严格 YYYY-MM-DD;失败返回 None(调用处 usage())。
+fn parse_trash_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+/// 解析 trash 子命令(首个参数是子命令名,已由 main 分发确认)。非法
+/// 参数(未知选项 / 多余 positional / 坏日期)→ usage() 退出。
+fn parse_trash_command(raw: &[String]) -> TrashCommand {
+    let rest = &raw[1..];
+    match raw.first().map(String::as_str).unwrap_or("") {
+        "trash-list" => {
+            let mut json = false;
+            for a in rest {
+                match a.as_str() {
+                    "--json" => json = true,
+                    _ => usage(),
+                }
+            }
+            TrashCommand::List { json }
+        }
+        "trash-restore" => {
+            let mut path: Option<String> = None;
+            let mut date: Option<chrono::NaiveDate> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--date" => {
+                        let v = rest.get(i + 1).unwrap_or_else(|| usage());
+                        date = parse_trash_date(v);
+                        i += 2;
+                    }
+                    other if other.starts_with("--") => usage(),
+                    other => {
+                        if path.is_some() {
+                            usage(); // 多余 positional
+                        }
+                        path = Some(other.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            TrashCommand::Restore {
+                path: path.unwrap_or_else(|| usage()),
+                date,
+            }
+        }
+        "trash-clean" => {
+            let mut before: Option<chrono::NaiveDate> = None;
+            let mut dry_run = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--before" => {
+                        let v = rest.get(i + 1).unwrap_or_else(|| usage());
+                        before = parse_trash_date(v);
+                        i += 2;
+                    }
+                    "--dry-run" => {
+                        dry_run = true;
+                        i += 1;
+                    }
+                    other if other.starts_with("--") => usage(),
+                    _ => usage(),
+                }
+            }
+            TrashCommand::Clean { before, dry_run }
+        }
+        _ => usage(),
+    }
+}
+
+/// 挂载专用、管理命令不消费的键。命令行显式传入 → 报错;config 文件
+/// 带入 → 忽略(同一份 mount config 可复用于管理命令,规格 4.2)。
+const MOUNT_ONLY_SWITCH_KEYS: &[&str] = &[
+    "read-only",
+    "allow-other",
+    "no-rename-dir",
+    "no-ignore-fsync",
+    "no-verify-crc64",
+    "content-md5",
+    "notsup-compat-dir",
+    "disk-cache-verify-etag",
+];
+const MOUNT_ONLY_VALUE_KEYS: &[&str] = &[
+    "refresh-secs",
+    "uid",
+    "gid",
+    "dir-mode",
+    "file-mode",
+    "umask",
+    "rename-dir-limit",
+    "max-upload-bytes",
+    "read-ahead-bytes",
+    "max-dirty-bytes",
+    "storage-class",
+    "multipart-size",
+    "multipart-concurrency",
+    "disk-cache-dir",
+    "disk-cache-max-bytes",
+    "disk-cache-block-size",
+    "disk-cache-prefetch-blocks",
+    "disk-cache-prefetch-concurrency",
+    "disk-cache-etag-ttl",
+    "disk-cache-reserve-diskfree",
+    "disk-cache-free-space-ratio",
+    "negative-cache-ttl",
+    "negative-cache-max-entries",
+    "stat-cache-ttl",
+    "stat-cache-max-entries",
+    "total-mem-limit",
+    "total-mem-read-ratio",
+    "read-cache-max-bytes",
+    "metrics-listen",
+    "log-dir",
+    "metrics-log-interval",
+];
+
+/// 管理命令的连接参数解析(规格 4.2 连接复用方案):从 CLI/config 解析
+/// 连接子集(bucket/endpoint/region/prefix/force-path-style/
+/// credential-process/connect-timeout/readwrite-timeout/retries/
+/// max-concurrent-requests/list-rate-limit)+ trash 参数 + log-level。
+/// 返回 (OssConfig, log_level)。trash 命令强制 read_only=false
+/// (回收站运维必然写操作)。
+fn parse_connection_args(
+    iter: &mut impl Iterator<Item = String>,
+) -> anyhow::Result<(OssConfig, Option<String>)> {
+    let raw: Vec<String> = iter.collect();
+    // 与 parse_args 相同的 --config 展开;config 来源标记 from_config=true
+    // (其挂载专用键被忽略),CLI 来源显式传入挂载专用键 → 报错。
+    let mut args: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == "--config" || raw[i] == "-c" {
+            let path = raw.get(i + 1).cloned().unwrap_or_else(|| usage());
+            match expand_config_file(&path) {
+                Ok(expanded) => args.extend(expanded.into_iter().map(|a| (a, true))),
+                Err(e) => {
+                    eprintln!("ossmount: {e}");
+                    std::process::exit(2);
+                }
+            }
+            i += 2;
+        } else {
+            args.push((raw[i].clone(), false));
+            i += 1;
+        }
+    }
+    let mut bucket = String::new();
+    let mut endpoint: Option<String> = None;
+    let mut region = "us-east-1".to_string();
+    let mut prefix = String::new();
+    let mut force_path_style = false;
+    let mut max_concurrent_requests: Option<usize> = None;
+    let mut list_rate_limit: Option<f64> = None;
+    let mut credential_process: Option<String> = None;
+    let mut connect_timeout_secs: Option<u64> = None;
+    let mut readwrite_timeout_secs: Option<u64> = None;
+    let mut retries: Option<u32> = None;
+    let mut trash_dir: Option<String> = None;
+    let mut trash_retention_days: Option<u32> = None;
+    let mut trash_refresh_interval_secs: Option<u64> = None;
+    let mut trash_refresh_mode: Option<TrashRefreshMode> = None;
+    let mut trash_gc_interval_secs: Option<u64> = None;
+    let mut log_level: Option<String> = None;
+    let mut iter = args.into_iter().peekable();
+    while let Some((arg, from_config)) = iter.next() {
+        if let Some(rest) = arg.strip_prefix("--") {
+            if MOUNT_ONLY_SWITCH_KEYS.contains(&rest) {
+                if from_config {
+                    continue; // config 挂载专用键忽略
+                }
+                anyhow::bail!("option `--{rest}` is mount-only and not valid for trash commands");
+            }
+            if MOUNT_ONLY_VALUE_KEYS.contains(&rest) {
+                if from_config {
+                    iter.next(); // 跳过其值
+                    continue;
+                }
+                anyhow::bail!("option `--{rest}` is mount-only and not valid for trash commands");
+            }
+        }
+        match arg.as_str() {
+            "--bucket" => bucket = iter.next().unwrap_or_else(|| usage()).0,
+            "--endpoint" => endpoint = Some(iter.next().unwrap_or_else(|| usage()).0),
+            "--region" => region = iter.next().unwrap_or_else(|| usage()).0,
+            "--prefix" => prefix = iter.next().unwrap_or_else(|| usage()).0,
+            "--force-path-style" => force_path_style = true,
+            "--max-concurrent-requests" => {
+                let v: usize = iter
+                    .next()
+                    .map(|(v, _)| v)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                max_concurrent_requests = if v == 0 { None } else { Some(v) };
+            }
+            "--list-rate-limit" => {
+                let v: f64 = iter
+                    .next()
+                    .map(|(v, _)| v)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                list_rate_limit = if v > 0.0 { Some(v) } else { None };
+            }
+            "--credential-process" => {
+                credential_process = Some(iter.next().unwrap_or_else(|| usage()).0)
+            }
+            "--connect-timeout" => {
+                let v: u64 = iter
+                    .next()
+                    .map(|(v, _)| v)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                connect_timeout_secs = if v > 0 { Some(v) } else { None };
+            }
+            "--readwrite-timeout" => {
+                let v: u64 = iter
+                    .next()
+                    .map(|(v, _)| v)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                readwrite_timeout_secs = if v > 0 { Some(v) } else { None };
+            }
+            "--retries" => {
+                retries = Some(
+                    iter.next()
+                        .map(|(v, _)| v)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--trash-dir" => {
+                let v = iter.next().unwrap_or_else(|| usage()).0;
+                // 单段名校验(与 build_trash_state 一致)
+                if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                    usage();
+                }
+                trash_dir = Some(v);
+            }
+            "--trash-retention-days" => {
+                trash_retention_days = Some(
+                    iter.next()
+                        .map(|(v, _)| v)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--trash-refresh-interval-secs" => {
+                trash_refresh_interval_secs = Some(
+                    iter.next()
+                        .map(|(v, _)| v)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--trash-refresh-mode" => {
+                let v = iter.next().unwrap_or_else(|| usage()).0;
+                trash_refresh_mode = Some(match v.as_str() {
+                    "lazy" => TrashRefreshMode::Lazy,
+                    "eager" => TrashRefreshMode::Eager,
+                    _ => usage(),
+                });
+            }
+            "--trash-gc-interval-secs" => {
+                trash_gc_interval_secs = Some(
+                    iter.next()
+                        .map(|(v, _)| v)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
+            }
+            "--log-level" => log_level = Some(iter.next().unwrap_or_else(|| usage()).0),
+            "--no-trash" => {
+                anyhow::bail!(
+                    "--no-trash conflicts with trash management commands (trash must be enabled)"
+                );
+            }
+            other if other.starts_with("--") => {
+                anyhow::bail!("ossmount: unknown option: {other}");
+            }
+            other => {
+                anyhow::bail!("ossmount: unexpected argument: {other}");
+            }
+        }
+    }
+    if bucket.is_empty() {
+        anyhow::bail!("ossmount: missing --bucket");
+    }
+    Ok((
+        OssConfig {
+            bucket,
+            region,
+            endpoint,
+            force_path_style,
+            prefix,
+            max_concurrent_requests,
+            list_rate_limit,
+            read_only: false, // 管理命令必然写操作
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            credential_process,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs,
+            readwrite_timeout_secs,
+            retries,
+            multipart_size: None,
+            multipart_concurrency: None,
+            // 管理命令必须有回收站(CLI 默认 Some(".trash"));--no-trash 已拦截
+            trash_dir: Some(trash_dir.unwrap_or_else(|| ".trash".to_string())),
+            trash_retention_days,
+            trash_refresh_interval_secs,
+            trash_refresh_mode,
+            trash_gc_interval_secs,
+        },
+        log_level,
+    ))
+}
+
+/// 执行 trash 子命令(独立进程,复用 ObjectFs::connect):tracing 初始化
+/// (复用 log-level,默认 info,stderr)→ 连接解析 → connect →
+/// 分发(规格 4.2)。解析错误 exit 2(与 usage 一致);restore 未恢复
+/// exit 1(0 恢复 / 1 未恢复)。
+async fn run_trash_command(cmd: TrashCommand, raw: Vec<String>) -> anyhow::Result<()> {
+    let mut iter = raw.into_iter();
+    iter.next(); // 子命令名
+    let (cfg, log_level) = parse_connection_args(&mut iter).unwrap_or_else(|e| {
+        eprintln!("ossmount: {e:#}");
+        std::process::exit(2);
+    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level.as_deref().unwrap_or("info")));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let fs = Arc::new(ObjectFs::connect(cfg).await?);
+    match cmd {
+        TrashCommand::List { json } => {
+            fs.trash_list(|page| {
+                for e in page {
+                    if json {
+                        println!("{}", serde_json::to_string(&e)?);
+                    } else {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            e.deleted_date,
+                            e.path,
+                            e.etag.as_deref().unwrap_or("-"),
+                            e.size.map_or_else(|| "-".to_string(), |s| s.to_string())
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        TrashCommand::Restore { path, date } => match fs.trash_restore(&path, date).await? {
+            ossfs::trash::RestoreOutcome::Restored { etag_mismatch } => {
+                if etag_mismatch {
+                    eprintln!("警告:内容已被其他端修改,恢复的是当前内容");
+                }
+                println!("已恢复 {path}");
+            }
+            ossfs::trash::RestoreOutcome::OriginalGone => {
+                eprintln!("原对象不存在,无法恢复(墓碑已清除)");
+                std::process::exit(1);
+            }
+            ossfs::trash::RestoreOutcome::NoTombstone => {
+                eprintln!("未找到 {path} 的回收站墓碑");
+                std::process::exit(1);
+            }
+        },
+        TrashCommand::Clean { before, dry_run } => {
+            let report = fs
+                .trash_gc(ossfs::trash::GcOptions { before, dry_run })
+                .await?;
+            println!(
+                "files_removed={} files_tombstone_only={} files_skipped_etag={} \
+                 dirs_removed={} objects_deleted={} tombstones_deleted={}{}",
+                report.files_removed,
+                report.files_tombstone_only,
+                report.files_skipped_etag,
+                report.dirs_removed,
+                report.objects_deleted,
+                report.tombstones_deleted,
+                if dry_run { " (dry-run,未删除)" } else { "" }
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 周期 GC 任务:先立即 trash_gc(default)(挂载时触发),再 interval
+/// 循环(interval.tick() 消费首次立即 tick);每次失败仅 warn 不退出
+/// (规格 4.2,与刷新循环同生命周期)。
+async fn run_trash_gc_periodic(fs: Arc<ObjectFs>, interval_secs: u64) {
+    if let Err(e) = fs.trash_gc(Default::default()).await {
+        tracing::warn!(error = %e, "trash gc failed at mount; will retry next cycle");
+    }
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await; // 挂载时已 GC 一次,消费首个立即 tick
+    loop {
+        interval.tick().await;
+        if let Err(e) = fs.trash_gc(Default::default()).await {
+            tracing::warn!(error = %e, "trash gc failed; will retry next cycle");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    // 子命令分发(规格 4.2,parse_args 调用之前):trash-* 独立进程,
+    // 复用 ObjectFs::connect 的连接参数构造方式。
+    match raw.first().map(String::as_str) {
+        Some("trash-list") | Some("trash-restore") | Some("trash-clean") => {
+            let cmd = parse_trash_command(&raw);
+            return run_trash_command(cmd, raw).await;
+        }
+        _ => {}
+    }
     let (cfg, mount_point, refresh_secs, metrics_listen, log_dir, log_level, metrics_log_interval) =
-        parse_args();
+        parse_args_from(raw);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level.as_deref().unwrap_or("info")));
     if let Some(dir) = log_dir {
@@ -683,6 +1169,16 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
     let fs = Arc::new(ObjectFs::connect(cfg).await?);
+    // 周期 GC:挂载时立即 trash_gc(default) 一次,再按
+    // trash_gc_interval_secs 循环(规格 4.2;trash 关闭或 interval=0 不启动)。
+    if let Some(interval) = fs.trash_gc_interval_secs() {
+        if interval > 0 {
+            let gc_fs = Arc::clone(&fs);
+            tokio::spawn(async move {
+                run_trash_gc_periodic(gc_fs, interval).await;
+            });
+        }
+    }
     if metrics_log_interval > 0 {
         let metrics_fs = Arc::clone(&fs);
         tokio::spawn(async move {
@@ -756,7 +1252,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        KNOWN_CONFIG_KEYS, TrashRefreshMode, expand_config_file, parse_args_from, parse_mode,
+        KNOWN_CONFIG_KEYS, TrashCommand, TrashRefreshMode, expand_config_file, parse_args_from,
+        parse_connection_args, parse_mode, parse_trash_command,
     };
 
     #[test]
@@ -896,6 +1393,130 @@ mod tests {
         assert_eq!(parse_mode("493"), Some(493)); // '9' forces decimal
         assert_eq!(parse_mode(""), None);
         assert_eq!(parse_mode("abc"), None);
+    }
+
+    // ---------- 单元 4:trash 子命令解析 ----------
+
+    #[test]
+    fn trash_subcommand_parse() {
+        // trash-restore <path> [--date YYYY-MM-DD]
+        let cmd = parse_trash_command(&[
+            "trash-restore".into(),
+            "docs/a.txt".into(),
+            "--date".into(),
+            "2026-07-01".into(),
+        ]);
+        assert_eq!(
+            cmd,
+            TrashCommand::Restore {
+                path: "docs/a.txt".into(),
+                date: Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+            }
+        );
+        // trash-restore 无 --date
+        let cmd = parse_trash_command(&["trash-restore".into(), "docs/a.txt".into()]);
+        assert_eq!(
+            cmd,
+            TrashCommand::Restore {
+                path: "docs/a.txt".into(),
+                date: None,
+            }
+        );
+        // trash-clean --before --dry-run
+        let cmd = parse_trash_command(&[
+            "trash-clean".into(),
+            "--before".into(),
+            "2026-06-01".into(),
+            "--dry-run".into(),
+        ]);
+        assert_eq!(
+            cmd,
+            TrashCommand::Clean {
+                before: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()),
+                dry_run: true,
+            }
+        );
+        // trash-list --json
+        let cmd = parse_trash_command(&["trash-list".into(), "--json".into()]);
+        assert_eq!(cmd, TrashCommand::List { json: true });
+        let cmd = parse_trash_command(&["trash-list".into()]);
+        assert_eq!(cmd, TrashCommand::List { json: false });
+    }
+
+    #[test]
+    fn trash_connection_args_parse() {
+        // 连接子集 + trash 参数 + log-level
+        let args = vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--endpoint".to_string(),
+            "http://127.0.0.1:9000".to_string(),
+            "--prefix".to_string(),
+            "ossfs".to_string(),
+            "--trash-dir".to_string(),
+            ".trash".to_string(),
+            "--trash-retention-days".to_string(),
+            "7".to_string(),
+            "--trash-refresh-mode".to_string(),
+            "eager".to_string(),
+            "--trash-gc-interval-secs".to_string(),
+            "3600".to_string(),
+            "--log-level".to_string(),
+            "debug".to_string(),
+        ];
+        let (cfg, log_level) = parse_connection_args(&mut args.into_iter()).unwrap();
+        assert_eq!(cfg.bucket, "b");
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(cfg.prefix, "ossfs");
+        assert_eq!(cfg.trash_dir.as_deref(), Some(".trash"));
+        assert_eq!(cfg.trash_retention_days, Some(7));
+        assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Eager));
+        assert_eq!(cfg.trash_gc_interval_secs, Some(3600));
+        assert_eq!(log_level.as_deref(), Some("debug"));
+        // 默认:trash_dir 默认 Some(".trash")(管理命令需回收站开启)
+        let (cfg, _) =
+            parse_connection_args(&mut ["--bucket".to_string(), "b".to_string()].into_iter())
+                .unwrap();
+        assert_eq!(cfg.trash_dir.as_deref(), Some(".trash"));
+        // --no-trash 与 trash 命令冲突 → Err
+        let err = parse_connection_args(
+            &mut [
+                "--bucket".to_string(),
+                "b".to_string(),
+                "--no-trash".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--no-trash"), "got: {err}");
+        // CLI 显式挂载专用参数 → Err
+        let err = parse_connection_args(
+            &mut [
+                "--bucket".to_string(),
+                "b".to_string(),
+                "--uid".to_string(),
+                "1000".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mount-only"), "got: {err}");
+        // config 文件带入的挂载专用键 → 忽略(同一份 mount config 可复用)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json");
+        std::fs::write(
+            &path,
+            r#"{"bucket":"b","uid":1000,"read_only":true,"trash_gc_interval_secs":7200}"#,
+        )
+        .unwrap();
+        let (cfg, _) = parse_connection_args(
+            &mut ["--config".to_string(), path.to_str().unwrap().to_string()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(cfg.bucket, "b");
+        assert_eq!(cfg.uid, 0, "config 挂载专用键被忽略");
+        assert!(!cfg.read_only, "config 挂载专用键被忽略");
+        assert_eq!(cfg.trash_gc_interval_secs, Some(7200), "trash 键保留");
     }
 }
 
