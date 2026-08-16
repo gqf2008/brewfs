@@ -8,8 +8,8 @@
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
 use crate::ossfs::{
-    DeleteObjectsContentMd5, MAX_DELETE_OBJECTS_PER_REQUEST, ObjectFs, TRASH_RETENTION_DAYS,
-    TrashRefreshMode, is_s3_not_found, next_page_token,
+    DeleteObjectsContentMd5, MAX_DELETE_OBJECTS_PER_REQUEST, ObjectFs, TrashRefreshMode,
+    is_s3_not_found, next_page_token,
 };
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
@@ -220,6 +220,9 @@ pub(crate) struct TrashState {
     pub(crate) rebuild_interval: Duration,
     /// 后台 GC 周期(挂载时立即 GC 一次后按此周期循环;normalize 默认 24h)
     pub(crate) gc_interval: Duration,
+    /// 保留期天数(`--trash-retention-days`;trash_gc 的 cutoff 消费,
+    /// build_trash_state 从 normalized config 传入,默认 30)
+    pub(crate) retention_days: u32,
     /// 增量游标 = 最后见过的墓碑 key(ListObjectsV2 start-after 参数)
     pub(crate) cursor: Mutex<Option<String>>,
     /// 上次全量重建时刻(含 bootstrap);未 bootstrap 前构造为「早已过期」,
@@ -288,7 +291,8 @@ impl TrashState {
     }
 
     /// 构造(含调度字段默认值)。refresh_interval/mode 由 connect 读
-    /// normalized config 传入;rebuild_interval/gc_interval 传常量。
+    /// normalized config 传入;rebuild_interval/gc_interval/retention_days
+    /// 传常量或 config(保留期 H1:--trash-retention-days 的消费点)。
     /// 测试经 `new` 或直接改 pub(crate) 字段定制(eager 档、重建周期强制)。
     pub(crate) fn new(
         prefix: String,
@@ -296,6 +300,7 @@ impl TrashState {
         refresh_interval: Duration,
         rebuild_interval: Duration,
         gc_interval: Duration,
+        retention_days: u32,
     ) -> Arc<Self> {
         let now = Instant::now();
         Arc::new(Self {
@@ -305,6 +310,7 @@ impl TrashState {
             refresh_interval,
             rebuild_interval,
             gc_interval,
+            retention_days,
             cursor: Mutex::new(None),
             // 未 bootstrap 前视为「全量早已过期」:首次 refresh_once 直接全量
             last_full_rebuild: Mutex::new(now.checked_sub(rebuild_interval).unwrap_or(now)),
@@ -1197,9 +1203,15 @@ impl TrashState {
     /// "活数据"不被目录启发式误删,规格 4.4 风险 9);处理完的墓碑从
     /// 索引 remove;dry_run 判定照做(HEAD/GET/list)、删除动作全跳过。
     pub(crate) async fn trash_gc(&self, fs: &ObjectFs, opts: GcOptions) -> Result<GcReport> {
+        // 只读挂载绝不动桶(M2):后台周期 GC 与任何直接调用都早退零动作
+        // —— 只读"绝不改桶"语义;管理命令 trash-clean 强制 read_only=false,
+        // 不受影响。
+        if fs.read_only() {
+            return Ok(GcReport::default());
+        }
         let today = date_partition_utc(SystemTime::now());
         let retention_start = today
-            .checked_sub_days(chrono::Days::new(TRASH_RETENTION_DAYS as u64))
+            .checked_sub_days(chrono::Days::new(self.retention_days as u64))
             .unwrap_or(today);
         let cutoff = opts.before.unwrap_or(today).min(retention_start);
         let mut report = GcReport::default();
@@ -1708,6 +1720,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(600),
             Duration::from_secs(crate::ossfs::TRASH_GC_INTERVAL_SECS),
+            crate::ossfs::TRASH_RETENTION_DAYS,
         );
         state.store_index_entries(idx.len());
         assert_eq!(

@@ -1911,12 +1911,16 @@ fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>
             .trash_gc_interval_secs
             .unwrap_or(TRASH_GC_INTERVAL_SECS),
     );
+    // 保留期消费点(H1):--trash-retention-days 经 normalize 已填默认,
+    // 兜底常量防直接构造未 normalize 的 config。
+    let retention_days = config.trash_retention_days.unwrap_or(TRASH_RETENTION_DAYS);
     Ok(Some(trash::TrashState::new(
         format!("{}{}/", config.prefix, dir),
         mode,
         refresh_interval,
         rebuild_interval,
         gc_interval,
+        retention_days,
     )))
 }
 
@@ -4294,6 +4298,7 @@ mod tests {
                 Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
                 Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
                 Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+                TRASH_RETENTION_DAYS,
             )
         };
         // trash None → 恒 false(零行为变化)
@@ -5052,7 +5057,8 @@ mod s3_mock_tests {
         /// 模拟「其他端覆盖同名 key」;缺省回退全局 head_etag)。
         pub(crate) etags: Arc<Mutex<HashMap<String, String>>>,
         /// Per-key LastModified(单元 4:目录 GC 的 mtime 启发式需要按对象
-        /// 区分 last_modified;list 分支返回,缺省 2026-01-01T00:00:00.000Z)。
+        /// 区分 last_modified;PUT/COPY 落地即写当前时间,list/HEAD 分支
+        /// 返回,无记录对象缺省当前时间(C1 生产对齐))。
         pub(crate) last_modified: Arc<Mutex<HashMap<String, String>>>,
         /// When non-zero, every HEAD answers with this status (used to
         /// simulate 403/5xx bucket checks; 0 = normal object lookup).
@@ -5471,7 +5477,21 @@ mod s3_mock_tests {
                         .unwrap()
                         .get(&key)
                         .cloned()
-                        .map(|v| format!("\r\nLast-Modified: {v}"))
+                        .map(|v| {
+                            // last_modified 存储为 ISO 8601(list XML 用);
+                            // HEAD 的 Last-Modified 头必须 HTTP-date 形态
+                            // (RFC 7231),SDK 解析失败是硬错误而非 mtime
+                            // 归零 —— PUT 落地记 last_modified 后 HEAD
+                            // 路径必须给出可解析的头。
+                            chrono::DateTime::parse_from_rfc3339(&v)
+                                .map(|dt| {
+                                    format!(
+                                        "\r\nLast-Modified: {}",
+                                        dt.format("%a, %d %b %Y %H:%M:%S GMT")
+                                    )
+                                })
+                                .unwrap_or_default()
+                        })
                         .unwrap_or_default();
                     format!(
                         "HTTP/1.1 200 OK\r\nETag: \"{etag}\"{lm}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -5506,6 +5526,12 @@ mod s3_mock_tests {
                     let data = mock.objects.lock().unwrap().get(&src_key).cloned();
                     if let Some(data) = data {
                         mock.objects.lock().unwrap().insert(key.clone(), data);
+                        // 生产对齐(C1):COPY 落地即记当前时间 last_modified,
+                        // 与真实 S3 一致(目录 GC mtime 启发式的判据)。
+                        mock.last_modified
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), mock_now_lm());
                         let mut entries = mock.entries.lock().unwrap();
                         if !entries.iter().any(|(k, _)| *k == key) {
                             entries.push((key, false));
@@ -5525,6 +5551,13 @@ mod s3_mock_tests {
                         .lock()
                         .unwrap()
                         .insert(key.clone(), body.clone());
+                    // 生产对齐(C1):PUT 落地即记当前时间 last_modified ——
+                    // 墓碑目录下新写入的对象必须被判「新数据」,不得被目录
+                    // GC 的 mtime 启发式误删;显式 set_last_modified 覆盖。
+                    mock.last_modified
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), mock_now_lm());
                     let mut entries = mock.entries.lock().unwrap();
                     if !entries.iter().any(|(k, _)| *k == key) {
                         entries.push((key, false));
@@ -5596,6 +5629,15 @@ mod s3_mock_tests {
             .to_string()
     }
 
+    /// 当前 UTC 时间的 last_modified 字符串(ISO 8601 毫秒,与
+    /// set_last_modified 的既有形态一致)。mock 服务端语义对齐生产(C1):
+    /// PUT/COPY 落地写当前时间;list 对无记录对象缺省当前时间 —— 避免
+    /// 恒早于墓碑日期的假时间把新对象误判为「过期可删」(目录 GC mtime
+    /// 启发式)。
+    fn mock_now_lm() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     fn list_xml(
         entries: &[(String, bool)],
         sizes: &HashMap<String, u64>,
@@ -5604,6 +5646,9 @@ mod s3_mock_tests {
         use_delimiter: bool,
         prefix: &str,
     ) -> String {
+        // 无记录对象缺省当前时间(生产对齐,C1:对象总是「已存在」,
+        // 绝非 2026-01-01 的远古时间)。
+        let default_lm = mock_now_lm();
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
@@ -5646,7 +5691,7 @@ mod s3_mock_tests {
                 let lm = last_modified
                     .get(key)
                     .map(String::as_str)
-                    .unwrap_or("2026-01-01T00:00:00.000Z");
+                    .unwrap_or(default_lm.as_str());
                 body.push_str(&format!(
                     "<Contents><Key>{key}</Key><LastModified>{lm}</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
                 ));
@@ -5664,7 +5709,7 @@ mod s3_mock_tests {
                 let lm = last_modified
                     .get(key)
                     .map(String::as_str)
-                    .unwrap_or("2026-01-01T00:00:00.000Z");
+                    .unwrap_or(default_lm.as_str());
                 body.push_str(&format!(
                     "<Contents><Key>{key}</Key><LastModified>{lm}</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
                 ));
@@ -7565,6 +7610,7 @@ mod s3_mock_tests {
             Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
             Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
             Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+            TRASH_RETENTION_DAYS,
         )
     }
 
@@ -9393,6 +9439,137 @@ mod s3_mock_tests {
                 .lock()
                 .unwrap()
                 .contains_key(&format!(".trash/{d_future}/c.txt"))
+        );
+    }
+
+    /// H1 回归:--trash-retention-days 必须被 GC 消费 —— 设 7 天保留期时
+    /// 8 天前墓碑被清(旧实现恒用常量 30 天,8 天前不会清 → 红;设 90 则
+    /// 第 30 天数据即被删,合规场景=数据丢失)、2 天前保留(保留期内边界)、
+    /// 29 天前被清(7 < 默认 30,证明选项确实缩短了保留期)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_uses_configured_retention_days() {
+        let d_8 = days_before(8);
+        let d_2 = days_before(2);
+        let d_29 = days_before(29);
+        let entries = vec![
+            (format!(".trash/{d_8}/a.txt"), false),
+            (format!(".trash/{d_2}/b.txt"), false),
+            (format!(".trash/{d_29}/c.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        for (obj, tomb_key) in [
+            ("a.txt", format!(".trash/{d_8}/a.txt")),
+            ("b.txt", format!(".trash/{d_2}/b.txt")),
+            ("c.txt", format!(".trash/{d_29}/c.txt")),
+        ] {
+            mock.set_object(obj, vec![1]);
+            mock.set_etag(obj, "mock-etag");
+            seed_tombstone(
+                &mock,
+                &tomb_key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash::TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
+            Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+            Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+            7, // 保留期 7 天
+        ));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            report.files_removed, 2,
+            "7 天保留期下 8 天前与 29 天前墓碑被清(2 天前保留)"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("a.txt"),
+            "8 天前原对象已删"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("c.txt"),
+            "29 天前原对象已删(7 天保留期短于默认 30)"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "2 天前原对象保留(保留期内)"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_2}/b.txt")),
+            "2 天前墓碑保留"
+        );
+    }
+
+    /// M2 回归:--read-only 挂载不得触发破坏性 GC —— trash_gc 在只读挂载
+    /// 上必须早退零动作(后台周期 GC 与任何直接调用都不删桶内对象)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_only_mount_never_gc_deletes() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.read_only = true;
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report, trash::GcReport::default(), "只读挂载 GC 必须零动作");
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象未删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑未删"
+        );
+    }
+
+    /// C1 回归:mock PUT 必须按当前时间写 per-key last_modified —— 墓碑
+    /// 目录下 PUT 新对象后直接跑目录 GC 时,新对象不得被判「早于墓碑
+    /// 日期」而误删(旧 mock 对无记录对象缺省 2026-01-01,恒早于一切
+    /// 墓碑日期 → 假红/假绿源)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_dirs_preserves_freshly_written_object() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/docs/"), true)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 墓碑目录下 PUT 新对象(走 fs 写路径 → mock PUT;不显式设
+        // last_modified —— 生产语义:PUT 后 last_modified=now)
+        fs.write("/docs/new.txt", b"fresh").await.unwrap();
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            report.objects_deleted, 0,
+            "新写入对象不得被目录 GC 的 mtime 启发式误删"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("docs/new.txt"),
+            "新对象必须存活"
         );
     }
 

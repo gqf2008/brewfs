@@ -707,13 +707,79 @@ enum TrashCommand {
     },
 }
 
-/// --before / --date 严格 YYYY-MM-DD;失败返回 None(调用处 usage())。
+/// --before / --date 严格 YYYY-MM-DD(零填充,如 2026-06-01);失败返回
+/// None(调用处 usage())。round-trip 校验把 chrono 宽容接受的
+/// "2026-6-1" 也判为非法 —— 非法日期必须 usage(),绝不静默当作未提供
+/// (M1:静默退化 = 全量扫描 + 可能命中错误日期的墓碑/错误清理范围)。
 fn parse_trash_date(s: &str) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    (d.to_string() == s).then_some(d)
 }
 
-/// 解析 trash 子命令(首个参数是子命令名,已由 main 分发确认)。非法
-/// 参数(未知选项 / 多余 positional / 坏日期)→ usage() 退出。
+/// 连接/trash 选项里带值的标志:拆分 trash 子命令参数时必须连同值一起
+/// 归连接参数,否则值会被误判为 trash-restore 的 path。与
+/// [`parse_connection_args`] 的接受集保持同步 —— 新增带值连接选项时
+/// 必须同步更新本表。
+const TRASH_CONN_VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "--bucket",
+    "--endpoint",
+    "--region",
+    "--prefix",
+    "--max-concurrent-requests",
+    "--list-rate-limit",
+    "--credential-process",
+    "--connect-timeout",
+    "--readwrite-timeout",
+    "--retries",
+    "--trash-dir",
+    "--trash-retention-days",
+    "--trash-refresh-interval-secs",
+    "--trash-refresh-mode",
+    "--trash-gc-interval-secs",
+    "--log-level",
+];
+
+/// 把 trash 子命令的原始参数(raw 去掉子命令名)拆成
+/// (连接参数, trash 命令参数)。trash 命令参数 = path(裸 positional,
+/// 仅 trash-restore)/--date <值>/--before <值>/--dry-run/--json;其余
+/// 全部归连接参数(含带值标志的值,表见 [`TRASH_CONN_VALUE_FLAGS`])。
+/// 没有这层拆分,两个解析器会把对方的参数当非法输入拒掉 —— trash
+/// 子命令整体不可用(实测 `trash-restore docs/a.txt --bucket b` 报
+/// "unexpected argument: docs/a.txt"),命令日期校验的失败场景也根本
+/// 无法到达。日期值已由 parse_trash_command 校验为 YYYY-MM-DD,绝不
+/// 形似选项,跳过安全。
+fn split_trash_command_args(raw: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut conn = Vec::new();
+    let mut trash_args = Vec::new();
+    let mut iter = raw.iter().skip(1); // 子命令名
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--date" | "--before" => {
+                trash_args.push(arg.clone());
+                if let Some(v) = iter.next() {
+                    trash_args.push(v.clone());
+                }
+            }
+            "--dry-run" | "--json" => trash_args.push(arg.clone()),
+            other if other.starts_with("--") => {
+                conn.push(arg.clone());
+                if TRASH_CONN_VALUE_FLAGS.contains(&other)
+                    && let Some(v) = iter.next()
+                {
+                    conn.push(v.clone());
+                }
+            }
+            other => trash_args.push(other.to_string()), // path(裸 positional)
+        }
+    }
+    (conn, trash_args)
+}
+
+/// 解析 trash 子命令参数(已由 [`split_trash_command_args`] 剥离连接
+/// 参数,只含 path/--date/--before/--dry-run/--json)。非法参数(未知
+/// 选项 / 多余 positional / 坏日期)→ usage() 退出。
 fn parse_trash_command(raw: &[String]) -> TrashCommand {
     let rest = &raw[1..];
     match raw.first().map(String::as_str).unwrap_or("") {
@@ -735,7 +801,13 @@ fn parse_trash_command(raw: &[String]) -> TrashCommand {
                 match rest[i].as_str() {
                     "--date" => {
                         let v = rest.get(i + 1).unwrap_or_else(|| usage());
-                        date = parse_trash_date(v);
+                        // 非法日期(非 YYYY-MM-DD / 越界)→ usage() 退出,
+                        // 绝不静默当作未提供(M1:静默退化 = 全量扫描 + 可能
+                        // 命中错误日期的墓碑)。
+                        let Some(d) = parse_trash_date(v) else {
+                            usage();
+                        };
+                        date = Some(d);
                         i += 2;
                     }
                     other if other.starts_with("--") => usage(),
@@ -761,7 +833,13 @@ fn parse_trash_command(raw: &[String]) -> TrashCommand {
                 match rest[i].as_str() {
                     "--before" => {
                         let v = rest.get(i + 1).unwrap_or_else(|| usage());
-                        before = parse_trash_date(v);
+                        // 非法日期 → usage() 退出,绝不静默当作未提供(M1:
+                        // 静默退化 = 按默认 30 天 cutoff 执行,用户意图被
+                        // 替换为另一行为)。
+                        let Some(b) = parse_trash_date(v) else {
+                            usage();
+                        };
+                        before = Some(b);
                         i += 2;
                     }
                     "--dry-run" => {
@@ -1057,10 +1135,8 @@ fn parse_connection_args(
 /// (复用 log-level,默认 info,stderr)→ 连接解析 → connect →
 /// 分发(规格 4.2)。解析错误 exit 2(与 usage 一致);restore 未恢复
 /// exit 1(0 恢复 / 1 未恢复)。
-async fn run_trash_command(cmd: TrashCommand, raw: Vec<String>) -> anyhow::Result<()> {
-    let mut iter = raw.into_iter();
-    iter.next(); // 子命令名
-    let (cfg, log_level) = parse_connection_args(&mut iter).unwrap_or_else(|e| {
+async fn run_trash_command(cmd: TrashCommand, conn_args: Vec<String>) -> anyhow::Result<()> {
+    let (cfg, log_level) = parse_connection_args(&mut conn_args.into_iter()).unwrap_or_else(|e| {
         eprintln!("ossmount: {e:#}");
         std::process::exit(2);
     });
@@ -1149,8 +1225,13 @@ async fn main() -> anyhow::Result<()> {
     // 复用 ObjectFs::connect 的连接参数构造方式。
     match raw.first().map(String::as_str) {
         Some("trash-list") | Some("trash-restore") | Some("trash-clean") => {
-            let cmd = parse_trash_command(&raw);
-            return run_trash_command(cmd, raw).await;
+            // 子命令参数与连接参数可任意交错(spec 4.2:trash commands
+            // share the connection args);先拆分,各解析器只见自己的参数。
+            let (conn_args, trash_args) = split_trash_command_args(&raw);
+            let mut cmd_raw = vec![raw[0].clone()]; // parse_trash_command 期望首参是子命令名
+            cmd_raw.extend(trash_args);
+            let cmd = parse_trash_command(&cmd_raw);
+            return run_trash_command(cmd, conn_args).await;
         }
         _ => {}
     }
@@ -1170,14 +1251,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let fs = Arc::new(ObjectFs::connect(cfg).await?);
     // 周期 GC:挂载时立即 trash_gc(default) 一次,再按
-    // trash_gc_interval_secs 循环(规格 4.2;trash 关闭或 interval=0 不启动)。
-    if let Some(interval) = fs.trash_gc_interval_secs() {
-        if interval > 0 {
-            let gc_fs = Arc::clone(&fs);
-            tokio::spawn(async move {
-                run_trash_gc_periodic(gc_fs, interval).await;
-            });
-        }
+    // trash_gc_interval_secs 循环(规格 4.2;trash 关闭或 interval=0 不启动;
+    // 只读挂载的 GC 早退在 trash_gc 入口,spawn 本身无妨)。
+    if let Some(interval) = fs.trash_gc_interval_secs()
+        && interval > 0
+    {
+        let gc_fs = Arc::clone(&fs);
+        tokio::spawn(async move {
+            run_trash_gc_periodic(gc_fs, interval).await;
+        });
     }
     if metrics_log_interval > 0 {
         let metrics_fs = Arc::clone(&fs);
@@ -1255,7 +1337,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         KNOWN_CONFIG_KEYS, TrashCommand, TrashRefreshMode, expand_config_file, parse_args_from,
-        parse_connection_args, parse_mode, parse_trash_command,
+        parse_connection_args, parse_mode, parse_trash_command, split_trash_command_args,
     };
 
     #[test]
@@ -1443,6 +1525,96 @@ mod tests {
         assert_eq!(cmd, TrashCommand::List { json: true });
         let cmd = parse_trash_command(&["trash-list".into()]);
         assert_eq!(cmd, TrashCommand::List { json: false });
+    }
+
+    #[test]
+    fn trash_command_split_conn_and_own_args() {
+        // trash-restore:path(任意位置)+ --date 值归命令参数,连接/trash
+        // 选项(含值)归连接参数
+        let raw: Vec<String> = [
+            "trash-restore",
+            "docs/a.txt",
+            "--date",
+            "2026-07-01",
+            "--bucket",
+            "b",
+            "--trash-dir",
+            ".trash",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (conn, trash_args) = split_trash_command_args(&raw);
+        assert_eq!(
+            conn,
+            ["--bucket", "b", "--trash-dir", ".trash"],
+            "连接/trash 选项必须保留在连接侧"
+        );
+        assert_eq!(
+            trash_args,
+            ["docs/a.txt", "--date", "2026-07-01"],
+            "path 与 --date 值必须归命令参数"
+        );
+        // 顺序任意:--date 在前、path 在后;--config 带路径值不被误判为 path
+        let raw2: Vec<String> = [
+            "trash-restore",
+            "--date",
+            "2026-07-01",
+            "docs/a.txt",
+            "--config",
+            "/tmp/cfg.json",
+            "--bucket",
+            "b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (conn2, trash_args2) = split_trash_command_args(&raw2);
+        assert_eq!(trash_args2, ["--date", "2026-07-01", "docs/a.txt"]);
+        assert_eq!(
+            conn2,
+            ["--config", "/tmp/cfg.json", "--bucket", "b"],
+            "--config 的路径值必须留在连接侧"
+        );
+        // trash-clean:--before 值 + --dry-run 归命令参数
+        let raw3: Vec<String> = [
+            "trash-clean",
+            "--before",
+            "2026-06-01",
+            "--dry-run",
+            "--bucket",
+            "b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (conn3, trash_args3) = split_trash_command_args(&raw3);
+        assert_eq!(conn3, ["--bucket", "b"]);
+        assert_eq!(trash_args3, ["--before", "2026-06-01", "--dry-run"]);
+        // trash-list:--json 归命令参数
+        let raw4: Vec<String> = ["trash-list", "--json", "--bucket", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (conn4, trash_args4) = split_trash_command_args(&raw4);
+        assert_eq!(conn4, ["--bucket", "b"]);
+        assert_eq!(trash_args4, ["--json"]);
+        // 未知标志归连接侧,由 parse_connection_args 报错(其后的裸参数
+        // 会落到命令侧,但未知标志本身必报错,不会静默通过)
+        let raw5: Vec<String> = ["trash-clean", "--bogus", "x", "--bucket", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (conn5, trash_args5) = split_trash_command_args(&raw5);
+        assert_eq!(conn5, ["--bogus", "--bucket", "b"]);
+        assert_eq!(trash_args5, ["x"]);
+        // 裸 positional 只允许一个(restore 的 path);多余交给命令解析报错
+        let raw6: Vec<String> = ["trash-restore", "a.txt", "b.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_conn6, trash_args6) = split_trash_command_args(&raw6);
+        assert_eq!(trash_args6, ["a.txt", "b.txt"]);
     }
 
     #[test]
