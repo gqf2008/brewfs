@@ -5179,7 +5179,7 @@ mod s3_mock_tests {
                 .collect();
             let sizes = mock.sizes.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
-            let body = list_xml(&filtered, &sizes, truncated, use_delimiter);
+            let body = list_xml(&filtered, &sizes, truncated, use_delimiter, &prefix);
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
@@ -5438,25 +5438,57 @@ mod s3_mock_tests {
         sizes: &HashMap<String, u64>,
         truncated_no_token: bool,
         use_delimiter: bool,
+        prefix: &str,
     ) -> String {
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
-        body.push_str("<Name>bucket</Name><Prefix></Prefix><KeyCount>");
-        body.push_str(&entries.len().to_string());
-        body.push_str("</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>");
-        body.push_str(if truncated_no_token { "true" } else { "false" });
-        body.push_str("</IsTruncated>");
-        for (key, is_dir) in entries {
-            if *is_dir && use_delimiter {
-                // With a delimiter the server folds directory markers into
-                // CommonPrefixes; without one (how ObjectFs lists) a marker
-                // is an ordinary zero-byte object in Contents, matching real
-                // S3/OSS semantics (#60 review).
+        body.push_str("<Name>bucket</Name><Prefix></Prefix>");
+        // delimiter 语义与真实 S3 对齐(裁决 #10 分区枚举的依赖):带
+        // delimiter 时按「前缀之后第一个分隔符」折叠 CommonPrefixes
+        // (去重、升序),仅直接子项进 Contents;目录标记 key 本身就是
+        // 其公共前缀,折叠行为与旧实现一致。不带 delimiter(如何 ObjectFs
+        // 的 max_keys 探测)时标记是普通零字节对象。
+        if use_delimiter {
+            let mut common: Vec<String> = Vec::new();
+            let mut direct: Vec<&(String, bool)> = Vec::new();
+            for e in entries {
+                let rest = e.0.strip_prefix(prefix).unwrap_or(&e.0);
+                match rest.find('/') {
+                    Some(idx) => {
+                        let cp = format!("{prefix}{}", &rest[..=idx]);
+                        if !common.contains(&cp) {
+                            common.push(cp);
+                        }
+                    }
+                    None => direct.push(e),
+                }
+            }
+            common.sort_unstable();
+            body.push_str(&format!("<KeyCount>{}</KeyCount>", common.len() + direct.len()));
+            body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>");
+            body.push_str(if truncated_no_token { "true" } else { "false" });
+            body.push_str("</IsTruncated>");
+            for cp in &common {
                 body.push_str(&format!(
-                    "<CommonPrefixes><Prefix>{key}</Prefix></CommonPrefixes>"
+                    "<CommonPrefixes><Prefix>{cp}</Prefix></CommonPrefixes>"
                 ));
-            } else {
+            }
+            for (key, _) in direct {
+                let size = sizes.get(key).copied().unwrap_or(5);
+                body.push_str(&format!(
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                ));
+            }
+        } else {
+            body.push_str(&format!("<KeyCount>{}</KeyCount>", entries.len()));
+            body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>");
+            body.push_str(if truncated_no_token { "true" } else { "false" });
+            body.push_str("</IsTruncated>");
+            for (key, _) in entries {
+                // Without a delimiter a directory marker is an ordinary
+                // zero-byte object in Contents, matching real S3/OSS
+                // semantics (#60 review).
                 let size = sizes.get(key).copied().unwrap_or(5);
                 body.push_str(&format!(
                     "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
@@ -8376,6 +8408,98 @@ mod s3_mock_tests {
             rebuild_delta <= bound,
             "降级 eager 全量重建必须受周期节流:5 轮 poll 全量 {rebuild_delta} 次,上界 {bound}(修复前为 5)"
         );
+    }
+
+    /// 裁决 #10:清墓碑按日期分区反向扫描(先查今天分区)—— 请求数从
+    /// O(墓碑总数/页) 收紧为 O(分区数);全量覆盖(不做「首个命中即停」:
+    /// 旧分区残留墓碑会让已提交写入在下次刷新后重新隐藏);今天分区最先
+    /// 探测。修复前:全量分页枚举 .trash(1 次 list),本测试断言 1+分区数
+    /// 次列表与探测顺序,旧实现必红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_tombstones_partition_scan_bounded_and_full_coverage() {
+        let today = trash::date_partition_utc(std::time::SystemTime::now());
+        let yesterday = today.pred_opt().expect("today 非纪元首日");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 今天分区墓碑(软删除真实写入)+ 昨天分区墓碑 + 无关墓碑
+        fs.delete("/a.txt").await.expect("soft delete");
+        mock.recorded.lock().unwrap().clear();
+        let old_tomb = format!(".trash/{yesterday}/a.txt");
+        mock.set_object(&old_tomb, br#"{"is_dir":false}"#.to_vec());
+        mock.entries.lock().unwrap().push((old_tomb, false));
+        let unrelated = format!(".trash/{today}/b.txt");
+        mock.set_object(&unrelated, br#"{"is_dir":false}"#.to_vec());
+        mock.entries.lock().unwrap().push((unrelated.clone(), false));
+        let today_tomb = format!(".trash/{today}/a.txt");
+
+        fs.write("/a.txt", b"new").await.expect("同名重建");
+
+        let recorded = mock.recorded.lock().unwrap();
+        // 全量覆盖:两个分区的同名墓碑都必须删除;无关墓碑保留
+        let trash_deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .map(|r| {
+                r.target
+                    .split('?')
+                    .next()
+                    .unwrap_or(&r.target)
+                    .split(".trash/")
+                    .nth(1)
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(trash_deletes.len(), 2, "跨分区同名墓碑全清: {trash_deletes:?}");
+        assert!(
+            trash_deletes
+                .iter()
+                .any(|k| *k == format!("{today}/a.txt")),
+            "今天分区墓碑被删: {trash_deletes:?}"
+        );
+        assert!(
+            trash_deletes
+                .iter()
+                .any(|k| *k == format!("{yesterday}/a.txt")),
+            "旧分区墓碑被删: {trash_deletes:?}"
+        );
+        drop(recorded);
+        assert!(
+            mock.objects.lock().unwrap().contains_key(&unrelated),
+            "无关墓碑不得误删"
+        );
+        // 请求数有界:1 次分区枚举(delimiter)+ 分区数次探测 —— 与墓碑
+        // 总数无关(修复前为 1 次全量分页枚举)
+        let lists: Vec<String> = mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.contains("list-type=2"))
+            .cloned()
+            .collect();
+        assert_eq!(lists.len(), 3, "1 delimiter 枚举 + 2 分区探测: {lists:?}");
+        assert!(
+            lists[0].contains("delimiter="),
+            "第一笔必须是分区枚举(delimiter): {lists:?}"
+        );
+        // 反向顺序:今天分区最先探测
+        let today_idx = lists
+            .iter()
+            .position(|t| t.contains(&format!("prefix=")) && t.contains(&today.to_string()))
+            .expect("今天分区探测存在");
+        let yesterday_idx = lists
+            .iter()
+            .position(|t| t.contains(&yesterday.to_string()))
+            .expect("旧分区探测存在");
+        assert!(
+            today_idx < yesterday_idx,
+            "今天分区必须最先探测: {lists:?}"
+        );
+        // 重建后立即可见,gauge 归零
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
     }
 
     /// 裁决 #7:refresh_once 入口统一 poll_inflight 互斥 —— 周期循环与

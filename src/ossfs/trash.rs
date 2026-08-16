@@ -811,12 +811,67 @@ impl TrashState {
         self.clear_tombstones_matching(fs, &dir_key, true).await
     }
 
+    /// 枚举 .trash 下全部日期分区(common prefixes,delimiter 扫描,
+    /// 分页续 token 复用 next_page_token 护栏),返回降序(最新在前)
+    /// 的 "YYYY-MM-DD" 字符串。1+ 次 list 请求(分区数 >1000 才多页,
+    /// 现实中远低于此)。s3_lists 计数与 list_impl 对齐(每页 +1)。
+    /// 不 acquire permit:调用方(clear 路径)已持。
+    async fn list_partitions_desc(
+        fs: &ObjectFs,
+        trash_prefix: &str,
+    ) -> Result<Vec<String>> {
+        let mut token: Option<String> = None;
+        let mut parts: Vec<String> = Vec::new();
+        loop {
+            fs.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
+            let mut req = fs
+                .client
+                .list_objects_v2()
+                .bucket(&fs.bucket)
+                .prefix(trash_prefix)
+                .delimiter("/");
+            if let Some(tok) = token.as_deref() {
+                req = req.continuation_token(tok);
+            }
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    fs.metrics.s3_list_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(e).context("s3 list trash partitions");
+                }
+            };
+            for cp in resp.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    let date = p.strip_prefix(trash_prefix).unwrap_or(p);
+                    if !date.is_empty() {
+                        parts.push(date.trim_end_matches('/').to_string());
+                    }
+                }
+            }
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
+            }
+        }
+        parts.sort_unstable_by(|a, b| b.cmp(a)); // 降序:今天分区最先
+        parts.dedup();
+        Ok(parts)
+    }
+
     /// 分页 list trash 前缀,decode 精确匹配 `original_key == target &&
     /// is_dir` 后逐个 DELETE;全部成功后索引 remove + gauge store。
     /// 任一 DELETE 失败 → Err(调用方决定整体失败)。
     /// 锁纪律:列表/删除期间不持 index 锁,仅收尾时短写锁。
     /// 不 acquire permit:permit 由入口(_if_covered 变体)或调用方
     /// (rename_impl 的外层 permit)负责,此处只做请求。
+    ///
+    /// 扫描策略(裁决 #10):按日期分区**反向**扫描 —— 先枚举分区
+    /// (1 次 delimiter list),再逐分区精确前缀探测、最新在前(今天
+    /// 分区最先:同日删除+重建最常见,第一笔请求即命中并删除)。请求数
+    /// 从 O(墓碑总数/页) 收紧为 O(分区数)(≤ 保留窗口,有界)。**全量
+    /// 覆盖,不做「首个命中即停」**:旧分区残留墓碑会让已提交写入在下次
+    /// 刷新后重新隐藏(静默回归),跨分区同名墓碑(跨日删除链)必须全清。
     async fn clear_tombstones_matching(
         &self,
         fs: &ObjectFs,
@@ -825,18 +880,24 @@ impl TrashState {
     ) -> Result<()> {
         let prefix = self.prefix.clone();
         let mut to_delete: Vec<String> = Vec::new();
-        list_trash_keys(fs, None, None, |page| {
-            for k in page {
-                if let Some(t) = decode_tombstone_key(&prefix, &k)
-                    && t.is_dir == is_dir
-                    && t.original_key == target
-                {
-                    to_delete.push(k);
+        let partitions = Self::list_partitions_desc(fs, &prefix).await?;
+        for date in &partitions {
+            // 精确前缀探测:仅该分区的同名墓碑(含目录尾斜杠变体与子路径
+            // 同名键,均经 decode 精确过滤),页面恒为 0-2 键。
+            let probe = format!("{prefix}{date}/{target}");
+            list_trash_keys(fs, None, Some(&probe), |page| {
+                for k in page {
+                    if let Some(t) = decode_tombstone_key(&prefix, &k)
+                        && t.is_dir == is_dir
+                        && t.original_key == target
+                    {
+                        to_delete.push(k);
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await?;
+                Ok(())
+            })
+            .await?;
+        }
         for k in &to_delete {
             fs.client
                 .delete_object()
@@ -896,11 +957,19 @@ impl TrashState {
 
 /// 以 trash_prefix 分页枚举墓碑对象 key。start_after 传 Some 时携带
 /// ListObjectsV2 start-after 参数(单元 3);None 为从头全量。prefix 传
-/// Some 时覆盖默认 trash_prefix(如「当前 UTC 日期分区」完整扫描)。
+/// Some 时覆盖默认 trash_prefix(如「当前 UTC 日期分区」完整扫描、
+/// 清墓碑的逐分区精确探测)。
 /// 分页间续 token 处理复用 next_page_token 的 truncated 护栏(#60)。
 /// 不 acquire limiter permit:调用方决定(rebuild 全程持一个 permit,
 /// eager 挂点靠 poll_inflight 互斥,均见各调用点注释)。
 /// s3_lists 计数与 list_impl 对齐(每页 +1)。
+///
+/// **不施加 list_rate(规格 §7.1 待验证项,裁决 #10 结论)**:list_rate
+/// 是用户目录枚举节流(list_impl 路径),施加到 trash 刷新会让墓碑可见
+/// 性依赖用户枚举负载(同一桶大目录枚举可把 30s 可见性 SLA 任意恶化);
+/// trash 路径已有自身并发约束(全量持 permit、eager 靠 poll_inflight
+/// 天然限 1);且清墓碑已按分区扫描,请求数 O(分区数) 有界,无线性
+/// 放大可节流。
 pub(crate) async fn list_trash_keys(
     fs: &ObjectFs,
     start_after: Option<&str>,
