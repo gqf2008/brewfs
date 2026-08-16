@@ -1688,6 +1688,14 @@ pub async fn mount_oss_fuse(
     // present a mount that every operation errors on.
     fs.list("/").await?;
 
+    // 回收站:挂载启动全量建索引(bootstrap 失败仅 warn + 计数,不阻塞挂载;
+    // 索引空则已删文件短暂可见,周期刷新自愈)+ 启动周期刷新循环(与下方
+    // 目录 refresh 任务同生命周期,随进程退出)。
+    if fs.trash_enabled() {
+        let _ = fs.trash_bootstrap().await;
+        fs.trash_refresh_start();
+    }
+
     if !mount_point.exists() {
         std::fs::create_dir_all(mount_point).map_err(|e| {
             anyhow::anyhow!(

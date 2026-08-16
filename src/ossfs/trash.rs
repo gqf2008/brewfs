@@ -7,13 +7,13 @@
 //!
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
-use crate::ossfs::{ObjectFs, is_s3_not_found, next_page_token};
+use crate::ossfs::{ObjectFs, TrashRefreshMode, is_s3_not_found, next_page_token};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// eager 档的最小轮询间隔:每次 list/stat 前的增量拉取节流,防枚举类请求
 /// 远程成本翻倍放大(规格 C5 阈值,独立 commit 落地 + 断言;变更必须独立
@@ -164,18 +164,288 @@ impl TombstoneIndex {
     }
 }
 
-/// 回收站运行状态:墓碑前缀 + 本地索引。挂在 `ObjectFs.trash` 上
-/// (`Option<Arc<TrashState>>`,None = 回收站关闭,硬删除)。
-/// 锁纪律:调用方不得跨 await 持有 index 锁;读锁只应在 is_covered 内瞬时持有。
+/// 回收站运行状态:墓碑前缀 + 本地索引 + 多端同步调度字段。挂在
+/// `ObjectFs.trash` 上(`Option<Arc<TrashState>>`,None = 回收站关闭,硬删除)。
+/// 锁纪律:调用方不得跨 await 持有 index 锁;读锁只应在 is_covered 内瞬时
+/// 持有;增量/重建遍历期间不持写锁(离线构建 + 短写锁整体换入)。
 #[derive(Debug)]
 pub(crate) struct TrashState {
     /// 墓碑前缀,如 "ossfs/.trash/"(含命名空间,尾斜杠)
     pub prefix: String,
     /// 本地索引(files + dirs)
     pub index: RwLock<TombstoneIndex>,
+    /// lazy(默认)| eager —— eager 档每次 list/stat 前先增量刷一遍 .trash
+    pub(crate) mode: TrashRefreshMode,
+    /// 增量拉取周期(refresh_loop 的循环节拍;normalize 默认 30s)
+    pub(crate) refresh_interval: Duration,
+    /// 全量重建周期(兜底被恢复/被 GC 移除的墓碑;默认 600s)
+    pub(crate) rebuild_interval: Duration,
+    /// 增量游标 = 最后见过的墓碑 key(ListObjectsV2 start-after 参数)
+    pub(crate) cursor: Mutex<Option<String>>,
+    /// 上次全量重建时刻(含 bootstrap);未 bootstrap 前构造为「早已过期」,
+    /// 首次 refresh_once 直接全量重建(挂载 bootstrap 失败自愈路径)。
+    pub(crate) last_full_rebuild: Mutex<Instant>,
+    /// start-after 自动探测:true=store 遵守 start-after;探测到被忽略
+    /// → false,此后增量退化为全量(每轮全量,insert 幂等,正确性不损)。
+    pub(crate) start_after_supported: AtomicBool,
+    /// eager 节流:距上次 < TRASH_EAGER_MIN_POLL_INTERVAL 跳过本轮
+    pub(crate) last_eager_poll: Mutex<Instant>,
+    /// 增量/重建互斥:swap(true) 抢锁,失败即跳过(天然限 1 —— eager 挂点
+    /// 不 acquire limiter permit,靠它防并发放大)。
+    pub(crate) poll_inflight: AtomicBool,
     /// gauge:索引条目数(files+dirs)。insert/remove/rebuild 后 store,
     /// `ObjectFs::metrics()` 注入 snapshot(prefetch_inflight 先例,§0.3)。
     pub index_entries: AtomicU64,
+}
+
+impl TrashState {
+    /// 构造(含调度字段默认值)。refresh_interval/mode 由 connect 读
+    /// normalized config 传入;rebuild_interval 传常量。测试经 `new` 或
+    /// 直接改 pub(crate) 字段定制(eager 档、重建周期强制)。
+    pub(crate) fn new(
+        prefix: String,
+        mode: TrashRefreshMode,
+        refresh_interval: Duration,
+        rebuild_interval: Duration,
+    ) -> Arc<Self> {
+        let now = Instant::now();
+        Arc::new(Self {
+            prefix,
+            index: RwLock::new(TombstoneIndex::default()),
+            mode,
+            refresh_interval,
+            rebuild_interval,
+            cursor: Mutex::new(None),
+            // 未 bootstrap 前视为「全量早已过期」:首次 refresh_once 直接全量
+            last_full_rebuild: Mutex::new(now.checked_sub(rebuild_interval).unwrap_or(now)),
+            start_after_supported: AtomicBool::new(true),
+            last_eager_poll: Mutex::new(
+                now.checked_sub(TRASH_EAGER_MIN_POLL_INTERVAL)
+                    .unwrap_or(now),
+            ),
+            poll_inflight: AtomicBool::new(false),
+            index_entries: AtomicU64::new(0),
+        })
+    }
+
+    /// 挂载启动全量建索引(可重入:降级/重挂载再调):分页 list 全量,
+    /// 离线构建新集合、短写锁整体换入(遍历期间不持写锁),cursor = 最后
+    /// key、last_full_rebuild = now、全清 stats/negative 缓存。
+    /// 锁纪律:调用方(ObjectFs::trash_bootstrap)持一个 limiter permit。
+    pub(crate) async fn bootstrap(&self, fs: &ObjectFs) -> Result<()> {
+        let mut index = TombstoneIndex::default();
+        let mut last_key: Option<String> = None;
+        let prefix = self.prefix.clone();
+        list_trash_keys(fs, None, |page| {
+            for key in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &key) {
+                    index.insert(&t.original_key, t.is_dir);
+                }
+                last_key = Some(key);
+            }
+            Ok(())
+        })
+        .await?;
+        // 短写锁整体换入:离线构建期间读路径继续用旧索引
+        *self.index.write().unwrap() = index;
+        self.index_entries
+            .store(self.index.read().unwrap().len() as u64, Ordering::Relaxed);
+        *self.cursor.lock().unwrap() = last_key;
+        *self.last_full_rebuild.lock().unwrap() = Instant::now();
+        fs.stats.lock().unwrap().clear();
+        fs.negative.lock().unwrap().clear();
+        Ok(())
+    }
+
+    /// 一轮调度:距上次全量 >= rebuild_interval → full_rebuild,否则
+    /// poll_incremental。测试与挂载 refresh_loop 共用(经
+    /// [`ObjectFs::trash_refresh_once`] 转发)。
+    pub(crate) async fn refresh_once(&self, fs: &ObjectFs) -> Result<()> {
+        let rebuild_due = {
+            let last = self.last_full_rebuild.lock().unwrap();
+            last.elapsed() >= self.rebuild_interval
+        };
+        if rebuild_due {
+            self.full_rebuild(fs).await
+        } else {
+            self.poll_incremental(fs).await
+        }
+    }
+
+    /// start-after 游标增量(list_trash_keys(start_after=cursor)):逐条
+    /// decode,新增 insert + 缓存失效;**探测 start-after 被忽略**(返回 key
+    /// 含 <= 游标者)→ start_after_supported=false + 当轮转全量重建 +
+    /// trash_start_after_ignored+1;成功 → cursor=最后 key、
+    /// trash_refresh_incrementals+1。start_after_supported 已为 false →
+    /// 直接退化为全量(每轮全量,正确性不损)。
+    pub(crate) async fn poll_incremental(&self, fs: &ObjectFs) -> Result<()> {
+        if !self.start_after_supported.load(Ordering::SeqCst) {
+            // 已探测到 store 不支持 start-after → 增量退化为全量
+            return self.full_rebuild(fs).await;
+        }
+        let cursor = self.cursor.lock().unwrap().clone();
+        let mut last_key: Option<String> = None;
+        let mut ignored = false;
+        let prefix = self.prefix.clone();
+        let mut added: Vec<(String, bool)> = Vec::new();
+        list_trash_keys(fs, cursor.as_deref(), |page| {
+            for key in page {
+                // 探测:start-after 语义要求返回 key 全部 > 游标
+                if !ignored
+                    && let Some(c) = &cursor
+                    && key.as_str() <= c.as_str()
+                {
+                    ignored = true;
+                }
+                if let Some(t) = decode_tombstone_key(&prefix, &key) {
+                    added.push((t.original_key, t.is_dir));
+                }
+                last_key = Some(key);
+            }
+            Ok(())
+        })
+        .await?;
+
+        if ignored {
+            // store 忽略 start-after → 当轮转全量重建(游标不可信)
+            self.start_after_supported.store(false, Ordering::SeqCst);
+            fs.metrics
+                .trash_start_after_ignored
+                .fetch_add(1, Ordering::Relaxed);
+            return self.full_rebuild(fs).await;
+        }
+
+        // 应用新增:insert 幂等(同名多日期墓碑只留一条),逐一短写锁,
+        // 缓存失效在锁外做(不跨 await 持锁)。
+        if !added.is_empty() {
+            {
+                let mut idx = self.index.write().unwrap();
+                for (key, is_dir) in &added {
+                    idx.insert(key, *is_dir);
+                }
+                self.index_entries
+                    .store(idx.len() as u64, Ordering::Relaxed);
+            }
+            for (key, is_dir) in &added {
+                invalidate_key(fs, key, *is_dir);
+            }
+        }
+        if let Some(k) = last_key {
+            *self.cursor.lock().unwrap() = Some(k);
+        }
+        fs.metrics
+            .trash_refresh_incrementals
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 全量 list + diff(旧索引 entries() vs 远端):新增 insert + 缓存失效、
+    /// 移除 remove + 缓存失效(否则 stats 正向缓存 ≤3s TTL 内旧文件仍可见);
+    /// 单轮 diff > [`FULL_REBUILD_DIFF_CLEAR_THRESHOLD`] 条 → 整体清空
+    /// stats/negative 缓存(防瞬时 stat 风暴);cursor=最后 key;
+    /// trash_refresh_rebuilds+1。
+    pub(crate) async fn full_rebuild(&self, fs: &ObjectFs) -> Result<()> {
+        let prev = self.index.read().unwrap().entries();
+        let mut index = TombstoneIndex::default();
+        let mut last_key: Option<String> = None;
+        let prefix = self.prefix.clone();
+        list_trash_keys(fs, None, |page| {
+            for key in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &key) {
+                    index.insert(&t.original_key, t.is_dir);
+                }
+                last_key = Some(key);
+            }
+            Ok(())
+        })
+        .await?;
+        // diff:prev - new = 被恢复/被 GC 移除的墓碑;new - prev = 新增
+        let prev_set: HashSet<(String, bool)> = prev.into_iter().collect();
+        let new_set: HashSet<(String, bool)> = index.entries().into_iter().collect();
+        let removed: Vec<(String, bool)> = prev_set.difference(&new_set).cloned().collect();
+        let added: Vec<(String, bool)> = new_set.difference(&prev_set).cloned().collect();
+        let diff_total = removed.len() + added.len();
+        // 短写锁整体换入:diff 计算期间不持锁
+        *self.index.write().unwrap() = index;
+        self.index_entries
+            .store(self.index.read().unwrap().len() as u64, Ordering::Relaxed);
+        *self.cursor.lock().unwrap() = last_key;
+        *self.last_full_rebuild.lock().unwrap() = Instant::now();
+        if diff_total > FULL_REBUILD_DIFF_CLEAR_THRESHOLD {
+            fs.stats.lock().unwrap().clear();
+            fs.negative.lock().unwrap().clear();
+        } else {
+            for (key, is_dir) in removed.iter().chain(added.iter()) {
+                invalidate_key(fs, key, *is_dir);
+            }
+        }
+        fs.metrics
+            .trash_refresh_rebuilds
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// eager 入口(list/stat 挂点):节流(距上次 <
+    /// TRASH_EAGER_MIN_POLL_INTERVAL 跳过)+ poll_inflight 互斥 + 错误仅
+    /// warn(不 fail 上层 list/stat);**不 acquire limiter permit** —— 调用
+    /// 方(list/stat)已持 permit,再等第二把会在饱和池死锁;靠 poll_inflight
+    /// 天然限 1。
+    pub(crate) async fn poll_incremental_eager(&self, fs: &ObjectFs) {
+        if self.mode != TrashRefreshMode::Eager {
+            return; // lazy 零开销
+        }
+        // 节流:1s 内最多一次增量拉取(连续 list/stat 只放大一份工作)
+        {
+            let mut last = self.last_eager_poll.lock().unwrap();
+            if last.elapsed() < TRASH_EAGER_MIN_POLL_INTERVAL {
+                return;
+            }
+            *last = Instant::now();
+        }
+        // 互斥:上一次增量/重建未结束 → 本轮跳过
+        if self.poll_inflight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // RAII:中途被取消(drop 上层 list/stat future)也复位互斥位,
+        // 避免永久卡死后续 eager 轮询
+        let _guard = InflightGuard(&self.poll_inflight);
+        let result = self.refresh_once(fs).await;
+        if let Err(e) = result {
+            fs.metrics
+                .trash_refresh_errors
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "trash eager refresh failed; will retry");
+        }
+    }
+}
+
+/// poll_inflight 的 RAII 复位(防 await 取消后互斥位永久置位)。
+struct InflightGuard<'a>(&'a AtomicBool);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 全量重建 diff 超此条数 → 整体清空 stats/negative 缓存,防瞬时 stat
+/// 风暴(规格 §3.2 full_rebuild)。内部阈值,随主 commit 落地。
+const FULL_REBUILD_DIFF_CLEAR_THRESHOLD: usize = 1000;
+
+/// 墓碑 key(含命名空间前缀)对应的缓存失效:key → 挂载视图路径 →
+/// invalidate_trash_cached(目录额外扫掉 stats/negative 后代);目录另按
+/// 裸形态 invalidate(stat("/docs") 与 stat("/docs/") 是不同缓存键)。
+fn invalidate_key(fs: &ObjectFs, key: &str, is_dir: bool) {
+    let rel = key.strip_prefix(fs.prefix.as_str()).unwrap_or(key);
+    let path = if rel.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{rel}")
+    };
+    fs.invalidate_trash_cached(&path, is_dir);
+    if is_dir {
+        fs.invalidate_stat(path.trim_end_matches('/'));
+    }
 }
 
 /// 墓碑 body(serde 往返;serde_json 已是直接依赖)。serde 默认忽略未知
