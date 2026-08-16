@@ -244,6 +244,61 @@ impl TombstoneIndex {
     }
 }
 
+// ---------- 单元 1:系统回收站虚拟视图(识别/渲染/放行) ----------
+
+/// 系统回收站配置(裁决 R1)。`OssConfig.system_trash: None` = 关闭。
+/// 平台默认与默认开/关在 CLI(ossmount)与 build_trash_state 按
+/// `cfg!(target_os = "macos")` 注入:Windows/Linux 默认随 trash 开启,
+/// macOS 默认关闭(需显式 --system-trash-dir,采纳 A3 的保守默认)。
+#[derive(Debug, Clone)]
+pub struct SystemTrashConfig {
+    /// 目录名覆盖(平台默认:"$Recycle.Bin" / ".Trashes")
+    pub dir_name: Option<String>,
+    /// macOS:渲染哪些 uid 段;空 = 当前挂载用户 uid
+    pub macos_uid_dirs: Vec<u32>,
+}
+
+/// 平台形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemTrashPlatform {
+    /// 条目成对:$R(内容)+$I(元数据,捕获字节)
+    WindowsRecycleBin,
+    /// 条目 = 原名(无 $R/$I)
+    MacOsTrashes,
+}
+
+/// 系统回收站虚拟视图,挂在 TrashState.system(None = 不渲染)。
+#[derive(Debug, Clone)]
+pub(crate) struct SystemTrash {
+    /// "$Recycle.Bin" | ".Trashes"(挂载根下可见目录名)
+    pub dir_name: String,
+    /// 完整 key 前缀,含 namespace prefix,尾斜杠,如 "ossfs/$Recycle.Bin/"
+    pub key_prefix: String,
+    pub platform: SystemTrashPlatform,
+    /// macOS 渲染/拦截范围;空 = 当前挂载用户 uid(裁决 R17)
+    pub macos_uid_dirs: Vec<u32>,
+}
+
+/// 路径落在系统回收站内的哪一层(纯结构识别,同步,零远程)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemTrashMatch {
+    /// 目录层:level 0 = 根("$Recycle.Bin" / ".Trashes"),1 = SID/uid 段
+    Dir { level: usize },
+    /// 条目层(第 2 段):Windows = $R/$I 名;macOS = 条目名
+    Entry { entry_name: String },
+}
+
+/// Windows $R 名 ↔ 墓碑的反向索引(裁决 R3:① 本地软删写入;② 增量/全量
+/// 重建 diff 读 body 填充;③ 渲染/读取未命中按需 GET 兜底)。派生缓存,
+/// 非独立事实源;与墓碑同生命周期(remove_tombstone_maps 收尾)。
+#[derive(Debug, Default)]
+pub(crate) struct RecycleNameIndex {
+    /// recycle_name -> 墓碑 key(".trash/<date>/<orig>",带前缀)
+    by_name: HashMap<String, String>,
+    /// original_key(带前缀) -> recycle_name(最新,裁决 R7)
+    by_key: HashMap<String, String>,
+}
+
 /// 回收站运行状态:墓碑前缀 + 本地索引 + 多端同步调度字段。挂在
 /// `ObjectFs.trash` 上(`Option<Arc<TrashState>>`,None = 回收站关闭,硬删除)。
 /// 锁纪律:调用方不得跨 await 持有 index 锁;读锁只应在 is_covered 内瞬时
@@ -286,6 +341,14 @@ pub(crate) struct TrashState {
     /// store(含超阈值告警,裁决 #6/#9),`ObjectFs::metrics()` 注入
     /// snapshot(prefetch_inflight 先例,§0.3)。
     pub index_entries: AtomicU64,
+    /// 系统回收站虚拟视图(None = 不渲染)。配置/平台注入见
+    /// build_trash_state(mod.rs);测试直接置字段定制。
+    pub(crate) system: Option<SystemTrash>,
+    /// Windows $R 名 ↔ 墓碑的反向索引(裁决 R3)
+    pub(crate) recycle_names: RwLock<RecycleNameIndex>,
+    /// Windows:见过的 SID 段(裁决 R14,list("$Recycle.Bin") 渲染);
+    /// macOS 不使用
+    pub(crate) seen_sids: RwLock<HashSet<String>>,
 }
 
 /// 分页全量拉取 .trash 全部 key 并离线构建新索引(不换入、不失效缓存)。
@@ -368,6 +431,9 @@ impl TrashState {
             ),
             poll_inflight: AtomicBool::new(false),
             index_entries: AtomicU64::new(0),
+            system: None,
+            recycle_names: RwLock::new(RecycleNameIndex::default()),
+            seen_sids: RwLock::new(HashSet::new()),
         })
     }
 
@@ -663,6 +729,51 @@ impl TrashState {
                 .trash_refresh_errors
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(error = %e, "trash eager refresh failed; will retry");
+        }
+    }
+}
+
+// ---------- 单元 1:系统回收站路径识别(同步,零远程) ----------
+
+impl TrashState {
+    /// 纯字符串判定:path 命中系统前缀 0/1/2 层(Dir 或 Entry)。边界:
+    /// ".Trashesx" 不误伤;与 ".trash" 前缀互不干扰;trash 关闭时恒 false。
+    pub(crate) fn is_system_trash_path(&self, path: &str) -> bool {
+        self.match_system_trash(path).is_some()
+    }
+
+    /// 结构识别(同步零远程):段切分后精确匹配 dir_name + 固定段数。
+    /// "$Recycle.Bin/<SID>/<name>" 第 3 段为条目名;更深(>2 层)不拦截、
+    /// 原样可见(风险:桶中真实用户数据,裁决:深层文件不隐藏)。第二段
+    /// 任意接受(SID/uid 只是视图分区,跨段共享同一墓碑集,裁决 R14)。
+    pub(crate) fn match_system_trash(&self, path: &str) -> Option<SystemTrashMatch> {
+        let sys = self.system.as_ref()?;
+        let dir_name = sys.dir_name.as_str();
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        match segments.as_slice() {
+            [d] if *d == dir_name => Some(SystemTrashMatch::Dir { level: 0 }),
+            [d, _] if *d == dir_name => Some(SystemTrashMatch::Dir { level: 1 }),
+            [d, _, name] if *d == dir_name => Some(SystemTrashMatch::Entry {
+                entry_name: (*name).to_string(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Windows:mkdir/rename 拦截时记录 SID 段(裁决 R14)。仅
+    /// WindowsRecycleBin 平台、level 1 目录命中时记录;macOS 不使用。
+    /// 幂等(集合去重)。
+    pub(crate) fn record_seen_sid(&self, path: &str) {
+        let Some(sys) = &self.system else { return };
+        if sys.platform != SystemTrashPlatform::WindowsRecycleBin {
+            return;
+        }
+        if let Some(SystemTrashMatch::Dir { level: 1 }) = self.match_system_trash(path) {
+            if let Some(sid) = path.trim_matches('/').split('/').nth(1) {
+                if !sid.is_empty() {
+                    self.seen_sids.write().unwrap().insert(sid.to_string());
+                }
+            }
         }
     }
 }
@@ -1770,6 +1881,147 @@ mod tests {
             idx.insert(dir, true, d((2026, 8, 16)));
         }
         idx
+    }
+
+    /// 单元 1:系统回收站测试统一构造(直接置 pub(crate) 字段,不走
+    /// build_trash_state —— 平台/目录名/uid 范围由测试显式定制)。
+    fn state_with_system(sys: SystemTrash) -> Arc<TrashState> {
+        let mut state = TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        Arc::get_mut(&mut state)
+            .expect("freshly created arc is uniquely owned")
+            .system = Some(sys);
+        state
+    }
+
+    fn win_state() -> Arc<TrashState> {
+        state_with_system(SystemTrash {
+            dir_name: "$Recycle.Bin".into(),
+            key_prefix: "$Recycle.Bin/".into(),
+            platform: SystemTrashPlatform::WindowsRecycleBin,
+            macos_uid_dirs: vec![],
+        })
+    }
+
+    fn mac_state() -> Arc<TrashState> {
+        state_with_system(SystemTrash {
+            dir_name: ".Trashes".into(),
+            key_prefix: ".Trashes/".into(),
+            platform: SystemTrashPlatform::MacOsTrashes,
+            macos_uid_dirs: vec![501],
+        })
+    }
+
+    #[test]
+    fn match_system_trash_matrix() {
+        // Windows 形态:0/1/2 层命中,>2 层不拦截(桶中真实用户数据原样可见)
+        let s = win_state();
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin"),
+            Some(SystemTrashMatch::Dir { level: 0 })
+        );
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/S-1-5-21-1"),
+            Some(SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/S-1-5-21-1/$R4de00001a.txt"),
+            Some(SystemTrashMatch::Entry {
+                entry_name: "$R4de00001a.txt".into()
+            })
+        );
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/S-1-5-21-1/$R4de00001a.txt/sub"),
+            None,
+            ">2 层不拦截(深层文件原样可见)"
+        );
+        // 尾斜杠形态与根/空路径
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/"),
+            Some(SystemTrashMatch::Dir { level: 0 })
+        );
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/S-1/"),
+            Some(SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(s.match_system_trash("/"), None);
+        assert_eq!(s.match_system_trash(""), None);
+        // 前缀边界不误伤
+        assert_eq!(s.match_system_trash("/$Recycle.Binx"), None, "前缀边界");
+        assert_eq!(s.match_system_trash("/x$Recycle.Bin"), None);
+        assert_eq!(s.match_system_trash("/.trash/2026-08-16/a.txt"), None, "与 .trash 前缀互不干扰");
+        assert_eq!(s.match_system_trash("/docs/a.txt"), None);
+        // macOS 形态同构
+        let m = mac_state();
+        assert_eq!(
+            m.match_system_trash("/.Trashes"),
+            Some(SystemTrashMatch::Dir { level: 0 })
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/501"),
+            Some(SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/501/a.txt"),
+            Some(SystemTrashMatch::Entry {
+                entry_name: "a.txt".into()
+            })
+        );
+        assert_eq!(m.match_system_trash("/.Trashesx/501/a.txt"), None);
+        assert_eq!(m.match_system_trash("/.Trashes/501/a/b"), None);
+        // 目录名覆盖生效
+        let custom = state_with_system(SystemTrash {
+            dir_name: "CustomBin".into(),
+            key_prefix: "CustomBin/".into(),
+            platform: SystemTrashPlatform::WindowsRecycleBin,
+            macos_uid_dirs: vec![],
+        });
+        assert_eq!(
+            custom.match_system_trash("/CustomBin/S-1"),
+            Some(SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(custom.match_system_trash("/$Recycle.Bin"), None);
+        // trash 关闭(system=None)恒 None
+        let closed = TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        assert_eq!(closed.match_system_trash("/$Recycle.Bin"), None);
+        assert_eq!(closed.match_system_trash("/.Trashes/501"), None);
+        assert!(!closed.is_system_trash_path("/$Recycle.Bin"));
+        // is_system_trash_path = match 命中
+        assert!(s.is_system_trash_path("/$Recycle.Bin"));
+        assert!(s.is_system_trash_path("/$Recycle.Bin/S-1"));
+        assert!(s.is_system_trash_path("/$Recycle.Bin/S-1/$R1.txt"));
+        assert!(!s.is_system_trash_path("/$Recycle.Bin/S-1/$R1.txt/x"));
+    }
+
+    #[test]
+    fn record_seen_sid_windows_only() {
+        // 裁决 R14:Windows mkdir/rename 时记录 SID 段;macOS 不使用
+        let s = win_state();
+        s.record_seen_sid("/$Recycle.Bin/S-1-5-21-1");
+        s.record_seen_sid("/$Recycle.Bin/S-1-5-21-2/");
+        s.record_seen_sid("/$Recycle.Bin"); // level 0 不记录
+        s.record_seen_sid("/docs"); // 范围外不记录
+        let sids = s.seen_sids.read().unwrap();
+        assert_eq!(sids.len(), 2);
+        assert!(sids.contains("S-1-5-21-1"));
+        assert!(sids.contains("S-1-5-21-2"));
+        drop(sids);
+        let m = mac_state();
+        m.record_seen_sid("/.Trashes/501");
+        assert!(m.seen_sids.read().unwrap().is_empty(), "macOS 不使用 seen_sids");
     }
 
     #[test]

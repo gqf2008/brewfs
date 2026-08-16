@@ -218,6 +218,12 @@ pub struct OssConfig {
     pub trash_refresh_mode: Option<TrashRefreshMode>,
     /// GC interval in seconds (unit 4 lands the default).
     pub trash_gc_interval_secs: Option<u64>,
+    /// 系统回收站虚拟视图(issue #80)。None = 关闭。
+    /// 默认:Windows/Linux 跟随 trash_dir 开启(平台默认目录名 $Recycle.Bin);
+    /// macOS 默认关闭(需显式 --system-trash-dir,裁决 R1)。normalize 不填
+    /// 该字段(门控不被默认值覆盖,同 trash_dir 注释模式);平台默认与默认
+    /// 开/关在 CLI 与 build_trash_state 按 cfg!(target_os = "macos") 注入。
+    pub system_trash: Option<trash::SystemTrashConfig>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -1914,14 +1920,45 @@ fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>
     // 保留期消费点(H1):--trash-retention-days 经 normalize 已填默认,
     // 兜底常量防直接构造未 normalize 的 config。
     let retention_days = config.trash_retention_days.unwrap_or(TRASH_RETENTION_DAYS);
-    Ok(Some(trash::TrashState::new(
+    let mut state = trash::TrashState::new(
         format!("{}{}/", config.prefix, dir),
         mode,
         refresh_interval,
         rebuild_interval,
         gc_interval,
         retention_days,
-    )))
+    );
+    // 系统回收站虚拟视图注入(裁决 R1):纯消费 Some/None —— 默认开/关由
+    // CLI 按平台决定(--no-system-trash 显式关必须可区分「未配置」,故
+    // 默认值不在此处补齐,否则 --no-system-trash 会被默认开覆盖)。
+    // 平台形态:macOS = MacOsTrashes(.Trashes),其余 = WindowsRecycleBin
+    // ($Recycle.Bin,$R/$I 成对);dir_name 平台默认在此落地。
+    if let Some(sys) = &config.system_trash {
+        let dir_name = sys
+            .dir_name
+            .clone()
+            .unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    ".Trashes".to_string()
+                } else {
+                    "$Recycle.Bin".to_string()
+                }
+            });
+        let platform = if cfg!(target_os = "macos") {
+            trash::SystemTrashPlatform::MacOsTrashes
+        } else {
+            trash::SystemTrashPlatform::WindowsRecycleBin
+        };
+        Arc::get_mut(&mut state)
+            .expect("freshly created arc is uniquely owned")
+            .system = Some(trash::SystemTrash {
+            key_prefix: format!("{}{}/", config.prefix, dir_name),
+            platform,
+            macos_uid_dirs: sys.macos_uid_dirs.clone(),
+            dir_name,
+        });
+    }
+    Ok(Some(state))
 }
 
 impl ObjectFs {
@@ -4653,6 +4690,7 @@ mod tests {
             trash_refresh_interval_secs: None,
             trash_refresh_mode: None,
             trash_gc_interval_secs: None,
+            system_trash: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
@@ -4745,6 +4783,7 @@ mod tests {
             trash_refresh_interval_secs: None,
             trash_refresh_mode: None,
             trash_gc_interval_secs: None,
+            system_trash: None,
         };
         let cfg = base().normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(DEFAULT_CONNECT_TIMEOUT_SECS));
@@ -4774,6 +4813,187 @@ mod tests {
         let cfg = cfg.normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(3));
         assert_eq!(cfg.readwrite_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn normalize_never_fills_system_trash() {
+        // 裁决 R1:normalize 绝不填 system_trash(门控不被默认值覆盖,
+        // 同 trash_dir 注释模式;默认开/关由 CLI 与 build_trash_state 注入)。
+        let base = || OssConfig {
+            bucket: "b".into(),
+            region: "cn-shanghai".into(),
+            endpoint: None,
+            force_path_style: false,
+            prefix: String::new(),
+            max_concurrent_requests: None,
+            list_rate_limit: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
+            multipart_size: None,
+            multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
+            system_trash: None,
+        };
+        assert!(
+            base().normalize().system_trash.is_none(),
+            "normalize 绝不填 system_trash"
+        );
+        let mut cfg = base();
+        cfg.system_trash = Some(trash::SystemTrashConfig {
+            dir_name: Some("Custom".into()),
+            macos_uid_dirs: vec![501],
+        });
+        let cfg = cfg.normalize();
+        assert_eq!(
+            cfg.system_trash.unwrap().dir_name.as_deref(),
+            Some("Custom"),
+            "显式配置不被 normalize 覆盖"
+        );
+    }
+
+    #[test]
+    fn build_trash_state_injects_system_view() {
+        // 裁决 R1:build_trash_state 是纯消费 Some/None —— 默认开/关由
+        // CLI 决定(--no-system-trash 必须可区分「未配置」);平台形态与
+        // 目录名默认在此按 cfg!(target_os) 落地。
+        let mut cfg = OssConfig {
+            bucket: "b".into(),
+            region: "cn-shanghai".into(),
+            endpoint: None,
+            force_path_style: false,
+            prefix: "ossfs/".into(),
+            max_concurrent_requests: None,
+            list_rate_limit: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
+            multipart_size: None,
+            multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            credential_process: None,
+            trash_dir: Some(".trash".into()),
+            trash_retention_days: Some(TRASH_RETENTION_DAYS),
+            trash_refresh_interval_secs: Some(TRASH_REFRESH_INTERVAL_SECS),
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: Some(TRASH_GC_INTERVAL_SECS),
+            system_trash: None,
+        };
+        // system_trash 未配置 → 无系统视图(默认开/关是 CLI 的职责)
+        let state = build_trash_state(&cfg).unwrap().unwrap();
+        assert!(state.system.is_none(), "未配置 system_trash → 不渲染");
+        // 显式配置 → 平台形态与目录名默认注入
+        cfg.system_trash = Some(trash::SystemTrashConfig {
+            dir_name: None,
+            macos_uid_dirs: vec![],
+        });
+        let state = build_trash_state(&cfg).unwrap().unwrap();
+        let sys = state.system.as_ref().expect("配置后必须注入系统视图");
+        if cfg!(target_os = "macos") {
+            assert_eq!(sys.dir_name, ".Trashes");
+            assert_eq!(
+                sys.platform,
+                trash::SystemTrashPlatform::MacOsTrashes,
+                "macOS = MacOsTrashes(.Trashes)"
+            );
+        } else {
+            assert_eq!(sys.dir_name, "$Recycle.Bin");
+            assert_eq!(
+                sys.platform,
+                trash::SystemTrashPlatform::WindowsRecycleBin,
+                "Windows/Linux = WindowsRecycleBin($Recycle.Bin)"
+            );
+        }
+        assert_eq!(sys.key_prefix, format!("ossfs/{}/", sys.dir_name));
+        // 目录名覆盖
+        cfg.system_trash = Some(trash::SystemTrashConfig {
+            dir_name: Some("CustomBin".into()),
+            macos_uid_dirs: vec![501],
+        });
+        let state = build_trash_state(&cfg).unwrap().unwrap();
+        let sys = state.system.as_ref().unwrap();
+        assert_eq!(sys.dir_name, "CustomBin");
+        assert_eq!(sys.key_prefix, "ossfs/CustomBin/");
+        assert_eq!(sys.macos_uid_dirs, vec![501]);
+        // 平台形态随目标平台;路径识别按注入后的目录名
+        assert_eq!(
+            state.match_system_trash("/CustomBin/S-1"),
+            Some(trash::SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(state.match_system_trash("/$Recycle.Bin"), None);
+        // trash 关闭 → 无状态(系统视图无从谈起)
+        cfg.trash_dir = None;
+        assert!(build_trash_state(&cfg).unwrap().is_none());
     }
 
     #[test]
@@ -4857,6 +5077,7 @@ mod tests {
             trash_refresh_interval_secs: None,
             trash_refresh_mode: None,
             trash_gc_interval_secs: None,
+            system_trash: None,
         };
         let cfg = base().normalize();
         assert_eq!(

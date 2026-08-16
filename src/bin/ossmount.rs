@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
+use ossfs::trash::SystemTrashConfig;
 use ossfs::{ObjectFs, OssConfig, TrashRefreshMode};
 
 fn usage_text() -> String {
@@ -47,6 +48,7 @@ fn usage_text() -> String {
                  [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
                  [--trash-dir NAME] [--trash-refresh-mode lazy|eager] [--no-trash]\n\
+                 [--system-trash-dir NAME] [--system-trash-uids N[,N...]] [--no-system-trash]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
@@ -57,6 +59,13 @@ fn usage_text() -> String {
          --trash-refresh-mode lazy|eager:  trash refresh policy, default lazy\n\
                            (eager refreshes tombstones before every list/stat,\n\
                            shrinking the remote-deletion visibility window)\n\
+         --system-trash-dir NAME:  system recycle bin virtual view (issue #80)\n\
+                           Windows/Linux: default ON with trash (dir $Recycle.Bin);\n\
+                           macOS: default OFF — this flag enables it (dir .Trashes);\n\
+                           NAME overrides the directory name on any platform\n\
+         --system-trash-uids N[,N...]:  macOS only — render only these uid dirs\n\
+                           under .Trashes (default: the mounting user's uid)\n\
+         --no-system-trash:  disable the system recycle bin view (any platform)\n\
          env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n\
          --config PATH:  JSON config file; keys are long option names (CLI\n\
                           args override file values). access_key_id /\n\
@@ -161,6 +170,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "trash-refresh-mode",
     "trash-gc-interval-secs",
     "no-trash",
+    "system-trash-dir",
+    "system-trash-uids",
+    "no-system-trash",
 ];
 
 /// Expand a JSON config file into CLI arguments. Each top-level key maps
@@ -294,6 +306,9 @@ fn parse_args_from(
     let mut trash_refresh_mode: Option<TrashRefreshMode> = None;
     let mut trash_gc_interval_secs: Option<u64> = None;
     let mut no_trash = false;
+    let mut system_trash_dir: Option<String> = None;
+    let mut system_trash_uids: Vec<u32> = Vec::new();
+    let mut no_system_trash = false;
 
     if raw.first().map(String::as_str) == Some("mount") {
         raw.remove(0);
@@ -575,6 +590,27 @@ fn parse_args_from(
                     .unwrap_or_else(|| usage());
             }
             "--no-trash" => no_trash = true,
+            "--no-system-trash" => no_system_trash = true,
+            "--system-trash-dir" => {
+                let v = iter.next().unwrap_or_else(|| usage());
+                // 单段名校验(与 build_trash_state 一致)
+                if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                    usage();
+                }
+                system_trash_dir = Some(v);
+            }
+            "--system-trash-uids" => {
+                let v = iter.next().unwrap_or_else(|| usage());
+                system_trash_uids = v
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u32>()
+                            .map_err(|_| ())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap_or_else(|_| usage());
+            }
             "--trash-dir" => {
                 let v = iter.next().unwrap_or_else(|| usage());
                 // 单段名校验(与 build_trash_state 一致):含 '/'、'.'、'..'、空 → usage()
@@ -681,6 +717,22 @@ fn parse_args_from(
             trash_refresh_interval_secs,
             trash_refresh_mode,
             trash_gc_interval_secs,
+            // 系统回收站视图(裁决 R1):Windows/Linux 默认随 trash 开启,
+            // macOS 默认关(仅 --system-trash-dir 显式开启);--no-system-trash
+            // 全平台显式关闭;--no-trash(硬删除)时视图无墓碑可渲染,一并关闭。
+            system_trash: if no_system_trash || no_trash {
+                None
+            } else if cfg!(target_os = "macos") {
+                system_trash_dir.map(|d| SystemTrashConfig {
+                    dir_name: Some(d),
+                    macos_uid_dirs: system_trash_uids,
+                })
+            } else {
+                Some(SystemTrashConfig {
+                    dir_name: system_trash_dir,
+                    macos_uid_dirs: system_trash_uids,
+                })
+            },
         },
         mount_point,
         refresh_secs,
@@ -869,6 +921,7 @@ const MOUNT_ONLY_SWITCH_KEYS: &[&str] = &[
     "content-md5",
     "notsup-compat-dir",
     "disk-cache-verify-etag",
+    "no-system-trash",
 ];
 const MOUNT_ONLY_VALUE_KEYS: &[&str] = &[
     "refresh-secs",
@@ -902,6 +955,8 @@ const MOUNT_ONLY_VALUE_KEYS: &[&str] = &[
     "metrics-listen",
     "log-dir",
     "metrics-log-interval",
+    "system-trash-dir",
+    "system-trash-uids",
 ];
 
 /// 管理命令的连接参数解析(规格 4.2 连接复用方案):从 CLI/config 解析
@@ -1128,6 +1183,8 @@ fn parse_connection_args(
             trash_refresh_interval_secs,
             trash_refresh_mode,
             trash_gc_interval_secs,
+            // 系统回收站视图是挂载专属(挂载时渲染);管理命令不消费
+            system_trash: None,
         },
         log_level,
     ))
@@ -1704,6 +1761,107 @@ mod tests {
         assert!(!cfg.read_only, "config 挂载专用键被忽略");
         assert_eq!(cfg.trash_gc_interval_secs, Some(7200), "trash 键保留");
     }
+    #[test]
+    fn parses_system_trash_flags() {
+        // --system-trash-dir NAME:开启 + 覆盖目录名(全平台)
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--system-trash-dir".to_string(),
+            "CustomBin".to_string(),
+            "Z:".to_string(),
+        ]);
+        let sys = cfg.system_trash.expect("--system-trash-dir 必须开启系统视图");
+        assert_eq!(sys.dir_name.as_deref(), Some("CustomBin"));
+
+        // --system-trash-uids 逗号分隔(全平台接受,macOS 消费;macOS 下
+        // 必须与 --system-trash-dir 同传 —— uids 不构成显式开启)
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--system-trash-dir".to_string(),
+            "CustomBin".to_string(),
+            "--system-trash-uids".to_string(),
+            "501,502".to_string(),
+            "Z:".to_string(),
+        ]);
+        let sys = cfg.system_trash.expect("--system-trash-dir 必须开启系统视图");
+        assert_eq!(
+            sys.macos_uid_dirs,
+            vec![501, 502],
+            "--system-trash-uids 必须逗号分隔解析"
+        );
+        assert_eq!(sys.dir_name.as_deref(), Some("CustomBin"));
+
+        // --no-system-trash:全平台显式关闭(--no-trash 一并关闭视图)
+        for extra in [
+            vec!["--no-system-trash".to_string()],
+            vec!["--no-trash".to_string()],
+        ] {
+            let mut args = vec!["--bucket".to_string(), "b".to_string()];
+            args.extend(extra.clone());
+            args.push("Z:".to_string());
+            let (cfg, _, _, _, _, _, _) = parse_args_from(args);
+            assert!(
+                cfg.system_trash.is_none(),
+                "{extra:?} 必须关闭系统回收站视图"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_trash_default_off_on_macos() {
+        // 裁决 R1:macOS 默认关闭(需显式 --system-trash-dir)
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "Z:".to_string(),
+        ]);
+        assert!(cfg.system_trash.is_none(), "macOS 默认关闭系统回收站视图");
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--system-trash-dir".to_string(),
+            ".Trashes".to_string(),
+            "Z:".to_string(),
+        ]);
+        assert!(cfg.system_trash.is_some(), "macOS --system-trash-dir 显式开启");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn system_trash_default_on_non_macos() {
+        // 裁决 R1:Windows/Linux 跟随 trash_dir 默认开启
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "Z:".to_string(),
+        ]);
+        let sys = cfg.system_trash.expect("Windows/Linux 默认开启系统回收站视图");
+        assert_eq!(sys.dir_name, None, "默认目录名由 build_trash_state 按平台注入");
+        assert!(sys.macos_uid_dirs.is_empty());
+    }
+
+    #[test]
+    fn config_file_expands_system_trash_keys() {
+        // system-trash-* 是合法 config 键(expand_config_file 归一化下划线)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfg.json");
+        std::fs::write(
+            &path,
+            r#"{"bucket":"b","system-trash-dir":"CustomBin","system-trash-uids":"501","no-system-trash":true}"#,
+        )
+        .unwrap();
+        let args = expand_config_file(path.to_str().unwrap()).unwrap();
+        let has = |f: &str| args.iter().any(|a| a == f);
+        assert!(has("--system-trash-dir"));
+        assert!(has("--system-trash-uids"));
+        assert!(has("--no-system-trash"));
+        let i = args.iter().position(|a| a == "--system-trash-dir").unwrap();
+        assert_eq!(args[i + 1], "CustomBin");
+    }
+
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -1740,4 +1898,5 @@ mod stack_tests {
             "SizeOfStackReserve {reserve:#x} < {MIN_RESERVE:#x}; build.rs stack widening missing?"
         );
     }
+
 }
