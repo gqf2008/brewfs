@@ -473,6 +473,14 @@ impl OssConfig {
         if self.trash_refresh_mode.is_none() {
             self.trash_refresh_mode = Some(TrashRefreshMode::Lazy);
         }
+        // 单元 4 默认值(C4b):GC 保留期/周期在消费单元落地;trash_dir 仍
+        // 绝不填(门控不被默认值覆盖)。
+        if self.trash_retention_days.is_none() {
+            self.trash_retention_days = Some(TRASH_RETENTION_DAYS);
+        }
+        if self.trash_gc_interval_secs.is_none() {
+            self.trash_gc_interval_secs = Some(TRASH_GC_INTERVAL_SECS);
+        }
         self
     }
 }
@@ -576,6 +584,14 @@ pub const TRASH_REBUILD_INTERVAL_SECS: u64 = 600;
 /// 的 diff 内存尖峰可见,缓解手段是 GC/trash-clean,见裁决 #6)。
 /// 规格 C5 新阈值落地(无旧值);变更必须独立 commit 写明新旧值与理由。
 pub const TRASH_INDEX_ALERT_THRESHOLD: usize = 500_000;
+/// 回收站保留天数:墓碑日期早于 `today - TRASH_RETENTION_DAYS` 的分区才可
+/// 被 GC 清理(规格 C5 阈值,独立 commit 落地 + 断言;新阈值,无旧值 ——
+/// 设计稿 §9 默认 30 天)。变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_RETENTION_DAYS: u32 = 30;
+/// 回收站 GC 周期秒:挂载时立即 GC 一次后按此周期后台清理过期墓碑
+/// (规格 C5 阈值,独立 commit 落地 + 断言;新阈值,无旧值 —— 设计稿 §9
+/// 默认 24h)。变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_GC_INTERVAL_SECS: u64 = 86_400;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -4703,6 +4719,14 @@ mod tests {
             "索引规模告警阈值 500k(裁决 #6 新阈值,无旧值)"
         );
         assert_eq!(
+            TRASH_RETENTION_DAYS, 30,
+            "回收站保留期 30 天(规格 C5,新阈值,无旧值)"
+        );
+        assert_eq!(
+            TRASH_GC_INTERVAL_SECS, 86_400,
+            "GC 周期 24h(规格 C5,新阈值,无旧值)"
+        );
+        assert_eq!(
             trash::TRASH_EAGER_MIN_POLL_INTERVAL,
             Duration::from_secs(1),
             "eager 最小轮询间隔 1s"
@@ -4781,13 +4805,32 @@ mod tests {
             cfg.trash_dir.is_none(),
             "normalize 绝不填 trash_dir(None = 回收站关闭)"
         );
+        // 单元 4 默认值(C4b):retention_days=30 / gc_interval_secs=86400
+        assert_eq!(
+            cfg.trash_retention_days,
+            Some(TRASH_RETENTION_DAYS),
+            "None → 默认 30 天保留期"
+        );
+        assert_eq!(
+            cfg.trash_gc_interval_secs,
+            Some(TRASH_GC_INTERVAL_SECS),
+            "None → 默认 86400s GC 周期"
+        );
         // 显式值不被覆盖
         let mut cfg = base();
         cfg.trash_refresh_interval_secs = Some(7);
         cfg.trash_refresh_mode = Some(TrashRefreshMode::Eager);
+        cfg.trash_retention_days = Some(7);
+        cfg.trash_gc_interval_secs = Some(3600);
         let cfg = cfg.normalize();
         assert_eq!(cfg.trash_refresh_interval_secs, Some(7));
         assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Eager));
+        assert_eq!(cfg.trash_retention_days, Some(7), "显式保留期不被覆盖");
+        assert_eq!(
+            cfg.trash_gc_interval_secs,
+            Some(3600),
+            "显式 GC 周期不被覆盖"
+        );
     }
 
     #[tokio::test]
