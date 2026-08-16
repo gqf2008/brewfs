@@ -318,7 +318,14 @@ impl TrashState {
     /// [`ObjectFs::trash_refresh_once`] 转发)。全量重建只经此入口
     /// (后台循环);eager 挂点直接调 poll_incremental,不触全量分支
     /// (裁决 #1)。
+    /// 入口统一 poll_inflight 互斥(裁决 #7):周期循环与 eager 挂点共用
+    /// 一把锁 —— 被占用(swap=true)即本轮跳过,防两轮全量/增量并发
+    /// (双倍 S3 成本);RAII 保证 await 取消后互斥位复位。
     pub(crate) async fn refresh_once(&self, fs: &ObjectFs) -> Result<()> {
+        if self.poll_inflight.swap(true, Ordering::SeqCst) {
+            return Ok(()); // 已在跑(失败即跳过,天然限 1)
+        }
+        let _guard = InflightGuard(&self.poll_inflight);
         if self.full_rebuild_due() {
             self.full_rebuild(fs).await
         } else {

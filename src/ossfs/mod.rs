@@ -8337,6 +8337,53 @@ mod s3_mock_tests {
         );
     }
 
+    /// 裁决 #7:refresh_once 入口统一 poll_inflight 互斥 —— 周期循环与
+    /// eager 挂点共用一把锁(失败即跳过,天然限 1)。占住互斥位时周期
+    /// 刷新必须零远程请求(修复前:eager 挂点与周期 refresh_loop 可并发
+    /// refresh_once,两轮全量 list + 双倍 S3 成本)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_once_skips_when_inflight_held() {
+        let (mock, port) =
+            MockS3::start(vec![(".trash/2026-08-16/a.txt".into(), false)], Duration::from_millis(1))
+                .await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_bootstrap().await.expect("bootstrap");
+        // 模拟并发中的增量/重建:占住互斥位
+        fs.trash
+            .as_ref()
+            .unwrap()
+            .poll_inflight
+            .store(true, Ordering::SeqCst);
+        let before = fs.metrics();
+        fs.trash_refresh_once()
+            .await
+            .expect("占锁时刷新必须静默跳过(Ok)");
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            0,
+            "占锁时周期刷新必须零远程列表(与 eager 共用 poll_inflight)"
+        );
+        assert_eq!(
+            after.trash_refresh_incrementals - before.trash_refresh_incrementals,
+            0,
+            "占锁时不得计数增量"
+        );
+        assert_eq!(
+            after.trash_refresh_rebuilds - before.trash_refresh_rebuilds,
+            0,
+            "占锁时不得计数全量重建"
+        );
+        // 释放后恢复正常刷新
+        fs.trash
+            .as_ref()
+            .unwrap()
+            .poll_inflight
+            .store(false, Ordering::SeqCst);
+        fs.trash_refresh_once().await.expect("释放后刷新正常");
+    }
+
     /// 刷新失败不拖垮挂载:强制 trash list 报错(分页无 token 护栏)→
     /// refresh_once Err + trash_refresh_errors 计数;故障恢复后上层
     /// list/stat 正常、索引未被破坏;下一轮刷新自愈。
