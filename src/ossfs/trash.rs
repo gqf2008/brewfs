@@ -288,6 +288,13 @@ pub(crate) enum SystemTrashMatch {
     Entry { entry_name: String },
 }
 
+/// $I 捕获字节上限(裁决 R8):Explorer 的 $I 头文件 ≤ 数百字节,4KiB 覆盖
+/// 全部已知变体(含长路径 8B 长度字段);超出截断(数据仍可用,仅可能丢
+/// 尾部 padding)。winfsp.rs 捕获缓冲与 set_recycle_i 落 body 共用同一
+/// 常量(截断在落 body 时强制执行,防缓冲上限漂移)。验证见
+/// set_recycle_i_truncates_over_4k。
+pub(crate) const MAX_RECYCLE_I_BYTES: usize = 4 * 1024;
+
 /// Windows $R 名 ↔ 墓碑的反向索引(裁决 R3:① 本地软删写入;② 增量/全量
 /// 重建 diff 读 body 填充;③ 渲染/读取未命中按需 GET 兜底)。派生缓存,
 /// 非独立事实源;与墓碑同生命周期(remove_tombstone_maps 收尾)。
@@ -1205,8 +1212,10 @@ impl TrashState {
         fs: &ObjectFs,
         entry_name: &str,
     ) -> Result<Option<Vec<u8>>> {
-        // $I 名 → $R 名(反向索引键)
-        let r_name = format!("$R{}", &entry_name[2..]);
+        // $I 名 → $R 名(反向索引键;单一推导点 i_to_r_name)
+        let Some(r_name) = i_to_r_name(entry_name) else {
+            return Ok(None);
+        };
         let Some(resolved) = self.resolve_entry(fs, &r_name, true).await? else {
             return Ok(None);
         };
@@ -1295,6 +1304,17 @@ pub(crate) fn is_i_entry(name: &str) -> bool {
     name.len() >= 10
         && name.starts_with("$I")
         && name.as_bytes()[2..10].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// $I 名 → 对应 $R 名(8 位 hex 后缀互换,裁决 R8 捕获窗口的反查键)。
+/// 非 $I 形态返回 None。synthesize_i_file / i_entry_has_r_tombstone /
+/// set_recycle_i 共用(单一推导点)。
+fn i_to_r_name(name: &str) -> Option<String> {
+    if is_i_entry(name) {
+        Some(format!("$R{}", &name[2..]))
+    } else {
+        None
+    }
 }
 
 /// 删除日期 → FILETIME(100ns 步进,1601-01-01 起;UTC 午夜)。$I 合成的
