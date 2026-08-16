@@ -2708,7 +2708,22 @@ impl ObjectFs {
         if let Some(trash) = &self.trash
             && trash.is_system_trash_path(path)
         {
-            return trash.synthesize_stat(self, path).await;
+            if let Some(entry) = trash.synthesize_stat(self, path).await? {
+                return Ok(Some(entry));
+            }
+            // 单元 5(§5.3 测试 3):macOS —— `.Trashes/<uid>/` 下 Finder
+            // 写入的真实对象(.DS_Store 无墓碑对应)合成 None → 回退普通
+            // stat 链,真实对象可见(墓碑条目已短路返回,P3 请求数不变;
+            // 回退路径与普通路径同成本,零额外)。Windows 保持 ENOENT
+            // (视图条目必由墓碑支撑;桶中真实 $Recycle.Bin 数据风险口径
+            // 见规格 §1.6)。
+            let macos = trash
+                .system
+                .as_ref()
+                .is_some_and(|s| s.platform == trash::SystemTrashPlatform::MacOsTrashes);
+            if !macos {
+                return Ok(None);
+            }
         }
         // 回收站过滤:根路径守卫之后、HEAD 计数之前 —— 被删路径的 stat
         // 零远程请求(head 都不发);None 经 `stat()` 走 negative 缓存。
@@ -2840,10 +2855,14 @@ impl ObjectFs {
                 let start = offset.min(bytes.len() as u64) as usize;
                 return Ok(bytes[start..].iter().take(len).copied().collect());
             }
-            key = trash
-                .resolve_entry_original(self, &entry_name)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("read: recycle bin entry not found"))?;
+            if let Some(orig) = trash.resolve_entry_original(self, &entry_name).await? {
+                key = orig;
+            } else if is_windows {
+                anyhow::bail!("read: recycle bin entry not found");
+            }
+            // macOS:保持视图 key —— `.Trashes/<uid>/` 下 Finder 写入的
+            // 真实对象(.DS_Store,无墓碑对应)按真实对象读;无墓碑也无
+            // 真实对象时由 S3 404 自然报错(单元 5,§5.3 测试 3)。
         }
 
         if window > 0
@@ -8412,12 +8431,67 @@ mod s3_mock_tests {
             .insert("docs/a.txt", false, sys_date());
         let data = fs.read_range("/.Trashes/501/a.txt", 0, 7).await.unwrap();
         assert_eq!(data, b"macdata");
-        // 未解析条目 → Err(不 404 静默)
+        // 未解析条目(无墓碑也无真实对象)→ 仍 Err(不静默):macOS 回退
+        // 真实 key 后由 S3 404 自然报错(单元 5 起,见
+        // system_trash_macos_ds_store_roundtrip)
         let err = fs
             .read_range("/.Trashes/501/ghost.txt", 0, 1)
             .await
             .expect_err("未知条目读必须报错");
-        assert!(err.to_string().contains("not found"), "got: {err:?}");
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().contains("not found") || c.to_string().contains("NotFound")),
+            "got: {err:?}"
+        );
+    }
+
+    /// 单元 5(§5.3 测试 3):macOS `.DS_Store` 往返 —— Finder 写入的
+    /// **真实对象**(非墓碑条目)write 直落真实 PUT(不经墓碑编解码)、
+    /// stat 命中真实对象、read 读回真实字节;list 可见且与合成条目
+    /// 同名去重(真实优先)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_trash_macos_ds_store_roundtrip() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", mac_sys());
+        fs.trash = Some(trash.clone());
+
+        // 1) Finder 写 .DS_Store → 真实 PUT(无墓碑对应,清墓碑挂点 no-op)
+        fs.write("/.Trashes/501/.DS_Store", b"ds-meta")
+            .await
+            .expect(".DS_Store 写必须直落真实对象");
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| { r.method == "PUT" && r.target.contains(".Trashes/501/.DS_Store") }),
+            ".DS_Store 必须真实落桶: {recorded:?}"
+        );
+        drop(recorded);
+
+        // 2) stat:合成路径 resolve 失败不得吞掉真实条目
+        let stat = fs
+            .stat("/.Trashes/501/.DS_Store")
+            .await
+            .unwrap()
+            .expect(".DS_Store stat 必须命中真实对象");
+        assert!(!stat.is_dir);
+        assert_eq!(stat.size, 7, "size = 真实对象大小");
+
+        // 3) read:读回真实字节(不因「回收站条目未解析」而 bail)
+        let data = fs
+            .read_range("/.Trashes/501/.DS_Store", 0, 7)
+            .await
+            .expect(".DS_Store read 必须命中真实对象");
+        assert_eq!(data, b"ds-meta");
+
+        // 4) list:真实条目可见(合并合成条目;同名去重见
+        // system_trash_list_macos_zero_extra_and_dedup)
+        let list = fs.list("/.Trashes/501").await.unwrap();
+        assert!(
+            list.iter().any(|e| e.name == ".DS_Store" && !e.is_dir),
+            ".DS_Store 必须可见: {list:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
