@@ -7,8 +7,12 @@
 //!
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
-use crate::ossfs::{ObjectFs, TrashRefreshMode, is_s3_not_found, next_page_token};
+use crate::ossfs::{
+    DeleteObjectsContentMd5, MAX_DELETE_OBJECTS_PER_REQUEST, ObjectFs, TrashRefreshMode,
+    is_s3_not_found, next_page_token,
+};
 use anyhow::{Context as _, Result};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
@@ -214,6 +218,15 @@ pub(crate) struct TrashState {
     pub(crate) refresh_interval: Duration,
     /// 全量重建周期(兜底被恢复/被 GC 移除的墓碑;默认 600s)
     pub(crate) rebuild_interval: Duration,
+    /// 后台 GC 周期(挂载时立即 GC 一次后按此周期循环;normalize 默认 24h)
+    pub(crate) gc_interval: Duration,
+    /// 保留期天数(`--trash-retention-days`;trash_gc 的 cutoff 消费,
+    /// build_trash_state 从 normalized config 传入,默认 30)
+    pub(crate) retention_days: u32,
+    /// 索引代际(L4):trash_gc(非 dry-run)完成后 fetch_add —— 并发中的
+    /// refresh/rebuild 在 apply 前检测代际变化,整体丢弃陈旧快照(否则
+    /// 会把 GC 刚删的墓碑重插回索引,隐藏至下轮全量重建)。
+    pub(crate) generation: AtomicU64,
     /// 增量游标 = 最后见过的墓碑 key(ListObjectsV2 start-after 参数)
     pub(crate) cursor: Mutex<Option<String>>,
     /// 上次全量重建时刻(含 bootstrap);未 bootstrap 前构造为「早已过期」,
@@ -282,13 +295,16 @@ impl TrashState {
     }
 
     /// 构造(含调度字段默认值)。refresh_interval/mode 由 connect 读
-    /// normalized config 传入;rebuild_interval 传常量。测试经 `new` 或
-    /// 直接改 pub(crate) 字段定制(eager 档、重建周期强制)。
+    /// normalized config 传入;rebuild_interval/gc_interval/retention_days
+    /// 传常量或 config(保留期 H1:--trash-retention-days 的消费点)。
+    /// 测试经 `new` 或直接改 pub(crate) 字段定制(eager 档、重建周期强制)。
     pub(crate) fn new(
         prefix: String,
         mode: TrashRefreshMode,
         refresh_interval: Duration,
         rebuild_interval: Duration,
+        gc_interval: Duration,
+        retention_days: u32,
     ) -> Arc<Self> {
         let now = Instant::now();
         Arc::new(Self {
@@ -297,6 +313,9 @@ impl TrashState {
             mode,
             refresh_interval,
             rebuild_interval,
+            gc_interval,
+            retention_days,
+            generation: AtomicU64::new(0),
             cursor: Mutex::new(None),
             // 未 bootstrap 前视为「全量早已过期」:首次 refresh_once 直接全量
             last_full_rebuild: Mutex::new(now.checked_sub(rebuild_interval).unwrap_or(now)),
@@ -338,9 +357,16 @@ impl TrashState {
 
     /// 应用新增墓碑:短写锁批量 insert + 锁外缓存失效 + gauge(锁不跨
     /// await;insert 幂等,同名多日期墓碑只留一条)。
-    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool)]) {
+    /// 代际校验(L4):调用方传入开始拉取时捕获的 generation_snapshot,若
+    /// 期间 trash_gc 已完成(代际推进)则本轮快照已陈旧 —— 其中可能含
+    /// GC 刚删掉的墓碑,整体丢弃返回 false(游标不推进,下轮重试),绝不
+    /// 把已删墓碑重插回索引。
+    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool)], gen_snapshot: u64) -> bool {
+        if self.generation.load(Ordering::SeqCst) != gen_snapshot {
+            return false; // GC 并发完成:陈旧快照整体丢弃(L4)
+        }
         if added.is_empty() {
-            return;
+            return true;
         }
         {
             let mut idx = self.index.write().unwrap();
@@ -370,6 +396,7 @@ impl TrashState {
         for (key, is_dir) in added {
             invalidate_key(fs, key, *is_dir);
         }
+        true
     }
 
     /// 增量刷新,两阶段(裁决 #2):
@@ -383,6 +410,9 @@ impl TrashState {
     /// last_full_rebuild 周期节流的全量兜底」(裁决 #1)。成功时游标推进
     /// 到最后 key,trash_refresh_incrementals+1。
     pub(crate) async fn poll_incremental(&self, fs: &ObjectFs) -> Result<()> {
+        // 代际捕获(L4):本轮 S3 快照的基准 —— apply 前代际变化(GC 并发
+        // 完成)则整轮丢弃。
+        let gen_snapshot = self.generation.load(Ordering::SeqCst);
         let today = date_partition_utc(SystemTime::now());
         let today_prefix = format!("{}{}/", self.prefix, today);
         let prefix = self.prefix.clone();
@@ -406,13 +436,16 @@ impl TrashState {
             // 不再数百次全量,最坏每 rebuild_interval 一次(正确性不损,
             // insert 幂等)。今天分区新增始终应用(游标无关,已由阶段一
             // 保证同日删除 ≤1s 内可见)。
-            self.apply_added(fs, &added);
-            if self.full_rebuild_due() {
-                self.full_rebuild(fs).await?;
-            } else {
-                fs.metrics
-                    .trash_refresh_incrementals
-                    .fetch_add(1, Ordering::Relaxed);
+            // 今天分区新增始终应用(游标无关,已由阶段一保证同日删除 ≤1s
+            // 内可见);代际变化(GC 并发)时丢弃本轮,下轮重试。
+            if self.apply_added(fs, &added, gen_snapshot) {
+                if self.full_rebuild_due() {
+                    self.full_rebuild(fs).await?;
+                } else {
+                    fs.metrics
+                        .trash_refresh_incrementals
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             return Ok(());
         }
@@ -453,7 +486,11 @@ impl TrashState {
             return self.full_rebuild(fs).await;
         }
 
-        self.apply_added(fs, &added);
+        // 代际校验(L4):GC 并发完成 → 丢弃本轮(游标不推进,下轮从旧
+        // 游标重扫,避免把 GC 刚删的墓碑重插回索引)。
+        if !self.apply_added(fs, &added, gen_snapshot) {
+            return Ok(());
+        }
         // 游标推进:阶段二有非今天分区的最后 key 用它,否则用阶段一最后
         // key(今天分区尽头)—— 保证后续阶段二不重复扫描今天分区。
         let new_cursor = last_key_phase2.or(last_key_phase1);
@@ -472,9 +509,17 @@ impl TrashState {
     /// stats/negative 缓存(防瞬时 stat 风暴);cursor=最后 key;
     /// trash_refresh_rebuilds+1。
     pub(crate) async fn full_rebuild(&self, fs: &ObjectFs) -> Result<()> {
+        // 代际捕获(L4):快照基准 —— 列表期间 GC 完成则整体丢弃,
+        // last_full_rebuild 不推进,下轮重试。
+        let gen_snapshot = self.generation.load(Ordering::SeqCst);
         let prev = self.index.read().unwrap().entries();
         // 全量列表逻辑统一走 fetch_all_tombstones(裁决 #11)
         let (index, last_key) = fetch_all_tombstones(fs, self).await?;
+        if self.generation.load(Ordering::SeqCst) != gen_snapshot {
+            // GC 并发完成:本快照可能含刚被删的墓碑,丢弃(L4);不推进
+            // last_full_rebuild —— 下轮 refresh 重试。
+            return Ok(());
+        }
         // diff(裁决 #6 内存尖峰守卫):prev 与 new 各自 sort_unstable(原地、
         // 不分配)后归并扫描 —— 省两个 HashSet(500k 条目时每 HashSet 约
         // 16B/桶 + 哈希运算,归并扫描峰值约减半)。语义与 HashSet 差集
@@ -602,6 +647,94 @@ pub struct TombstoneBody {
     pub size: Option<u64>,
     /// 目录墓碑 = {"is_dir":true}
     pub is_dir: bool,
+}
+
+// ---------- 单元 4:管理命令与 GC 类型 ----------
+
+/// trash-list 输出单元;--json 时逐条 NDJSON(全 pub —— ossmount 是
+/// 独立 bin crate,凡被 ossmount.rs 消费的项必须 pub,契约 C10)。
+/// deleted_date 经自定义 serde 序列化为 "YYYY-MM-DD" 字符串
+/// (chrono 未开 serde feature,不为此改依赖)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashEntry {
+    /// 删除时 UTC 日期分区(YYYY-MM-DD),墓碑 key 第 2 段
+    #[serde(serialize_with = "ser_naive_date", deserialize_with = "de_naive_date")]
+    pub deleted_date: chrono::NaiveDate,
+    /// 原路径(挂载视图相对路径,无前导 '/');目录带尾 '/'
+    pub path: String,
+    /// 文件墓碑才有(墓碑 body 里删除时 HEAD 的 etag);目录 None
+    pub etag: Option<String>,
+    /// 文件墓碑才有(删除时 HEAD 的 content_length);目录 None
+    pub size: Option<u64>,
+    pub is_dir: bool,
+}
+
+fn ser_naive_date<S: serde::Serializer>(
+    d: &chrono::NaiveDate,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&d.to_string())
+}
+
+fn de_naive_date<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<chrono::NaiveDate, D::Error> {
+    let s = String::deserialize(d)?;
+    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
+}
+
+/// trash-restore 三分支结果(契约 C10,全 pub)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// 已恢复(墓碑已删,原对象立即复活);etag_mismatch=true 表示
+    /// 墓碑 etag 与当前原对象不一致,恢复的是当前内容(已警告);
+    /// multiple_versions=true 表示同名存在多个日期墓碑,仅清除了最旧
+    /// 一条 —— 调用方(CLI)应提示用户用 --date 指定版本(L6)。
+    Restored {
+        etag_mismatch: bool,
+        multiple_versions: bool,
+    },
+    /// 墓碑存在但原对象 HEAD 404(已 GC / 其他端删):按 §7 顺序约定
+    /// 清墓碑,不留空引用
+    OriginalGone,
+    /// 文件/目录两形都未找到墓碑
+    NoTombstone,
+}
+
+/// GC 报告(trash-clean 输出;契约 C10,全 pub)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// etag 一致 → 原对象已删
+    pub files_removed: u64,
+    /// 原对象 404 → 仅清墓碑
+    pub files_tombstone_only: u64,
+    /// etag 不一致 → 跳过(活数据),记 metrics trash_gc_etag_skips
+    pub files_skipped_etag: u64,
+    /// 目录墓碑已处理
+    pub dirs_removed: u64,
+    /// 目录 mtime 启发式批删的原对象数
+    pub objects_deleted: u64,
+    /// 删除的墓碑对象数(文件+目录,允许 DeleteObjects 批删)
+    pub tombstones_deleted: u64,
+}
+
+/// GC 选项(契约 C10,全 pub)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcOptions {
+    /// 只处理日期分区严格早于该日期的;None = today - 保留期(严格早于,
+    /// 边界日不清)。**--before 只收紧不放松**:晚于默认保留期的 --before
+    /// 无效 —— cutoff = min(before, today - retention_days)(L7 文档口径;
+    /// 按字段字面语义实现会破坏 retention 对近期墓碑的保护)。
+    pub before: Option<chrono::NaiveDate>,
+    /// 只报告不删除(trash-clean --dry-run;判定照做,删除动作跳过)
+    pub dry_run: bool,
+}
+
+/// etag 比较:忽略大小写与首尾引号(OSS 大写带引号 / S3 小写,墓碑存
+/// HEAD 原样;恢复/GC 校验统一,规格 2.4 风险 7)。
+fn etag_eq(a: &str, b: &str) -> bool {
+    a.trim_matches('"')
+        .eq_ignore_ascii_case(b.trim_matches('"'))
 }
 
 impl TombstoneIndex {
@@ -911,6 +1044,573 @@ impl TrashState {
         }
         Ok(())
     }
+
+    // ---------- 单元 4:管理命令与 GC ----------
+
+    /// 找原 key 的全部墓碑:date Some → 快速路径直查 `.trash/<date>/<key>`
+    /// 与 `.trash/<date>/<key>/` 两形(精确前缀探测,各 0-1 键);date
+    /// None → 全量分页扫描(管理命令成本,规格 4.4 风险 5 文档化)。
+    /// 返回全部命中按 (date, is_dir) 升序(最旧在前);外部杂项 key 经
+    /// decode 校验跳过。多命中即 L6 场景(同名多日期墓碑 / 文件目录
+    /// 双形):restore 只清最旧一条并标记 multiple_versions。
+    pub(crate) async fn find_tombstone(
+        &self,
+        fs: &ObjectFs,
+        key: &str,
+        date: Option<chrono::NaiveDate>,
+    ) -> Result<Vec<(chrono::NaiveDate, bool)>> {
+        let prefix = self.prefix.clone();
+        let file_key = key.trim_end_matches('/');
+        let dir_key = format!("{file_key}/");
+        let mut hits: Vec<(chrono::NaiveDate, bool)> = Vec::new();
+        if let Some(d) = date {
+            for probe in [file_key, dir_key.as_str()] {
+                let p = format!("{prefix}{d}/{probe}");
+                list_trash_keys(fs, None, Some(&p), |page| {
+                    for k in page {
+                        if let Some(t) = decode_tombstone_key(&prefix, &k)
+                            && t.original_key == probe
+                        {
+                            hits.push((t.date, t.is_dir));
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            hits.sort(); // (date, is_dir) 升序,最旧在前
+            return Ok(hits);
+        }
+        list_trash_keys(fs, None, None, |page| {
+            for k in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &k)
+                    && (t.original_key == file_key || t.original_key == dir_key)
+                {
+                    hits.push((t.date, t.is_dir));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        hits.sort(); // 最旧在前:restore 无 --date 恢复最旧一条(L6)
+        Ok(hits)
+    }
+
+    /// 恢复:删墓碑 + 索引 remove + 缓存失效 → 原对象立即复活。
+    /// 文件墓碑先 HEAD 原对象校验(三分支):404 → 清墓碑(§7 顺序约定)
+    /// 报 OriginalGone,不留空引用;etag 不一致 → warn「内容已被其他端
+    /// 修改」后默认仍恢复(etag_mismatch=true,恢复的是当前内容);
+    /// 一致 → Restored{false}。目录墓碑无需 HEAD,删墓碑即恢复。
+    /// 未命中 → NoTombstone。
+    pub(crate) async fn trash_restore(
+        &self,
+        fs: &ObjectFs,
+        path: &str,
+        date: Option<chrono::NaiveDate>,
+    ) -> Result<RestoreOutcome> {
+        let key = fs.key_for(path);
+        let hits = self.find_tombstone(fs, &key, date).await?;
+        let Some(&(d, is_dir)) = hits.first() else {
+            return Ok(RestoreOutcome::NoTombstone);
+        };
+        // L6:同名多日期墓碑(或文件/目录双形)时只清最旧一条 —— 其余
+        // 仍隐藏 key,调用方(CLI)据此提示用户用 --date 指定版本。
+        let multiple_versions = hits.len() > 1;
+        // L2:入口持一个 permit 覆盖 find_tombstone 之后的 HEAD/GET/DELETE
+        // (head_original/read_tombstone 的「调用方已持 permit」契约;
+        // delete_tombstone 不再内部 acquire —— 饱和池二次 acquire 死锁,
+        // #55 纪律)。find_tombstone 的全量列表不占 permit(管理命令成本,
+        // 规格 4.4 风险 5),此处获取恰好覆盖其余请求。
+        let _permit = fs.acquire().await?;
+        // 墓碑 key 按 encode 同规则拼接:目录形态补尾斜杠(幂等)。
+        let original_key = if is_dir {
+            format!("{}/", key.trim_end_matches('/'))
+        } else {
+            key.clone()
+        };
+        let tomb_key = encode_tombstone_key(&self.prefix, d, &original_key, is_dir);
+        let outcome = if is_dir {
+            // 目录:删墓碑即恢复(无原对象,不做 HEAD)
+            self.delete_tombstone(fs, &tomb_key).await?;
+            RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions,
+            }
+        } else {
+            // 文件:HEAD 原对象校验(三分支)
+            let head = self.head_original(fs, &key).await?;
+            match head {
+                None => {
+                    // 原对象不存在(已 GC / 其他端删):清墓碑,不留空引用(§7)
+                    self.delete_tombstone(fs, &tomb_key).await?;
+                    RestoreOutcome::OriginalGone
+                }
+                Some(current_etag) => {
+                    // 墓碑 body 里删除时的 etag 与当前 etag 比较(忽略
+                    // 大小写与引号:OSS 大写带引号 / S3 小写,规格 2.4 风险 7)
+                    let mismatched = match self.read_tombstone(fs, &tomb_key).await? {
+                        // 墓碑已被并发恢复/GC 删除(L5):key 本已恢复
+                        None => false,
+                        Some(body) => match (body.etag.as_deref(), current_etag.as_deref()) {
+                            (Some(a), Some(b)) => !etag_eq(a, b),
+                            (Some(_), None) => true, // 墓碑有 etag、当前无 → 视为不一致
+                            _ => false,
+                        },
+                    };
+                    if mismatched {
+                        tracing::warn!(
+                            path = %path,
+                            "trash restore: 内容已被其他端修改,恢复的是当前内容"
+                        );
+                    }
+                    self.delete_tombstone(fs, &tomb_key).await?;
+                    RestoreOutcome::Restored {
+                        etag_mismatch: mismatched,
+                        multiple_versions,
+                    }
+                }
+            }
+        };
+        // 提交点后:索引 remove + 缓存失效(双形态,镜像 soft_delete_dir)
+        {
+            let mut idx = self.index.write().unwrap();
+            idx.remove(&key, is_dir);
+            self.store_index_entries(idx.len());
+        }
+        fs.invalidate_trash_cached(path, is_dir);
+        fs.invalidate_stat(path.trim_end_matches('/'));
+        Ok(outcome)
+    }
+
+    /// trash-list:分页列出墓碑(日期/原路径/etag/size)。文件墓碑 GET
+    /// body 取 etag/size(管理命令成本,一次性操作);目录墓碑 None。
+    /// 页回调流式输出,50 万条不整体驻留(规格 4.2)。分页骨架与
+    /// list_trash_keys 相同,但页内需 async GET body,同步 on_page 无法
+    /// 承载,故独立实现。
+    pub(crate) async fn trash_list(
+        &self,
+        fs: &ObjectFs,
+        mut on_page: impl FnMut(Vec<TrashEntry>) -> Result<()>,
+    ) -> Result<()> {
+        let prefix = self.prefix.clone();
+        let mut token: Option<String> = None;
+        loop {
+            fs.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
+            let mut req = fs
+                .client
+                .list_objects_v2()
+                .bucket(&fs.bucket)
+                .prefix(&prefix);
+            if let Some(tok) = token.as_deref() {
+                req = req.continuation_token(tok);
+            }
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    fs.metrics.s3_list_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(e).context("s3 list trash");
+                }
+            };
+            let mut entries = Vec::new();
+            for key in resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string))
+            {
+                let Some(t) = decode_tombstone_key(&prefix, &key) else {
+                    continue; // 外部客户端垃圾对象跳过
+                };
+                let (etag, size) = if t.is_dir {
+                    (None, None)
+                } else {
+                    let Some(body) = self.read_tombstone(fs, &key).await? else {
+                        continue; // 墓碑已被并发删除:跳过该条目
+                    };
+                    (body.etag, body.size)
+                };
+                // 挂载视图相对路径(剥命名空间 prefix;目录保留尾斜杠)
+                let rel = t
+                    .original_key
+                    .strip_prefix(&fs.prefix)
+                    .unwrap_or(&t.original_key);
+                entries.push(TrashEntry {
+                    deleted_date: t.date,
+                    path: rel.to_string(),
+                    etag,
+                    size,
+                    is_dir: t.is_dir,
+                });
+            }
+            on_page(entries)?;
+            match next_page_token(&resp)? {
+                Some(tok) => token = Some(tok),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// GC 过期清理。cutoff = min(opts.before 或今天, today - 保留期)
+    /// (规格 4.2:--before 只收紧不放松,绝不清今天以内的分区);按分区
+    /// 只处理 date < cutoff 的分区(未来日期墓碑天然跳过,时钟偏快保护);
+    /// 每分区先文件后目录(gc_partition_files → gc_partition_dirs ——
+    /// 顺序保证文件 etag 判定优先于目录 mtime 启发式,偏斜场景下
+    /// "活数据"不被目录启发式误删,规格 4.4 风险 9);处理完的墓碑从
+    /// 索引 remove;dry_run 判定照做(HEAD/GET/list)、删除动作全跳过。
+    pub(crate) async fn trash_gc(&self, fs: &ObjectFs, opts: GcOptions) -> Result<GcReport> {
+        // 只读挂载绝不动桶(M2):后台周期 GC 与任何直接调用都早退零动作
+        // —— 只读"绝不改桶"语义;管理命令 trash-clean 强制 read_only=false,
+        // 不受影响。
+        if fs.read_only() {
+            return Ok(GcReport::default());
+        }
+        let today = date_partition_utc(SystemTime::now());
+        let retention_start = today
+            .checked_sub_days(chrono::Days::new(self.retention_days as u64))
+            .unwrap_or(today);
+        let cutoff = opts.before.unwrap_or(today).min(retention_start);
+        let mut report = GcReport::default();
+        let partitions = Self::list_partitions_desc(fs, &self.prefix).await?;
+        for date_str in partitions {
+            let Ok(date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") else {
+                continue; // 外部垃圾分区
+            };
+            if date >= cutoff {
+                continue; // 严格早于 cutoff 才处理
+            }
+            self.gc_partition_files(fs, date, opts.dry_run, &mut report)
+                .await?;
+            self.gc_partition_dirs(fs, date, opts.dry_run, &mut report)
+                .await?;
+        }
+        if !opts.dry_run {
+            // L4 代际推进:GC 的索引变更已完成 —— 并发中的 refresh/rebuild
+            // 凭此丢弃其陈旧快照(apply 前检测),防止把已删墓碑重插回索引。
+            // dry-run 零状态变更,不推进。
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(report)
+    }
+
+    /// 单分区文件墓碑 GC。每墓碑:GET body 取删除时 etag → HEAD 原对象:
+    /// 404 → files_tombstone_only++、墓碑入批删;etag 一致 →
+    /// files_removed++,先 DELETE 原对象(单对象)再墓碑入批删;etag
+    /// 不一致 → files_skipped_etag++ + trash_gc_etag_skips,不动(活数据
+    /// 留给人工)。批删列表每 MAX_DELETE_OBJECTS_PER_REQUEST 条
+    /// DeleteObjects 一次(复用 DeleteObjectsContentMd5 interceptor,
+    /// #74 防 OSS 400 InvalidDigest)。每墓碑持一个 limiter permit
+    /// (并发上限不可回归);顺序约定 §7:先删原对象后删墓碑(多端竞态)。
+    async fn gc_partition_files(
+        &self,
+        fs: &ObjectFs,
+        date: chrono::NaiveDate,
+        dry_run: bool,
+        report: &mut GcReport,
+    ) -> Result<()> {
+        let prefix = self.prefix.clone();
+        let partition_prefix = format!("{prefix}{date}/");
+        let mut files: Vec<String> = Vec::new();
+        list_trash_keys(fs, None, Some(&partition_prefix), |page| {
+            for k in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &k)
+                    && !t.is_dir
+                {
+                    files.push(k);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        let mut tomb_keys: Vec<String> = Vec::new(); // 待批删墓碑
+        let mut removed: Vec<(String, bool)> = Vec::new(); // 索引 remove(key, is_dir)
+        for tomb_key in files {
+            let _permit = fs.acquire().await?;
+            let Some(body) = self.read_tombstone(fs, &tomb_key).await? else {
+                // 墓碑已被并发 restore/GC 删除(L5):绝不动原对象 ——
+                // 旧实现把 404 当「无 etag」按 matched 处理,恢复成功
+                // 瞬间原对象又被 GC 永久删除;跳过即下轮 S3 列表自然
+                // 不再出现,自愈。
+                continue;
+            };
+            let file_key = tomb_key
+                .strip_prefix(&partition_prefix)
+                .unwrap_or(&tomb_key);
+            match self.head_original(fs, file_key).await? {
+                None => {
+                    // 原对象不存在(外部已删):仅清墓碑,不留空引用
+                    report.files_tombstone_only += 1;
+                    removed.push((file_key.to_string(), false));
+                    tomb_keys.push(tomb_key);
+                }
+                Some(current_etag) => {
+                    let matched = match (body.etag.as_deref(), current_etag.as_deref()) {
+                        (Some(a), Some(b)) => etag_eq(a, b),
+                        (Some(_), None) => false,
+                        _ => true, // 墓碑无 etag(旧版/异常)或当前无 → 视为一致
+                    };
+                    if matched {
+                        report.files_removed += 1;
+                        removed.push((file_key.to_string(), false));
+                        if !dry_run {
+                            // 顺序约定 §7:先删原对象,后删墓碑
+                            self.delete_object(fs, file_key).await?;
+                        }
+                        tomb_keys.push(tomb_key);
+                    } else {
+                        // 活数据:跳过,记 metrics,留给人工
+                        report.files_skipped_etag += 1;
+                        fs.metrics
+                            .trash_gc_etag_skips
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if !tomb_keys.is_empty() {
+            if !dry_run {
+                for chunk in tomb_keys.chunks(MAX_DELETE_OBJECTS_PER_REQUEST) {
+                    self.delete_keys_batch(fs, chunk).await?;
+                }
+            }
+            report.tombstones_deleted += tomb_keys.len() as u64;
+        }
+        if !dry_run && !removed.is_empty() {
+            {
+                let mut idx = self.index.write().unwrap();
+                for (key, is_dir) in &removed {
+                    idx.remove(key, *is_dir);
+                }
+                self.store_index_entries(idx.len());
+            }
+            for (key, is_dir) in &removed {
+                invalidate_key(fs, key, *is_dir);
+            }
+        }
+        Ok(())
+    }
+
+    /// 单分区目录墓碑 GC(mtime 启发式):以原目录 key(含尾 '/')为前缀
+    /// ListObjectsV2,收集 last_modified < date 00:00 UTC 的对象 → 按
+    /// MAX_DELETE_OBJECTS_PER_REQUEST 分块 DeleteObjects(interceptor
+    /// 同文件路径);last_modified >= date 视为墓碑日期后的新数据保留。
+    /// 删原对象后删目录墓碑(顺序约定 §7);dirs_removed++/
+    /// objects_deleted+=n。边界声明:删除机本地时钟超前时墓碑日期晚于
+    /// 真实删除,之后合法重写对象 last_modified < 墓碑日期会被误删
+    /// (规格 4.4 风险 1,缓解:只处理 date < cutoff 分区、严格用服务器
+    /// LastModified 对比)。
+    async fn gc_partition_dirs(
+        &self,
+        fs: &ObjectFs,
+        date: chrono::NaiveDate,
+        dry_run: bool,
+        report: &mut GcReport,
+    ) -> Result<()> {
+        let prefix = self.prefix.clone();
+        let partition_prefix = format!("{prefix}{date}/");
+        let mut dirs: Vec<String> = Vec::new();
+        list_trash_keys(fs, None, Some(&partition_prefix), |page| {
+            for k in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &k)
+                    && t.is_dir
+                {
+                    dirs.push(t.original_key);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        for dir_key in dirs {
+            let _permit = fs.acquire().await?;
+            // mtime 启发式:last_modified < 墓碑日 00:00 UTC 的对象才删
+            let cutoff = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let mut doomed: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                fs.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
+                let mut req = fs
+                    .client
+                    .list_objects_v2()
+                    .bucket(&fs.bucket)
+                    .prefix(&dir_key);
+                if let Some(tok) = token.as_deref() {
+                    req = req.continuation_token(tok);
+                }
+                let resp = match req.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                        fs.metrics.s3_list_errors.fetch_add(1, Ordering::Relaxed);
+                        return Err(e).context("s3 list dir prefix in trash gc");
+                    }
+                };
+                for obj in resp.contents() {
+                    let (Some(k), Some(lm)) = (obj.key(), obj.last_modified()) else {
+                        continue;
+                    };
+                    if lm.secs() < cutoff.timestamp() {
+                        doomed.push(k.to_string());
+                    }
+                }
+                match next_page_token(&resp)? {
+                    Some(tok) => token = Some(tok),
+                    None => break,
+                }
+            }
+            // 顺序约定 §7:先删原对象(批删),后删目录墓碑
+            if !dry_run && !doomed.is_empty() {
+                for chunk in doomed.chunks(MAX_DELETE_OBJECTS_PER_REQUEST) {
+                    self.delete_keys_batch(fs, chunk).await?;
+                }
+            }
+            let tomb_key = encode_tombstone_key(&prefix, date, &dir_key, true);
+            if !dry_run {
+                self.delete_keys_batch(fs, std::slice::from_ref(&tomb_key))
+                    .await?;
+            }
+            report.objects_deleted += doomed.len() as u64;
+            report.dirs_removed += 1;
+            report.tombstones_deleted += 1;
+            if !dry_run {
+                // L1:dry-run 不改变任何状态 —— 索引 remove 与缓存失效
+                // 同样门控(dry-run 契约:判定照做、删除不落、状态不变)。
+                {
+                    let mut idx = self.index.write().unwrap();
+                    idx.remove(&dir_key, true);
+                    self.store_index_entries(idx.len());
+                }
+                invalidate_key(fs, &dir_key, true);
+            }
+        }
+        Ok(())
+    }
+
+    /// HEAD 原对象:404 → None(原对象不存在);成功 → Some(当前 etag,
+    /// 可能为 None)。错误计数与 soft_delete_file 对齐。
+    /// 调用方已持 limiter permit。
+    async fn head_original(&self, fs: &ObjectFs, key: &str) -> Result<Option<Option<String>>> {
+        let resp = fs
+            .client
+            .head_object()
+            .bucket(&fs.bucket)
+            .key(key)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => Ok(Some(r.e_tag().map(|s| s.to_string()))),
+            Err(e) if is_s3_not_found(&e) => Ok(None),
+            Err(e) => {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e).context("s3 head in trash gc")
+            }
+        }
+    }
+
+    /// 单对象 DELETE(GC 删原对象;顺序约定 §7 的第一步)。
+    /// 调用方已持 limiter permit。
+    async fn delete_object(&self, fs: &ObjectFs, key: &str) -> Result<()> {
+        fs.client
+            .delete_object()
+            .bucket(&fs.bucket)
+            .key(key)
+            .send()
+            .await
+            .inspect_err(|_| {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                fs.metrics.s3_delete_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .context("s3 delete original in trash gc")?;
+        Ok(())
+    }
+
+    /// DELETE 单个墓碑对象(restore 用)。**调用方已持 limiter permit**
+    /// (trash_restore 入口持一个覆盖 HEAD/GET/DELETE 全程;内部不再
+    /// acquire —— 饱和池二次 acquire 死锁,#55 纪律)。
+    async fn delete_tombstone(&self, fs: &ObjectFs, tomb_key: &str) -> Result<()> {
+        fs.client
+            .delete_object()
+            .bucket(&fs.bucket)
+            .key(tomb_key)
+            .send()
+            .await
+            .inspect_err(|_| {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                fs.metrics.s3_delete_errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .context("s3 delete tombstone")?;
+        Ok(())
+    }
+
+    /// GET 墓碑 body 解析 TombstoneBody。404 → None(墓碑已被并发删除:
+    /// GC 调用方跳过该墓碑绝不动原对象[L5],restore 调用方按「本已
+    /// 恢复」处理,list 调用方跳过该条目);调用方已持 limiter permit。
+    async fn read_tombstone(&self, fs: &ObjectFs, tomb_key: &str) -> Result<Option<TombstoneBody>> {
+        let resp = match fs
+            .client
+            .get_object()
+            .bucket(&fs.bucket)
+            .key(tomb_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if is_s3_not_found(&e) => return Ok(None),
+            Err(e) => {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e).context("s3 get tombstone");
+            }
+        };
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .context("read tombstone body")?
+            .into_bytes();
+        Ok(Some(
+            serde_json::from_slice(&bytes).context("parse tombstone body")?,
+        ))
+    }
+
+    /// DeleteObjects 批删(≤1000 键/请求,复用 DeleteObjectsContentMd5
+    /// interceptor —— OSS 缺 Content-MD5 报 400 InvalidDigest,#74;
+    /// trash 路径不得绕过)。镜像 delete_dir_recursive_impl 的批删
+    /// 形状(含部分失败检查)。调用方已持 limiter permit。
+    async fn delete_keys_batch(&self, fs: &ObjectFs, keys: &[String]) -> Result<()> {
+        let objects = keys
+            .iter()
+            .map(|k| ObjectIdentifier::builder().key(k).build())
+            .collect::<Result<Vec<_>, _>>()
+            .context("build delete object identifiers")?;
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .context("build batch delete request")?;
+        let resp = fs
+            .client
+            .delete_objects()
+            .bucket(&fs.bucket)
+            .delete(delete)
+            .customize()
+            .interceptor(DeleteObjectsContentMd5)
+            .send()
+            .await
+            .context("s3 batch delete in trash gc")?;
+        let failed = resp.errors();
+        if !failed.is_empty() {
+            let sample: Vec<&str> = failed.iter().filter_map(|e| e.key()).take(5).collect();
+            anyhow::bail!(
+                "s3 batch delete failed for {} of {} keys (e.g. {:?})",
+                failed.len(),
+                keys.len(),
+                sample
+            );
+        }
+        Ok(())
+    }
 }
 
 /// 以 trash_prefix 分页枚举墓碑对象 key。start_after 传 Some 时携带
@@ -1089,6 +1789,8 @@ mod tests {
             TrashRefreshMode::Lazy,
             Duration::from_secs(30),
             Duration::from_secs(600),
+            Duration::from_secs(crate::ossfs::TRASH_GC_INTERVAL_SECS),
+            crate::ossfs::TRASH_RETENTION_DAYS,
         );
         state.store_index_entries(idx.len());
         assert_eq!(
@@ -1314,5 +2016,41 @@ mod tests {
             date_partition_utc(systime_at("2026-08-17T00:00:01Z")),
             chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()
         );
+    }
+
+    /// L4 机制钉:refresh 捕获代际 → GC 并发完成(代际推进)→ 旧代际快照
+    /// 的 apply_added 必须整体丢弃 —— 否则已删墓碑被重插回索引,隐藏至
+    /// 下轮全量重建(同进程刷新任务与 GC 竞态,规格 4.4 风险 4)。
+    /// 竞态本身(列表快照与 apply 之间的调度窗口)无法确定性复现,这里
+    /// 直接按「refresh 捕获旧代际、GC 已推进代际」的等价状态驱动机制。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_added_discards_stale_generation_snapshot() {
+        let (_mock, port) = crate::ossfs::MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = crate::ossfs::test_fs(port, 32);
+        let state = TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        fs.trash = Some(state.clone());
+        // refresh 在 GC 之前捕获代际
+        let stale_gen = state.generation.load(Ordering::SeqCst);
+        // GC 并发完成:代际推进(trash_gc 收尾的同一操作)
+        state.generation.fetch_add(1, Ordering::SeqCst);
+        // refresh 把陈旧快照(含 GC 刚删的墓碑 x.txt)交给 apply
+        let applied = state.apply_added(&fs, &[("x.txt".to_string(), false)], stale_gen);
+        assert!(!applied, "旧代际快照必须被丢弃(L4)");
+        assert!(
+            !state.index.read().unwrap().is_covered("x.txt"),
+            "已删墓碑不得重插回索引"
+        );
+        // 当前代际的 apply 正常工作
+        let cur_gen = state.generation.load(Ordering::SeqCst);
+        let applied = state.apply_added(&fs, &[("y.txt".to_string(), false)], cur_gen);
+        assert!(applied, "当前代际快照正常应用");
+        assert!(state.index.read().unwrap().is_covered("y.txt"));
     }
 }

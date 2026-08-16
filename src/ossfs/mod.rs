@@ -348,7 +348,7 @@ impl Intercept for Crc64ResponseCapture {
 /// contracts — `delete_dir_recursive_sends_oss_content_md5` asserts the wire
 /// shape and turns red on an SDK upgrade that changes either.
 #[derive(Debug, Default)]
-struct DeleteObjectsContentMd5;
+pub(crate) struct DeleteObjectsContentMd5;
 
 impl Intercept for DeleteObjectsContentMd5 {
     fn name(&self) -> &'static str {
@@ -473,6 +473,14 @@ impl OssConfig {
         if self.trash_refresh_mode.is_none() {
             self.trash_refresh_mode = Some(TrashRefreshMode::Lazy);
         }
+        // 单元 4 默认值(C4b):GC 保留期/周期在消费单元落地;trash_dir 仍
+        // 绝不填(门控不被默认值覆盖)。
+        if self.trash_retention_days.is_none() {
+            self.trash_retention_days = Some(TRASH_RETENTION_DAYS);
+        }
+        if self.trash_gc_interval_secs.is_none() {
+            self.trash_gc_interval_secs = Some(TRASH_GC_INTERVAL_SECS);
+        }
         self
     }
 }
@@ -564,7 +572,8 @@ const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// copied via multipart copy (#60).
 const MULTIPART_COPY_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
 /// DeleteObjects batches at most this many keys per request (#60).
-const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1000;
+/// pub(crate):trash GC 批删复用(trash.rs)。
+pub(crate) const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1000;
 /// 回收站(soft delete)增量刷新周期秒:lazy 模式下本端感知远端删除的
 /// 延迟上界(规格 C5 阈值,独立 commit 落地 + 断言防漂移;变更必须独立
 /// commit 写明新旧值与理由)。
@@ -576,6 +585,14 @@ pub const TRASH_REBUILD_INTERVAL_SECS: u64 = 600;
 /// 的 diff 内存尖峰可见,缓解手段是 GC/trash-clean,见裁决 #6)。
 /// 规格 C5 新阈值落地(无旧值);变更必须独立 commit 写明新旧值与理由。
 pub const TRASH_INDEX_ALERT_THRESHOLD: usize = 500_000;
+/// 回收站保留天数:墓碑日期早于 `today - TRASH_RETENTION_DAYS` 的分区才可
+/// 被 GC 清理(规格 C5 阈值,独立 commit 落地 + 断言;新阈值,无旧值 ——
+/// 设计稿 §9 默认 30 天)。变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_RETENTION_DAYS: u32 = 30;
+/// 回收站 GC 周期秒:挂载时立即 GC 一次后按此周期后台清理过期墓碑
+/// (规格 C5 阈值,独立 commit 落地 + 断言;新阈值,无旧值 —— 设计稿 §9
+/// 默认 24h)。变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_GC_INTERVAL_SECS: u64 = 86_400;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -1334,6 +1351,7 @@ pub struct Metrics {
     trash_refresh_errors: AtomicU64,
     trash_start_after_ignored: AtomicU64,
     trash_bootstrap_failures: AtomicU64,
+    trash_gc_etag_skips: AtomicU64,
 }
 
 /// Point-in-time snapshot of [`Metrics`] counters.
@@ -1381,6 +1399,8 @@ pub struct MetricsSnapshot {
     pub trash_start_after_ignored: u64,
     /// 挂载时 bootstrap 失败次数(§0.3)。
     pub trash_bootstrap_failures: u64,
+    /// GC etag 不一致跳过次数(§0.3)。
+    pub trash_gc_etag_skips: u64,
 }
 
 impl Metrics {
@@ -1422,6 +1442,7 @@ impl Metrics {
             trash_refresh_errors: self.trash_refresh_errors.load(Ordering::Relaxed),
             trash_start_after_ignored: self.trash_start_after_ignored.load(Ordering::Relaxed),
             trash_bootstrap_failures: self.trash_bootstrap_failures.load(Ordering::Relaxed),
+            trash_gc_etag_skips: self.trash_gc_etag_skips.load(Ordering::Relaxed),
         }
     }
 }
@@ -1885,11 +1906,21 @@ fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>
             .unwrap_or(TRASH_REFRESH_INTERVAL_SECS),
     );
     let rebuild_interval = Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS);
+    let gc_interval = Duration::from_secs(
+        config
+            .trash_gc_interval_secs
+            .unwrap_or(TRASH_GC_INTERVAL_SECS),
+    );
+    // 保留期消费点(H1):--trash-retention-days 经 normalize 已填默认,
+    // 兜底常量防直接构造未 normalize 的 config。
+    let retention_days = config.trash_retention_days.unwrap_or(TRASH_RETENTION_DAYS);
     Ok(Some(trash::TrashState::new(
         format!("{}{}/", config.prefix, dir),
         mode,
         refresh_interval,
         rebuild_interval,
+        gc_interval,
+        retention_days,
     )))
 }
 
@@ -2219,7 +2250,14 @@ impl ObjectFs {
             return Ok(0);
         };
         let _permit = self.acquire().await?;
+        // 代际捕获(L3/L4):挂载期周期 GC 与 bootstrap 并发时,本快照可能
+        // 含 GC 刚删的墓碑 —— 换入前检测代际变化则整体丢弃(索引空 →
+        // 周期刷新自愈,绝不把已删墓碑重新隐藏进索引)。
+        let gen_snapshot = trash.generation.load(Ordering::SeqCst);
         let (index, last_key) = trash::fetch_all_tombstones(self, trash).await?;
+        if trash.generation.load(Ordering::SeqCst) != gen_snapshot {
+            return Ok(0); // GC 并发完成:丢弃陈旧快照,下轮刷新自愈
+        }
         let count = index.len();
         // 短写锁整体换入:离线构建期间读路径继续用旧索引
         *trash.index.write().unwrap() = index;
@@ -2339,6 +2377,46 @@ impl ObjectFs {
                 tracing::warn!(error = %e, "trash refresh failed; will retry next cycle");
             }
         }
+    }
+
+    // ---------- 单元 4:管理命令与周期 GC ----------
+
+    /// trash-list 管理命令:分页列出墓碑(CLI 流式打印)。trash 关闭
+    /// (--no-trash)时无墓碑可列 → bail(CLI 层已拦,双保险)。
+    pub async fn trash_list(
+        &self,
+        on_page: impl FnMut(Vec<trash::TrashEntry>) -> Result<()>,
+    ) -> Result<()> {
+        let Some(trash) = &self.trash else {
+            anyhow::bail!("trash is disabled (--no-trash); no trash to list");
+        };
+        trash.trash_list(self, on_page).await
+    }
+
+    /// trash-restore 管理命令(三分支见 [`trash::RestoreOutcome`])。
+    pub async fn trash_restore(
+        &self,
+        path: &str,
+        date: Option<chrono::NaiveDate>,
+    ) -> Result<trash::RestoreOutcome> {
+        let Some(trash) = &self.trash else {
+            anyhow::bail!("trash is disabled (--no-trash); nothing to restore");
+        };
+        trash.trash_restore(self, path, date).await
+    }
+
+    /// trash-clean 管理命令 / 周期 GC。trash 关闭 → 无事可做,返回空报告。
+    pub async fn trash_gc(&self, opts: trash::GcOptions) -> Result<trash::GcReport> {
+        let Some(trash) = &self.trash else {
+            return Ok(trash::GcReport::default());
+        };
+        trash.trash_gc(self, opts).await
+    }
+
+    /// 后台 GC 周期秒(trash 关闭 → None);main 据此 spawn 周期任务,
+    /// 0 或 None 不 spawn(TRASH_GC_INTERVAL_SECS 兜底在调用方)。
+    pub fn trash_gc_interval_secs(&self) -> Option<u64> {
+        self.trash.as_ref().map(|t| t.gc_interval.as_secs())
     }
 
     /// List the immediate children of `dir`.
@@ -4226,6 +4304,8 @@ mod tests {
                 TrashRefreshMode::Lazy,
                 Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
                 Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+                Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+                TRASH_RETENTION_DAYS,
             )
         };
         // trash None → 恒 false(零行为变化)
@@ -4703,6 +4783,14 @@ mod tests {
             "索引规模告警阈值 500k(裁决 #6 新阈值,无旧值)"
         );
         assert_eq!(
+            TRASH_RETENTION_DAYS, 30,
+            "回收站保留期 30 天(规格 C5,新阈值,无旧值)"
+        );
+        assert_eq!(
+            TRASH_GC_INTERVAL_SECS, 86_400,
+            "GC 周期 24h(规格 C5,新阈值,无旧值)"
+        );
+        assert_eq!(
             trash::TRASH_EAGER_MIN_POLL_INTERVAL,
             Duration::from_secs(1),
             "eager 最小轮询间隔 1s"
@@ -4781,13 +4869,32 @@ mod tests {
             cfg.trash_dir.is_none(),
             "normalize 绝不填 trash_dir(None = 回收站关闭)"
         );
+        // 单元 4 默认值(C4b):retention_days=30 / gc_interval_secs=86400
+        assert_eq!(
+            cfg.trash_retention_days,
+            Some(TRASH_RETENTION_DAYS),
+            "None → 默认 30 天保留期"
+        );
+        assert_eq!(
+            cfg.trash_gc_interval_secs,
+            Some(TRASH_GC_INTERVAL_SECS),
+            "None → 默认 86400s GC 周期"
+        );
         // 显式值不被覆盖
         let mut cfg = base();
         cfg.trash_refresh_interval_secs = Some(7);
         cfg.trash_refresh_mode = Some(TrashRefreshMode::Eager);
+        cfg.trash_retention_days = Some(7);
+        cfg.trash_gc_interval_secs = Some(3600);
         let cfg = cfg.normalize();
         assert_eq!(cfg.trash_refresh_interval_secs, Some(7));
         assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Eager));
+        assert_eq!(cfg.trash_retention_days, Some(7), "显式保留期不被覆盖");
+        assert_eq!(
+            cfg.trash_gc_interval_secs,
+            Some(3600),
+            "显式 GC 周期不被覆盖"
+        );
     }
 
     #[tokio::test]
@@ -4953,6 +5060,13 @@ mod s3_mock_tests {
         pub(crate) delete_errors: Arc<Mutex<Vec<String>>>,
         pub(crate) crc64: Mutex<u64>,
         pub(crate) head_etag: Mutex<String>,
+        /// Per-key etag 覆盖(单元 4:restore/GC 的 etag 一致性判定需要
+        /// 模拟「其他端覆盖同名 key」;缺省回退全局 head_etag)。
+        pub(crate) etags: Arc<Mutex<HashMap<String, String>>>,
+        /// Per-key LastModified(单元 4:目录 GC 的 mtime 启发式需要按对象
+        /// 区分 last_modified;PUT/COPY 落地即写当前时间,list/HEAD 分支
+        /// 返回,无记录对象缺省当前时间(C1 生产对齐))。
+        pub(crate) last_modified: Arc<Mutex<HashMap<String, String>>>,
         /// When non-zero, every HEAD answers with this status (used to
         /// simulate 403/5xx bucket checks; 0 = normal object lookup).
         pub(crate) head_status: std::sync::atomic::AtomicU16,
@@ -4985,6 +5099,24 @@ mod s3_mock_tests {
             *self.head_etag.lock().unwrap() = v.to_string();
         }
 
+        /// per-key etag 覆盖(HEAD 该 key 时优先返回;缺省回退 head_etag)。
+        /// 值存裸形态(不含引号),HEAD 响应按 S3/OSS 惯例包引号。
+        pub(crate) fn set_etag(&self, key: &str, v: &str) {
+            self.etags
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), v.to_string());
+        }
+
+        /// per-key LastModified(list 分支返回,ISO 8601 字符串;
+        /// 目录 GC 的 mtime 启发式消费)。
+        pub(crate) fn set_last_modified(&self, key: &str, v: &str) {
+            self.last_modified
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), v.to_string());
+        }
+
         fn set_crc64(&self, v: u64) {
             *self.crc64.lock().unwrap() = v;
         }
@@ -5011,6 +5143,8 @@ mod s3_mock_tests {
                 sizes: Arc::new(Mutex::new(HashMap::new())),
                 crc64: Mutex::new(0),
                 head_etag: Mutex::new("mock-etag".to_string()),
+                etags: Arc::new(Mutex::new(HashMap::new())),
+                last_modified: Arc::new(Mutex::new(HashMap::new())),
                 head_status: std::sync::atomic::AtomicU16::new(0),
                 complete_no_such_upload: std::sync::atomic::AtomicBool::new(false),
                 list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
@@ -5169,8 +5303,16 @@ mod s3_mock_tests {
                 .filter(|(k, _)| start_after.as_deref().is_none_or(|sa| k.as_str() > sa))
                 .collect();
             let sizes = mock.sizes.lock().unwrap().clone();
+            let last_modified = mock.last_modified.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
-            let body = list_xml(&filtered, &sizes, truncated, use_delimiter, &prefix);
+            let body = list_xml(
+                &filtered,
+                &sizes,
+                &last_modified,
+                truncated,
+                use_delimiter,
+                &prefix,
+            );
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
@@ -5272,8 +5414,34 @@ mod s3_mock_tests {
                 let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidDigest</Code><Message>The Content-MD5 you specified was invalid.</Message></Error>".to_string();
                 http_response(400, "application/xml", Some(&body))
             } else {
-                // Answer a result listing any configured failures.
+                // 真实删除:解析 <Key> 列表并从 objects/entries 移除
+                // (mock 服务端语义必须与生产对齐 —— GC 批删测试断言删除
+                // 效果;单元 2 前置扩展只断言请求形状,未暴露此缺口)。
+                // 失败 keys(delete_errors 配置)不删,与真实 OSS 一致。
+                let text = String::from_utf8_lossy(&body).to_string();
+                let mut keys: Vec<String> = Vec::new();
+                let mut rest = text.as_str();
+                while let Some(start) = rest.find("<Key>") {
+                    let key_start = start + "<Key>".len();
+                    let Some(end) = rest[key_start..].find("</Key>") else {
+                        break;
+                    };
+                    keys.push(rest[key_start..key_start + end].to_string());
+                    rest = &rest[key_start + end + "</Key>".len()..];
+                }
                 let errors = mock.delete_errors.lock().unwrap();
+                {
+                    let mut objects = mock.objects.lock().unwrap();
+                    let mut entries = mock.entries.lock().unwrap();
+                    for key in &keys {
+                        if errors.iter().any(|e| e == key) {
+                            continue; // 配置的失败 keys 不删
+                        }
+                        objects.remove(key);
+                        entries.retain(|(k, _)| k != key);
+                    }
+                }
+                // Answer a result listing any configured failures.
                 let mut body =
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>".to_string();
                 for key in errors.iter() {
@@ -5300,9 +5468,40 @@ mod s3_mock_tests {
                     .unwrap_or_default();
                 let objects = mock.objects.lock().unwrap();
                 if let Some(obj) = objects.get(&key) {
-                    let etag = mock.head_etag.lock().unwrap().clone();
+                    // per-key etag 覆盖(单元 4 restore/GC 判定),缺省回退
+                    // 全局 head_etag;Last-Modified 头同 per-key(无则省略,
+                    // SDK 解析失败也仅 mtime 归零,无行为影响)。
+                    let etag = mock
+                        .etags
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| mock.head_etag.lock().unwrap().clone());
+                    let lm = mock
+                        .last_modified
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned()
+                        .map(|v| {
+                            // last_modified 存储为 ISO 8601(list XML 用);
+                            // HEAD 的 Last-Modified 头必须 HTTP-date 形态
+                            // (RFC 7231),SDK 解析失败是硬错误而非 mtime
+                            // 归零 —— PUT 落地记 last_modified 后 HEAD
+                            // 路径必须给出可解析的头。
+                            chrono::DateTime::parse_from_rfc3339(&v)
+                                .map(|dt| {
+                                    format!(
+                                        "\r\nLast-Modified: {}",
+                                        dt.format("%a, %d %b %Y %H:%M:%S GMT")
+                                    )
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
                     format!(
-                        "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nETag: \"{etag}\"{lm}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         obj.len()
                     )
                 } else {
@@ -5334,6 +5533,12 @@ mod s3_mock_tests {
                     let data = mock.objects.lock().unwrap().get(&src_key).cloned();
                     if let Some(data) = data {
                         mock.objects.lock().unwrap().insert(key.clone(), data);
+                        // 生产对齐(C1):COPY 落地即记当前时间 last_modified,
+                        // 与真实 S3 一致(目录 GC mtime 启发式的判据)。
+                        mock.last_modified
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), mock_now_lm());
                         let mut entries = mock.entries.lock().unwrap();
                         if !entries.iter().any(|(k, _)| *k == key) {
                             entries.push((key, false));
@@ -5353,6 +5558,13 @@ mod s3_mock_tests {
                         .lock()
                         .unwrap()
                         .insert(key.clone(), body.clone());
+                    // 生产对齐(C1):PUT 落地即记当前时间 last_modified ——
+                    // 墓碑目录下新写入的对象必须被判「新数据」,不得被目录
+                    // GC 的 mtime 启发式误删;显式 set_last_modified 覆盖。
+                    mock.last_modified
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), mock_now_lm());
                     let mut entries = mock.entries.lock().unwrap();
                     if !entries.iter().any(|(k, _)| *k == key) {
                         entries.push((key, false));
@@ -5424,13 +5636,26 @@ mod s3_mock_tests {
             .to_string()
     }
 
+    /// 当前 UTC 时间的 last_modified 字符串(ISO 8601 毫秒,与
+    /// set_last_modified 的既有形态一致)。mock 服务端语义对齐生产(C1):
+    /// PUT/COPY 落地写当前时间;list 对无记录对象缺省当前时间 —— 避免
+    /// 恒早于墓碑日期的假时间把新对象误判为「过期可删」(目录 GC mtime
+    /// 启发式)。
+    fn mock_now_lm() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     fn list_xml(
         entries: &[(String, bool)],
         sizes: &HashMap<String, u64>,
+        last_modified: &HashMap<String, String>,
         truncated_no_token: bool,
         use_delimiter: bool,
         prefix: &str,
     ) -> String {
+        // 无记录对象缺省当前时间(生产对齐,C1:对象总是「已存在」,
+        // 绝非 2026-01-01 的远古时间)。
+        let default_lm = mock_now_lm();
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
@@ -5470,8 +5695,12 @@ mod s3_mock_tests {
             }
             for (key, _) in direct {
                 let size = sizes.get(key).copied().unwrap_or(5);
+                let lm = last_modified
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or(default_lm.as_str());
                 body.push_str(&format!(
-                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                    "<Contents><Key>{key}</Key><LastModified>{lm}</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
                 ));
             }
         } else {
@@ -5484,8 +5713,12 @@ mod s3_mock_tests {
                 // zero-byte object in Contents, matching real S3/OSS
                 // semantics (#60 review).
                 let size = sizes.get(key).copied().unwrap_or(5);
+                let lm = last_modified
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or(default_lm.as_str());
                 body.push_str(&format!(
-                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                    "<Contents><Key>{key}</Key><LastModified>{lm}</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
                 ));
             }
         }
@@ -7383,6 +7616,8 @@ mod s3_mock_tests {
             TrashRefreshMode::Lazy,
             Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
             Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+            Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+            TRASH_RETENTION_DAYS,
         )
     }
 
@@ -8746,6 +8981,992 @@ mod s3_mock_tests {
             "降级全量受 last_full_rebuild 周期节流(600s 内至多一次)"
         );
         assert!(fs.stat("/a.txt").await.unwrap().is_none());
+    }
+
+    // ---------- 单元 4:管理命令与 GC ----------
+
+    fn days_before(n: u32) -> chrono::NaiveDate {
+        trash::date_partition_utc(std::time::SystemTime::now())
+            .checked_sub_days(chrono::Days::new(n as u64))
+            .unwrap()
+    }
+
+    fn days_after(n: u32) -> chrono::NaiveDate {
+        trash::date_partition_utc(std::time::SystemTime::now())
+            .checked_add_days(chrono::Days::new(n as u64))
+            .unwrap()
+    }
+
+    /// 文件墓碑 body 写入 mock(etag 来自删除时 HEAD 的形态,含引号)。
+    fn seed_tombstone(mock: &MockS3, tomb_key: &str, body: &trash::TombstoneBody) {
+        mock.set_object(
+            tomb_key,
+            serde_json::to_vec(body).expect("tombstone body json"),
+        );
+    }
+
+    /// 恢复三分支 ①:正常恢复 —— 墓碑删、原对象保留、索引 remove 后
+    /// is_covered=false、invalidate 后立即可见;无 date 全量扫描与
+    /// --date 快速路径均恢复。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_normal_branch() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("软删");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none(), "软删后隐藏");
+        let today = trash::date_partition_utc(std::time::SystemTime::now());
+
+        // 无 date → find_tombstone 全量扫描
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            }
+        );
+        let recorded = mock.recorded.lock().unwrap();
+        let tomb_deletes: Vec<_> = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash/"))
+            .collect();
+        assert_eq!(tomb_deletes.len(), 1, "墓碑被删: {recorded:?}");
+        drop(recorded);
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象保留"
+        );
+        assert!(fs.stat("/a.txt").await.unwrap().is_some(), "恢复后立即可见");
+        assert_eq!(fs.metrics().trash_index_entries, 0, "索引 remove");
+
+        // --date 快速路径
+        fs.delete("/a.txt").await.expect("再软删");
+        let out = fs.trash_restore("/a.txt", Some(today)).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            }
+        );
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        // 目录墓碑恢复:无需 HEAD,删墓碑即恢复
+        fs.delete_dir_recursive("/docs").await.expect("软删目录");
+        assert!(fs.stat("/docs").await.unwrap().is_none());
+        let out = fs.trash_restore("/docs", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            }
+        );
+        assert_eq!(fs.metrics().trash_index_entries, 0, "目录索引 remove");
+    }
+
+    /// 恢复三分支 ②:etag 不一致(其他端覆盖同名 key)→ 警告后默认仍
+    /// 恢复(恢复的是当前内容),outcome.etag_mismatch=true。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_etag_mismatch_branch() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("软删"); // 墓碑 etag = "mock-etag"
+        mock.set_etag("a.txt", "changed-by-other-end"); // 其他端覆盖
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: true,
+                multiple_versions: false,
+            },
+            "etag 不一致仍恢复,但必须标记"
+        );
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_some(),
+            "恢复的是当前内容"
+        );
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.contains(".trash/")),
+            "墓碑仍被删: {recorded:?}"
+        );
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 恢复三分支 ③:原对象 HEAD 404(已被 GC/其他端删除)→ OriginalGone,
+    /// 墓碑被清、桶内不留空引用;④:无墓碑 → NoTombstone 且零删除请求。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_original_gone_and_no_tombstone() {
+        // ③ 原对象 404
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("软删");
+        mock.objects.lock().unwrap().remove("a.txt"); // 其他端/GC 已删原对象
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(out, trash::RestoreOutcome::OriginalGone);
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with(".trash/")),
+            "404 分支必须清墓碑,不留空引用"
+        );
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+
+        // ④ 无墓碑
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let out = fs.trash_restore("/nope.txt", None).await.unwrap();
+        assert_eq!(out, trash::RestoreOutcome::NoTombstone);
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            !recorded.iter().any(|r| r.method == "DELETE"
+                || (r.method == "POST" && r.target.to_lowercase().contains("delete"))),
+            "无墓碑零删除请求: {recorded:?}"
+        );
+    }
+
+    /// find_tombstone:文件/目录两形匹配;外部杂项 key(坏日期)跳过;
+    /// date Some 快速路径直查两形;date None 全量扫描。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn find_tombstone_matches_both_forms() {
+        let d = days_before(31);
+        let entries = vec![
+            (format!(".trash/{d}/a.txt"), false),
+            (format!(".trash/{d}/docs/"), true),
+            (".trash/garbage/x.txt".into(), false), // 外部杂项 key → decode 跳过
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let trash_state = fs.trash.clone().unwrap();
+        // 文件形
+        let hit = trash_state
+            .find_tombstone(&fs, "a.txt", None)
+            .await
+            .unwrap();
+        assert_eq!(hit, vec![(d, false)], "文件墓碑命中");
+        // 目录形(输入无尾斜杠 → 匹配 key+"/")
+        let hit = trash_state.find_tombstone(&fs, "docs", None).await.unwrap();
+        assert_eq!(hit, vec![(d, true)], "目录墓碑命中");
+        // 未命中
+        assert!(
+            trash_state
+                .find_tombstone(&fs, "nope.txt", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // date 快速路径
+        let hit = trash_state
+            .find_tombstone(&fs, "a.txt", Some(d))
+            .await
+            .unwrap();
+        assert_eq!(hit, vec![(d, false)], "date 快速路径");
+        assert!(
+            trash_state
+                .find_tombstone(&fs, "a.txt", Some(days_before(29)))
+                .await
+                .unwrap()
+                .is_empty(),
+            "错误日期不命中"
+        );
+    }
+
+    /// L6 回归:同名多日期墓碑下 trash-restore 无 --date —— 恢复最旧一条
+    /// 并标记 multiple_versions(CLI 据此提示用 --date 指定版本),较新
+    /// 墓碑保留 —— 否则 CLI 报「已恢复」而 key 仍被较新墓碑隐藏。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_without_date_reports_multiple_versions() {
+        let d_old = days_before(20);
+        let d_new = days_before(3);
+        let entries = vec![
+            (format!(".trash/{d_old}/a.txt"), false),
+            (format!(".trash/{d_new}/a.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        for key in [
+            format!(".trash/{d_old}/a.txt"),
+            format!(".trash/{d_new}/a.txt"),
+        ] {
+            seed_tombstone(
+                &mock,
+                &key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 无 --date:恢复最旧一条 + multiple_versions 标记
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: true,
+            },
+            "多版本必须标记(L6)"
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "最旧墓碑被清"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_new}/a.txt")),
+            "较新墓碑保留(key 仍被隐藏,提示用户用 --date)"
+        );
+        // --date 精确指定:恢复较新版本,单命中无标记
+        let out = fs.trash_restore("/a.txt", Some(d_new)).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            }
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_new}/a.txt")),
+            "--date 指定的版本墓碑被清"
+        );
+        // 全部墓碑已清后 NoTombstone
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(out, trash::RestoreOutcome::NoTombstone);
+    }
+
+    /// L7 语义钉:--before 晚于默认保留期 → 无效(cutoff 仍为 today-
+    /// retention,只收紧不放松)—— 31 天前墓碑仍被清(30 天保留),29 天
+    /// 前保留;用户以为「清 8/1 前」实际只清保留期之前。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_before_later_than_retention_is_ignored() {
+        let d_31 = days_before(31);
+        let d_29 = days_before(29);
+        let entries = vec![
+            (format!(".trash/{d_31}/a.txt"), false),
+            (format!(".trash/{d_29}/b.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        for (obj, tomb_key) in [
+            ("a.txt", format!(".trash/{d_31}/a.txt")),
+            ("b.txt", format!(".trash/{d_29}/b.txt")),
+        ] {
+            mock.set_object(obj, vec![1]);
+            mock.set_etag(obj, "mock-etag");
+            seed_tombstone(
+                &mock,
+                &tomb_key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // before = 5 天前,晚于 30 天保留期 → 无效
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: Some(days_before(5)),
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            report.files_removed, 1,
+            "--before 晚于保留期无效:仍按 30 天保留期清理"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("a.txt"),
+            "31 天前(超保留期)被清"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "29 天前(保留期内)保留"
+        );
+    }
+
+    /// GC 文件墓碑:etag 一致 → DELETE 原对象严格先于删墓碑;etag 不一致
+    /// → 原对象/墓碑均保留 + trash_gc_etag_skips 计数;原对象 404 → 仅删
+    /// 墓碑;§7 竞态(先删原对象再 restore)→ 404 分支清墓碑不留空引用。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_files_order_and_races() {
+        // ① etag 一致删除 + ② etag 不一致跳过
+        let d_old = days_before(31);
+        let entries = vec![
+            (format!(".trash/{d_old}/a.txt"), false),
+            (format!(".trash/{d_old}/b.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"aa".to_vec());
+        mock.set_object("b.txt", b"bb".to_vec());
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"same-etag\"".into()),
+                size: Some(2),
+                is_dir: false,
+            },
+        );
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/b.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"old-etag\"".into()),
+                size: Some(2),
+                is_dir: false,
+            },
+        );
+        mock.set_etag("a.txt", "same-etag"); // 一致 → 删
+        mock.set_etag("b.txt", "new-etag"); // 不一致 → 活数据跳过
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report.files_removed, 1, "etag 一致的原对象被删");
+        assert_eq!(report.files_skipped_etag, 1, "etag 不一致跳过");
+        assert_eq!(report.files_tombstone_only, 0);
+        assert_eq!(report.tombstones_deleted, 1, "a.txt 墓碑被删");
+        assert_eq!(fs.metrics().trash_gc_etag_skips, 1, "跳过计数");
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象已删"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "活数据保留"
+        );
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑已删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/b.txt")),
+            "不一致墓碑保留"
+        );
+        // 顺序:DELETE 原对象(a.txt 单对象)严格先于墓碑批删
+        let recorded = mock.recorded.lock().unwrap();
+        let plain_del = recorded
+            .iter()
+            .position(|r| {
+                r.method == "DELETE" && r.target.split('?').next().unwrap_or("").ends_with("/a.txt")
+            })
+            .expect("原对象单 DELETE");
+        let batch = recorded
+            .iter()
+            .position(|r| r.method == "POST" && r.target.to_lowercase().contains("delete"))
+            .expect("墓碑批删");
+        assert!(plain_del < batch, "先删原对象后删墓碑: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 1, "b.txt 墓碑仍在索引");
+
+        // ③ 原对象 404 → 仅删墓碑(files_tombstone_only)
+        let d_old2 = days_before(32);
+        let entries2 = vec![(format!(".trash/{d_old2}/c.txt"), false)];
+        let (mock2, port2) = MockS3::start(entries2, Duration::from_millis(1)).await;
+        seed_tombstone(
+            &mock2,
+            &format!(".trash/{d_old2}/c.txt"),
+            &trash::TombstoneBody {
+                etag: None,
+                size: None,
+                is_dir: false,
+            },
+        );
+        // 原对象不存在(外部已删)
+        let mut fs2 = test_fs(port2, 32);
+        fs2.trash = Some(trash_state(".trash/"));
+        fs2.rebuild_trash_index().await.expect("rebuild");
+        let report = fs2.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report.files_tombstone_only, 1);
+        assert_eq!(report.files_removed, 0);
+        assert!(
+            !mock2
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old2}/c.txt")),
+            "空引用墓碑被清"
+        );
+        assert_eq!(fs2.metrics().trash_index_entries, 0);
+
+        // ④ §7 竞态:先手动删原对象再 restore → 404 分支清墓碑,不留空引用
+        let d_old3 = days_before(33);
+        let entries3 = vec![(format!(".trash/{d_old3}/d.txt"), false)];
+        let (mock3, port3) = MockS3::start(entries3, Duration::from_millis(1)).await;
+        mock3.set_object("d.txt", b"dd".to_vec());
+        seed_tombstone(
+            &mock3,
+            &format!(".trash/{d_old3}/d.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"e\"".into()),
+                size: Some(2),
+                is_dir: false,
+            },
+        );
+        let mut fs3 = test_fs(port3, 32);
+        fs3.trash = Some(trash_state(".trash/"));
+        fs3.rebuild_trash_index().await.expect("rebuild");
+        mock3.objects.lock().unwrap().remove("d.txt"); // 模拟 GC 已删原对象
+        let out = fs3.trash_restore("/d.txt", None).await.unwrap();
+        assert_eq!(out, trash::RestoreOutcome::OriginalGone, "竞态走 404 分支");
+        assert!(
+            mock3
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with(".trash/")),
+            "竞态后不留空引用墓碑"
+        );
+    }
+
+    /// GC 目录墓碑 mtime 启发式:last_modified < 墓碑日期 00:00 UTC 的
+    /// 对象被 DeleteObjects 批删、>= 的保留(新数据);report.objects_deleted
+    /// 精确计数;墓碑最后删(原对象批删先于墓碑批删)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_dirs_mtime_heuristic() {
+        let d_old = days_before(31);
+        let lm_before = format!("{}T10:00:00.000Z", days_before(32));
+        let lm_after = format!("{}T10:00:00.000Z", days_before(30));
+        let entries = vec![
+            (format!(".trash/{d_old}/docs/"), true),
+            ("docs/x.txt".into(), false),
+            ("docs/y.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("docs/x.txt", b"x".to_vec());
+        mock.set_object("docs/y.txt", b"y".to_vec());
+        mock.set_last_modified("docs/x.txt", &lm_before); // < D 00:00 UTC → 删
+        mock.set_last_modified("docs/y.txt", &lm_after); // >= D → 保留
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report.dirs_removed, 1, "目录墓碑已处理");
+        assert_eq!(report.objects_deleted, 1, "仅早于墓碑日期的对象被删");
+        assert_eq!(report.tombstones_deleted, 1, "目录墓碑最后删");
+        assert!(!mock.objects.lock().unwrap().contains_key("docs/x.txt"));
+        assert!(
+            mock.objects.lock().unwrap().contains_key("docs/y.txt"),
+            "新数据保留"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with(".trash/")),
+            "目录墓碑已删"
+        );
+        // 墓碑最后删:原对象批删先于墓碑批删
+        let recorded = mock.recorded.lock().unwrap();
+        let batches: Vec<usize> = recorded
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.method == "POST" && r.target.to_lowercase().contains("delete"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(batches.len(), 2, "原对象批删 + 墓碑批删: {recorded:?}");
+        let body0 = String::from_utf8_lossy(&recorded[batches[0]].body);
+        assert!(body0.contains("docs/x.txt"), "第一批删原对象: {body0}");
+        let body1 = String::from_utf8_lossy(&recorded[batches[1]].body);
+        assert!(body1.contains(".trash/"), "第二批删墓碑: {body1}");
+    }
+
+    /// GC 分区过滤:--before 只清严格早于该日期的分区;未来日期墓碑
+    /// 天然跳过(时钟偏快保护)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_partition_filtering() {
+        let d_old = days_before(41); // < cutoff(40 天前)→ 清
+        let d_recent = days_before(39); // >= cutoff → 不清
+        let d_future = days_after(1); // 未来日期 → 跳过
+        let entries = vec![
+            (format!(".trash/{d_old}/a.txt"), false),
+            (format!(".trash/{d_recent}/b.txt"), false),
+            (format!(".trash/{d_future}/c.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("b.txt", b"b".to_vec());
+        mock.set_object("c.txt", b"c".to_vec());
+        for key in [
+            format!(".trash/{d_old}/a.txt"),
+            format!(".trash/{d_recent}/b.txt"),
+            format!(".trash/{d_future}/c.txt"),
+        ] {
+            seed_tombstone(
+                &mock,
+                &key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let before = days_before(40); // cutoff = min(before, today-30) = before
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: Some(before),
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.files_removed, 1, "仅早于 --before 的分区被清");
+        assert!(!mock.objects.lock().unwrap().contains_key("a.txt"));
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "晚于 --before 不清"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("c.txt"),
+            "未来日期墓碑不清"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_recent}/b.txt"))
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_future}/c.txt"))
+        );
+    }
+
+    /// H1 回归:--trash-retention-days 必须被 GC 消费 —— 设 7 天保留期时
+    /// 8 天前墓碑被清(旧实现恒用常量 30 天,8 天前不会清 → 红;设 90 则
+    /// 第 30 天数据即被删,合规场景=数据丢失)、2 天前保留(保留期内边界)、
+    /// 29 天前被清(7 < 默认 30,证明选项确实缩短了保留期)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_uses_configured_retention_days() {
+        let d_8 = days_before(8);
+        let d_2 = days_before(2);
+        let d_29 = days_before(29);
+        let entries = vec![
+            (format!(".trash/{d_8}/a.txt"), false),
+            (format!(".trash/{d_2}/b.txt"), false),
+            (format!(".trash/{d_29}/c.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        for (obj, tomb_key) in [
+            ("a.txt", format!(".trash/{d_8}/a.txt")),
+            ("b.txt", format!(".trash/{d_2}/b.txt")),
+            ("c.txt", format!(".trash/{d_29}/c.txt")),
+        ] {
+            mock.set_object(obj, vec![1]);
+            mock.set_etag(obj, "mock-etag");
+            seed_tombstone(
+                &mock,
+                &tomb_key,
+                &trash::TombstoneBody {
+                    etag: Some("\"mock-etag\"".into()),
+                    size: Some(1),
+                    is_dir: false,
+                },
+            );
+        }
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash::TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
+            Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+            Duration::from_secs(TRASH_GC_INTERVAL_SECS),
+            7, // 保留期 7 天
+        ));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            report.files_removed, 2,
+            "7 天保留期下 8 天前与 29 天前墓碑被清(2 天前保留)"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("a.txt"),
+            "8 天前原对象已删"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("c.txt"),
+            "29 天前原对象已删(7 天保留期短于默认 30)"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("b.txt"),
+            "2 天前原对象保留(保留期内)"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_2}/b.txt")),
+            "2 天前墓碑保留"
+        );
+    }
+
+    /// M2 回归:--read-only 挂载不得触发破坏性 GC —— trash_gc 在只读挂载
+    /// 上必须早退零动作(后台周期 GC 与任何直接调用都不删桶内对象)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_only_mount_never_gc_deletes() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.read_only = true;
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report, trash::GcReport::default(), "只读挂载 GC 必须零动作");
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象未删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑未删"
+        );
+    }
+
+    /// C1 回归:mock PUT 必须按当前时间写 per-key last_modified —— 墓碑
+    /// 目录下 PUT 新对象后直接跑目录 GC 时,新对象不得被判「早于墓碑
+    /// 日期」而误删(旧 mock 对无记录对象缺省 2026-01-01,恒早于一切
+    /// 墓碑日期 → 假红/假绿源)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_dirs_preserves_freshly_written_object() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/docs/"), true)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 墓碑目录下 PUT 新对象(走 fs 写路径 → mock PUT;不显式设
+        // last_modified —— 生产语义:PUT 后 last_modified=now)
+        fs.write("/docs/new.txt", b"fresh").await.unwrap();
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            report.objects_deleted, 0,
+            "新写入对象不得被目录 GC 的 mtime 启发式误删"
+        );
+        assert!(
+            mock.objects.lock().unwrap().contains_key("docs/new.txt"),
+            "新对象必须存活"
+        );
+    }
+
+    /// L1 回归:dry-run 只跳过 S3 DELETE,不改变任何状态 —— 索引 remove
+    /// 与 invalidate_key 必须门控 !dry_run(dry-run 契约:判定照做、删除
+    /// 不落、状态不变;否则未来挂载进程内复用 dry-run 会错误解除墓碑
+    /// 隐藏并清缓存)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_gc_dry_run_keeps_index_untouched() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let state = fs.trash.clone().unwrap();
+        assert!(
+            state.index.read().unwrap().is_covered("a.txt"),
+            "前置:索引含墓碑"
+        );
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.files_removed, 1, "dry-run 仍完成 etag 判定");
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象未删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑未删"
+        );
+        assert!(
+            state.index.read().unwrap().is_covered("a.txt"),
+            "dry-run 不得改变索引状态(L1)"
+        );
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            1,
+            "dry-run 后索引条目必须保留"
+        );
+    }
+
+    /// L5 回归:GC 读到并发 restore 已删的墓碑(404)必须跳过该墓碑,绝不
+    /// 动原对象 —— 旧实现把 404 的空 body 当「无 etag」按 matched 处理,
+    /// 恢复成功瞬间原对象又被 GC 永久删除(规格 4.4 风险 2 的窗口被
+    /// 放大为 GET 之后任意时点)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_skips_tombstone_deleted_by_concurrent_restore() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 模拟并发 restore 已删墓碑(索引未动 —— 同进程双任务竞态)
+        mock.objects
+            .lock()
+            .unwrap()
+            .remove(&format!(".trash/{d_old}/a.txt"));
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report.files_removed, 0, "404 墓碑不得删除原对象(L5)");
+        assert_eq!(report.files_skipped_etag, 0);
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象必须存活"
+        );
+    }
+
+    /// L2 回归:trash_restore 入口持一个 permit 覆盖 find_tombstone 之后
+    /// 的 HEAD/GET/DELETE —— 并发上限=1 下必须仍能完成(delete_tombstone
+    /// 改「调用方已持 permit」后,二次 acquire 会造成饱和池死锁,本测试
+    /// 钉死该不变量)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_restore_works_with_single_permit() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 1); // max_concurrent_requests = 1
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("软删");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            },
+            "单 permit 下 restore 必须完成且不二次 acquire 死锁(L2)"
+        );
+        assert!(fs.stat("/a.txt").await.unwrap().is_some(), "恢复后可见");
+    }
+
+    /// L4:trash_gc(非 dry-run)完成后代际必须推进,dry-run 不推进 ——
+    /// refresh/rebuild 凭代际丢弃陈旧快照(apply_added_discards 测试
+    /// 在 trash.rs 钉机制,这里是 GC 侧的代际推进钉)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_gc_bumps_generation_but_dry_run_does_not() {
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let state = fs.trash.clone().unwrap();
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let gen0 = state.generation.load(Ordering::SeqCst);
+        fs.trash_gc(trash::GcOptions {
+            before: None,
+            dry_run: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.generation.load(Ordering::SeqCst),
+            gen0,
+            "dry-run 零状态变更,不推进代际"
+        );
+        fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            state.generation.load(Ordering::SeqCst),
+            gen0 + 1,
+            "GC 完成后代际推进(L4)"
+        );
+    }
+
+    /// trash-clean --dry-run:判定照做(HEAD/GET/list),删除动作全部跳过
+    /// —— 原对象与墓碑都在,report 计数反映「将删除」。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_gc_dry_run_reports_without_deleting() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.files_removed, 1, "dry-run 仍完成 etag 判定");
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象未删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑未删"
+        );
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            !recorded.iter().any(|r| {
+                r.method == "DELETE"
+                    || (r.method == "POST" && r.target.to_lowercase().contains("delete"))
+            }),
+            "dry-run 不发任何删除请求"
+        );
+    }
+
+    /// trash-list 输出:多分区、目录尾 '/'、etag/size 列(文件墓碑 GET
+    /// body 解析);--json 形态逐条 NDJSON 可解析回 TrashEntry。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_list_output() {
+        let d1 = days_before(31);
+        let d2 = days_before(29);
+        let entries = vec![
+            (format!(".trash/{d1}/a.txt"), false),
+            (format!(".trash/{d1}/docs/"), true),
+            (format!(".trash/{d2}/b.txt"), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d1}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"e1\"".into()),
+                size: Some(5),
+                is_dir: false,
+            },
+        );
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d2}/b.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"e2\"".into()),
+                size: Some(7),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let mut got: Vec<trash::TrashEntry> = Vec::new();
+        fs.trash_list(|page| {
+            got.extend(page);
+            Ok(())
+        })
+        .await
+        .expect("trash-list");
+        assert_eq!(got.len(), 3, "三条墓碑: {got:?}");
+        got.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(got[0].path, "a.txt");
+        assert_eq!(got[0].deleted_date, d1);
+        assert_eq!(got[0].etag.as_deref(), Some("\"e1\""), "文件墓碑 etag 列");
+        assert_eq!(got[0].size, Some(5));
+        assert!(!got[0].is_dir);
+        assert_eq!(got[1].path, "b.txt");
+        assert_eq!(got[1].deleted_date, d2);
+        assert_eq!(got[1].etag.as_deref(), Some("\"e2\""));
+        assert_eq!(got[1].size, Some(7));
+        assert_eq!(got[2].path, "docs/", "目录 path 带尾斜杠");
+        assert!(got[2].is_dir);
+        assert!(
+            got[2].etag.is_none() && got[2].size.is_none(),
+            "目录墓碑无 etag/size"
+        );
+        // --json 形态:逐条 NDJSON 可解析
+        let json = serde_json::to_string(&got[0]).unwrap();
+        let back: trash::TrashEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, got[0]);
     }
 }
 

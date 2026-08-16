@@ -44,10 +44,26 @@ while the original object stays in the bucket. The mount filters tombstoned
 keys out of `list`/`stat`, so deleted paths disappear from the drive view
 without any extra remote requests. Restore = delete the tombstone; real space
 reclamation = GC purging expired tombstones and their original objects
-(default retention: 30 days; management commands and GC scheduling land in
-the same release). `--no-trash` restores the previous immediate
-permanent-delete behavior; `--trash-dir NAME` (default `.trash`) selects the
-tombstone prefix.
+(default retention: 30 days, `--trash-retention-days N` to override). GC runs
+at mount time, then every `--trash-gc-interval-secs` (default 86400 = 24 h),
+and on demand via `ossmount trash-clean`. `--no-trash` restores the previous
+immediate permanent-delete behavior; `--trash-dir NAME` (default `.trash`)
+selects the tombstone prefix.
+
+Management commands (they share the mount connection arguments
+`--bucket`/`--endpoint`/`--region`/...):
+
+- `ossmount trash-list [--json]` — list tombstones: UTC deletion date,
+  original path, etag, size (`--json` for machine-readable output).
+- `ossmount trash-restore <path>` — restore by deleting the tombstone. The
+  original object is HEAD-checked first: if it no longer exists (already
+  GC'd) restore fails with exit 1; if its etag differs from the tombstone,
+  restore proceeds with a warning that the content was modified elsewhere.
+- `ossmount trash-clean [--before YYYY-MM-DD] [--dry-run]` — run GC on
+  demand: purge expired tombstones and their original objects (only when the
+  etag still matches; mismatches are skipped and counted as
+  `trash_gc_etag_skips`). `--before` sets an earlier cutoff than the default
+  retention period; `--dry-run` reports without deleting.
 
 The default soft-delete semantics deliberately deviate from POSIX and are
 documented here:

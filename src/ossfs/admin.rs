@@ -114,6 +114,8 @@ fn format_prometheus(s: &MetricsSnapshot) -> String {
         ("ossfs_prefetch_failed_total", s.prefetch_failed),
         ("ossfs_list_throttled_total", s.list_throttled),
         ("ossfs_crc64_mismatches_total", s.crc64_mismatches),
+        ("ossfs_trash_index_entries", s.trash_index_entries as u64),
+        ("ossfs_trash_gc_etag_skips_total", s.trash_gc_etag_skips),
     ] {
         out.push_str(&format!("{name} {value}\n"));
     }
@@ -258,15 +260,24 @@ mod tests {
             list_throttled: 13,
             crc64_mismatches: 8,
             trash_tombstones_written: 0,
-            trash_index_entries: 0,
+            trash_index_entries: 42,
             trash_refresh_incrementals: 0,
             trash_refresh_rebuilds: 0,
             trash_refresh_errors: 0,
             trash_start_after_ignored: 0,
             trash_bootstrap_failures: 0,
+            trash_gc_etag_skips: 7,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
+        assert!(
+            body.contains("ossfs_trash_index_entries 42\n"),
+            "gauge 无 _total 后缀:got {body}"
+        );
+        assert!(
+            body.contains("ossfs_trash_gc_etag_skips_total 7\n"),
+            "counter 带 _total 后缀:got {body}"
+        );
         assert!(body.contains("ossfs_avg_upload_bytes 24.60\n"));
         assert!(body.contains("ossfs_avg_download_bytes 152.00\n"));
         assert!(body.contains("ossfs_stat_cache_hit_ratio 0.5833\n"));
