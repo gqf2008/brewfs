@@ -17,6 +17,7 @@
 //! [`crate::ossfs::winfsp`] (Windows only) and [`crate::ossfs::fuse`] (macOS/Linux).
 
 pub mod admin;
+pub mod trash;
 
 #[cfg(all(not(windows), feature = "fuse"))]
 pub mod fuse;
@@ -36,10 +37,21 @@ use aws_smithy_runtime_api::client::interceptors::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+
+/// Remote trash refresh mode (唯一定义在本模块;单元 3 起启用 eager)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrashRefreshMode {
+    /// 周期刷新(默认):本端删除即时隐藏,远端变更 ≤ 刷新周期感知。
+    #[default]
+    Lazy,
+    /// 每次 list/stat 前先增量刷一遍 `.trash`,窗口缩到 OSS 最终一致量级,
+    /// 代价是枚举类请求的远程成本翻倍。
+    Eager,
+}
 
 /// S3-compatible object store configuration.
 #[derive(Debug, Clone)]
@@ -192,6 +204,20 @@ pub struct OssConfig {
     pub stat_cache_ttl_secs: u64,
     /// Maximum positive-stat cache entries (default 4096).
     pub stat_cache_max_entries: usize,
+    /// Trash (soft delete) directory name relative to the namespace root.
+    /// `Some(".trash")` enables the trash; `None` disables it (hard delete).
+    /// The CLI defaults to `Some`; the library API to `None` — `normalize`
+    /// never fills it, so the gate is never overridden by defaulting.
+    pub trash_dir: Option<String>,
+    /// Retention days before the GC may clear a tombstone (unit 4 lands the
+    /// default; `None` = unset for now).
+    pub trash_retention_days: Option<u32>,
+    /// Remote trash refresh interval in seconds (unit 3 lands the default).
+    pub trash_refresh_interval_secs: Option<u64>,
+    /// `Lazy` (default) | `Eager` remote trash refresh (unit 3 enables eager).
+    pub trash_refresh_mode: Option<TrashRefreshMode>,
+    /// GC interval in seconds (unit 4 lands the default).
+    pub trash_gc_interval_secs: Option<u64>,
 }
 
 /// POSIX ownership / permission defaults applied to every object by the FUSE
@@ -439,6 +465,14 @@ impl OssConfig {
             // first attempt already distinguishes those from a dead link.
             self.retries = Some(1);
         }
+        // Trash refresh scheduling defaults (C4b: 阈值默认值随消费单元落地,
+        // 此处只填 refresh/mode —— trash_dir 绝不填,None = 回收站关闭)。
+        if self.trash_refresh_interval_secs.is_none() {
+            self.trash_refresh_interval_secs = Some(TRASH_REFRESH_INTERVAL_SECS);
+        }
+        if self.trash_refresh_mode.is_none() {
+            self.trash_refresh_mode = Some(TrashRefreshMode::Lazy);
+        }
         self
     }
 }
@@ -531,6 +565,17 @@ const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 const MULTIPART_COPY_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
 /// DeleteObjects batches at most this many keys per request (#60).
 const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1000;
+/// 回收站(soft delete)增量刷新周期秒:lazy 模式下本端感知远端删除的
+/// 延迟上界(规格 C5 阈值,独立 commit 落地 + 断言防漂移;变更必须独立
+/// commit 写明新旧值与理由)。
+pub const TRASH_REFRESH_INTERVAL_SECS: u64 = 30;
+/// 回收站全量重建周期秒:兜底「被恢复 / 被 GC 移除的墓碑」—— 增量游标
+/// 只增不减,全量重建 diff 解决索引只增不减的问题(规格 C5 阈值,同上)。
+pub const TRASH_REBUILD_INTERVAL_SECS: u64 = 600;
+/// 回收站索引条目数告警阈值:超过此值 → 仅 warn、行为不变(full_rebuild
+/// 的 diff 内存尖峰可见,缓解手段是 GC/trash-clean,见裁决 #6)。
+/// 规格 C5 新阈值落地(无旧值);变更必须独立 commit 写明新旧值与理由。
+pub const TRASH_INDEX_ALERT_THRESHOLD: usize = 500_000;
 /// Part size for multipart uploads (>= 5 MiB required by AWS; Aliyun OSS
 /// allows >= 100 KiB, so 8 MiB is safe for both).
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -1283,6 +1328,12 @@ pub struct Metrics {
     prefetch_failed: AtomicU64,
     list_throttled: AtomicU64,
     crc64_mismatches: AtomicU64,
+    trash_tombstones_written: AtomicU64,
+    trash_refresh_incrementals: AtomicU64,
+    trash_refresh_rebuilds: AtomicU64,
+    trash_refresh_errors: AtomicU64,
+    trash_start_after_ignored: AtomicU64,
+    trash_bootstrap_failures: AtomicU64,
 }
 
 /// Point-in-time snapshot of [`Metrics`] counters.
@@ -1317,6 +1368,19 @@ pub struct MetricsSnapshot {
     pub prefetch_failed: u64,
     pub list_throttled: u64,
     pub crc64_mismatches: u64,
+    pub trash_tombstones_written: u64,
+    /// 回收站索引条目数 gauge(TrashState.index_entries 注入,prefetch_inflight 先例)。
+    pub trash_index_entries: usize,
+    /// 增量拉取完成次数(§0.3)。
+    pub trash_refresh_incrementals: u64,
+    /// 全量重建完成次数(含 start-after 降级,§0.3)。
+    pub trash_refresh_rebuilds: u64,
+    /// 刷新/重建失败次数(§0.3)。
+    pub trash_refresh_errors: u64,
+    /// start-after 探测判定被忽略次数(§0.3)。
+    pub trash_start_after_ignored: u64,
+    /// 挂载时 bootstrap 失败次数(§0.3)。
+    pub trash_bootstrap_failures: u64,
 }
 
 impl Metrics {
@@ -1351,6 +1415,13 @@ impl Metrics {
             prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
             list_throttled: self.list_throttled.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
+            trash_tombstones_written: self.trash_tombstones_written.load(Ordering::Relaxed),
+            trash_index_entries: 0, // gauge 由 metrics() 注入(TrashState.index_entries)
+            trash_refresh_incrementals: self.trash_refresh_incrementals.load(Ordering::Relaxed),
+            trash_refresh_rebuilds: self.trash_refresh_rebuilds.load(Ordering::Relaxed),
+            trash_refresh_errors: self.trash_refresh_errors.load(Ordering::Relaxed),
+            trash_start_after_ignored: self.trash_start_after_ignored.load(Ordering::Relaxed),
+            trash_bootstrap_failures: self.trash_bootstrap_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -1717,6 +1788,11 @@ pub struct ObjectFs {
     stats: Mutex<HashMap<String, (Instant, DirEntry)>>,
     /// Negative stat cache: path -> cached_at (path known missing).
     negative: Mutex<HashMap<String, Instant>>,
+    /// Trash (soft-delete) index; `None` = trash disabled (hard delete).
+    trash: Option<Arc<trash::TrashState>>,
+    /// 回收站后台刷新循环已启动标记(挂载钩子调用 trash_refresh_start 的
+    /// 防重入;compare_exchange/swap 语义,重复调用 no-op)。
+    trash_refresh_started: AtomicBool,
     /// Bounds in-flight S3 requests (see [`MAX_CONCURRENT_S3_REQUESTS`]).
     limiter: Arc<Semaphore>,
     /// Optional directory-enumeration rate limiter (see [OssConfig::list_rate_limit]).
@@ -1788,6 +1864,35 @@ pub struct ObjectFs {
     operation_timeout: std::time::Duration,
 }
 
+/// Build the trash state from config: `trash_dir` is a single path segment
+/// (rejecting empty / '/' / '.' / '..'), and the tombstone prefix is
+/// `{prefix}{trash_dir}/` (`prefix` is normalized to end with '/'; an empty
+/// prefix yields `.trash/`). `None` → trash disabled, no state.
+/// 启动重建(rebuild_trash_index)不在此处 spawn —— 由挂载钩子在单元 3 落地
+/// (connect 内无 Arc<ObjectFs>,后台任务无法 invalidate 缓存)。
+fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>>> {
+    let Some(dir) = &config.trash_dir else {
+        return Ok(None);
+    };
+    if dir.is_empty() || dir.contains('/') || dir == "." || dir == ".." {
+        anyhow::bail!("trash-dir must be a single path segment (no '/', '.' or '..'): got `{dir}`");
+    }
+    // 调度字段读 normalized config(常量兜底;normalize 已填默认值,双保险)。
+    let mode = config.trash_refresh_mode.unwrap_or(TrashRefreshMode::Lazy);
+    let refresh_interval = Duration::from_secs(
+        config
+            .trash_refresh_interval_secs
+            .unwrap_or(TRASH_REFRESH_INTERVAL_SECS),
+    );
+    let rebuild_interval = Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS);
+    Ok(Some(trash::TrashState::new(
+        format!("{}{}/", config.prefix, dir),
+        mode,
+        refresh_interval,
+        rebuild_interval,
+    )))
+}
+
 impl ObjectFs {
     /// Build the S3 client from environment credentials
     /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or the shared config
@@ -1838,6 +1943,8 @@ impl ObjectFs {
         let read_ahead_window = config.read_ahead_bytes.unwrap_or(0);
         let ignore_fsync = config.ignore_fsync;
         let dirty_budget = DirtyBudget::new(max_dirty_bytes.unwrap_or(0));
+        // 回收站状态必须在 struct 字面量之前构建(config 字段随后被 move)。
+        let trash = build_trash_state(&config)?;
         let disk_cache = match &config.disk_cache_dir {
             Some(dir) if config.disk_cache_max_bytes > 0 => Some(Arc::new(DiskCache::new(
                 dir.clone(),
@@ -1911,6 +2018,8 @@ impl ObjectFs {
             operation_timeout: std::time::Duration::from_secs(
                 configured_readwrite.unwrap_or(DEFAULT_READWRITE_TIMEOUT_SECS),
             ),
+            trash,
+            trash_refresh_started: AtomicBool::new(false),
         };
         // Fail fast on a missing bucket: every later request would 404, which
         // is indistinguishable from "empty bucket" and would surface as a
@@ -1960,6 +2069,11 @@ impl ObjectFs {
     pub fn metrics(&self) -> MetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
         snapshot.prefetch_inflight = self.prefetch_inflight.lock().unwrap().len();
+        // gauge 注入:TrashState 持计数(prefetch_inflight 先例),None → 0。
+        snapshot.trash_index_entries = self
+            .trash
+            .as_ref()
+            .map_or(0, |t| t.index_entries.load(Ordering::Relaxed) as usize);
         snapshot
     }
 
@@ -2067,6 +2181,166 @@ impl ObjectFs {
         }
     }
 
+    /// 统一过滤入口(私有,同步,不 await)。None 时只多一次判空 → 零行为变化。
+    /// .trash 自隐藏双形态:`key.starts_with(prefix)` 覆盖 ".trash/..." 与根 list 的
+    /// common_prefix;`key == prefix.trim_end_matches('/')` 覆盖 stat("/.trash") 的裸 key
+    /// 形态(否则经 marker HEAD 复活)。尾斜杠边界保证 ".trashx" 不误伤。
+    fn hidden_key(&self, key: &str) -> bool {
+        let Some(trash) = &self.trash else {
+            return false;
+        };
+        let p = trash.prefix.as_str();
+        if key.starts_with(p) || key == p.trim_end_matches('/') {
+            return true;
+        }
+        trash.index.read().unwrap().is_covered(key)
+    }
+
+    /// 分页过滤专用(裁决 #12):调用方持**每页一次**读锁快照,本方法不再
+    /// 取锁。语义与 [`Self::hidden_key`] 相同(.trash 自隐藏双形态 + 索引
+    /// 覆盖);前提是过滤循环内无 await —— 见 `list_impl` 快照注释。
+    fn hidden_key_with(&self, snapshot: &trash::TombstoneIndex, key: &str) -> bool {
+        let Some(trash) = &self.trash else {
+            return false;
+        };
+        let p = trash.prefix.as_str();
+        key.starts_with(p) || key == p.trim_end_matches('/') || snapshot.is_covered(key)
+    }
+
+    /// 挂载启动全量建索引(回收站开启时由 [`Self::trash_bootstrap`] 转发
+    /// —— 契约 C7,裁决 #11):全量列表统一走 `trash::fetch_all_tombstones`
+    /// (bootstrap/全量重建共用,消除三处全量逻辑并存);离线构建新集合、
+    /// 短写锁整体换入(遍历期间不持写锁,否则刷新/GC 与挂载 list 相互
+    /// 饿死);推进增量游标与全量重建时刻(bootstrap 即一次全量重建);
+    /// 末尾全清 stat/negative 缓存;全程持一个 limiter permit(并发上限
+    /// 不可回归)。返回条目数(测试/指标用)。
+    pub(crate) async fn rebuild_trash_index(&self) -> Result<usize> {
+        let Some(trash) = &self.trash else {
+            return Ok(0);
+        };
+        let _permit = self.acquire().await?;
+        let (index, last_key) = trash::fetch_all_tombstones(self, trash).await?;
+        let count = index.len();
+        // 短写锁整体换入:离线构建期间读路径继续用旧索引
+        *trash.index.write().unwrap() = index;
+        // gauge 统一落点(裁决 #6/#9):整体换入后刷新条目数 + 超阈值告警
+        trash.store_index_entries(trash.index.read().unwrap().len());
+        *trash.cursor.lock().unwrap() = last_key;
+        *trash.last_full_rebuild.lock().unwrap() = Instant::now();
+        self.stats.lock().unwrap().clear();
+        self.negative.lock().unwrap().clear();
+        Ok(count)
+    }
+
+    /// 索引变更后的缓存失效接缝(单元 2 的调用点;本单元由其测试驱动):
+    /// 内部:key_for → index.write().insert → gauge 同步(裁决 #9:测试
+    /// 用 trash_insert 建索引后断言 trash_index_entries 此前会得 0)→
+    /// 失效目标路径(目录墓碑额外按 `path.trim_end_matches('/') + "/"`
+    /// 前缀扫掉 stats/negative 后代条目,有界 map ≤4096 一次扫描可忽略)。
+    /// 同步,不 await。仅测试驱动(生产写入路径走 TrashState 方法)。
+    pub(crate) fn trash_insert(&self, path: &str, is_dir: bool) {
+        let Some(trash) = &self.trash else {
+            return;
+        };
+        let key = self.key_for(path);
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert(&key, is_dir);
+            trash.store_index_entries(idx.len());
+        }
+        self.invalidate_trash_cached(path, is_dir);
+    }
+
+    /// 墓碑索引变更的缓存失效:精确路径 + 目录后代前缀扫描。
+    fn invalidate_trash_cached(&self, path: &str, is_dir: bool) {
+        self.invalidate_stat(path);
+        if is_dir {
+            let dir = format!("{}/", path.trim_end_matches('/'));
+            self.stats
+                .lock()
+                .unwrap()
+                .retain(|p, _| !p.starts_with(&dir));
+            self.negative
+                .lock()
+                .unwrap()
+                .retain(|p, _| !p.starts_with(&dir));
+        }
+    }
+
+    /// 回收站是否开启(挂载钩子 / 管理命令门控)。
+    pub fn trash_enabled(&self) -> bool {
+        self.trash.is_some()
+    }
+
+    /// 挂载启动全量建索引:转发 [`Self::rebuild_trash_index`](契约 C7,
+    /// 裁决 #11 —— 内部即全量重建 + 游标/全量周期推进 + 缓存清空,
+    /// permit 由其内部持有,此处不重复 acquire)。失败仅 warn +
+    /// trash_bootstrap_failures,**不阻塞挂载** —— 索引空则已删文件短暂
+    /// 可见,周期刷新自愈(warn + continue,无重试)。
+    pub async fn trash_bootstrap(&self) -> Result<()> {
+        if self.trash.is_none() {
+            return Ok(());
+        }
+        if let Err(e) = self.rebuild_trash_index().await {
+            self.metrics
+                .trash_bootstrap_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "trash bootstrap failed; 周期刷新将自愈");
+        }
+        Ok(())
+    }
+
+    /// 启动后台刷新循环:trash 开启且未启动(AtomicBool swap 防重入)时
+    /// `tokio::spawn(refresh_loop)`;重复调用 no-op。挂载钩子
+    /// (fuse.rs / winfsp.rs fail-fast 后)调用;循环与既有目录刷新任务
+    /// 同生命周期(随进程退出)。
+    pub fn trash_refresh_start(self: &Arc<Self>) {
+        if self.trash.is_none() || self.trash_refresh_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tokio::spawn(Self::refresh_loop(Arc::clone(self)));
+    }
+
+    /// 一轮调度(测试与 refresh_loop 共用):距上次全量 >= rebuild_interval
+    /// → 全量重建 diff,否则 start-after 游标增量。全程持一个 limiter
+    /// permit(并发上限不可回归);失败 → trash_refresh_errors +1 后原样
+    /// 返回 Err(上层循环仅 warn,下一轮重试)。
+    pub async fn trash_refresh_once(&self) -> Result<()> {
+        let Some(trash) = &self.trash else {
+            return Ok(());
+        };
+        let _permit = self.acquire().await?;
+        match trash.refresh_once(self).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.metrics
+                    .trash_refresh_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// 后台周期刷新:interval(refresh_interval)循环,MissedTickBehavior::Skip,
+    /// 首 tick 消费(挂载启动已 bootstrap);每轮 refresh_once,错误仅
+    /// warn + trash_refresh_errors(下一轮重试,不 panic)。
+    async fn refresh_loop(fs: Arc<ObjectFs>) {
+        let Some(trash) = &fs.trash else {
+            return;
+        };
+        let mut interval = tokio::time::interval(trash.refresh_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 首 tick 立即触发;消费掉,第一次刷新等一个完整周期
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            // 失败计数已在 trash_refresh_once 内完成;此处仅 warn,下一轮重试
+            if let Err(e) = fs.trash_refresh_once().await {
+                tracing::warn!(error = %e, "trash refresh failed; will retry next cycle");
+            }
+        }
+    }
+
     /// List the immediate children of `dir`.
     pub async fn list(&self, dir: &str) -> Result<Vec<DirEntry>> {
         self.acquire_list_permit().await;
@@ -2086,6 +2360,12 @@ impl ObjectFs {
     }
 
     async fn list_impl(&self, dir: &str) -> Result<Vec<DirEntry>> {
+        // eager 挂点:仅 eager 档生效(lazy 零开销);放过滤之前 —— 先拉后滤,
+        // 远端新墓碑当轮即隐藏。不 acquire permit(调用方 list() 已持,
+        // 饱和池二次 acquire 会死锁;poll_inflight 天然限 1)。
+        if let Some(trash) = &self.trash {
+            trash.poll_incremental_eager(self).await;
+        }
         self.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
         let prefix = self.list_prefix(dir);
         let mut out = Vec::new();
@@ -2108,8 +2388,21 @@ impl ObjectFs {
                     return Err(e).context("s3 list");
                 }
             };
+            // 回收站过滤(裁决 #12):每页一次读锁快照包整页两个过滤循环
+            // —— 10 万条目页面由逐条目 10 万次锁往返降为每页 1 次(读锁
+            // 与增量刷新写锁互斥,锁往返是热路径常数因子)。快照只覆盖
+            // 本页循环:循环内无 await(纯内存比较、零远程),读守卫不得
+            // 跨 await 存活(阻塞写者且使 future !Send),随页释放。
+            let snapshot = self.trash.as_ref().map(|t| t.index.read().unwrap());
             for cp in resp.common_prefixes() {
                 if let Some(p) = cp.prefix() {
+                    if let Some(snap) = &snapshot {
+                        // 目录墓碑覆盖的 common_prefix 一并跳过;在分页
+                        // 循环内过滤,continuation token 不受影响。
+                        if self.hidden_key_with(snap, p) {
+                            continue;
+                        }
+                    }
                     let name = p
                         .strip_prefix(&prefix)
                         .unwrap_or(p)
@@ -2131,6 +2424,13 @@ impl ObjectFs {
                 if key == prefix {
                     continue;
                 }
+                if let Some(snap) = &snapshot {
+                    // 回收站过滤:marker 跳过之后、裁剪之前 —— 隐藏 key
+                    // 免一次裁剪分配。
+                    if self.hidden_key_with(snap, key) {
+                        continue;
+                    }
+                }
                 let Some(name) = key.strip_prefix(&prefix) else {
                     continue;
                 };
@@ -2147,6 +2447,7 @@ impl ObjectFs {
                     mtime_secs: obj.last_modified().map(|d| d.secs()).unwrap_or(0),
                 });
             }
+            drop(snapshot);
             match next_page_token(&resp)? {
                 Some(tok) => token = Some(tok),
                 None => break,
@@ -2238,6 +2539,10 @@ impl ObjectFs {
     /// HEAD, then prefix probe as a last resort). Caller must hold a limiter
     /// permit.
     async fn stat_uncached_impl(&self, path: &str) -> Result<Option<DirEntry>> {
+        // eager 挂点(与 list_impl 同理由):放过滤之前,先拉后滤。
+        if let Some(trash) = &self.trash {
+            trash.poll_incremental_eager(self).await;
+        }
         if path == "/" {
             return Ok(Some(DirEntry {
                 name: String::new(),
@@ -2246,11 +2551,16 @@ impl ObjectFs {
                 mtime_secs: 0,
             }));
         }
+        // 回收站过滤:根路径守卫之后、HEAD 计数之前 —— 被删路径的 stat
+        // 零远程请求(head 都不发);None 经 `stat()` 走 negative 缓存。
+        let key = self.key_for(path);
+        if self.hidden_key(&key) {
+            return Ok(None);
+        }
         // One request counted per request actually issued below: the initial
         // HEAD, plus the marker HEAD / prefix probe on the miss path.
         self.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
         self.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
-        let key = self.key_for(path);
         match self
             .client
             .head_object()
@@ -2768,11 +3078,22 @@ impl ObjectFs {
         self.invalidate_read_cache(path);
         let _budget = self.acquire_upload_budget(data.len()).await?;
         if data.len() as u64 > MULTIPART_THRESHOLD {
-            self.write_multipart(path, data).await
+            self.write_multipart(path, data).await?;
         } else {
             let _permit = self.acquire().await?;
-            self.put_whole_object(path, data).await
+            self.put_whole_object(path, data).await?;
         }
+        // 清墓碑挂点(C9 裁决):FUSE create / WinFsp create 均收敛到
+        // write() —— 同名重建 = 覆盖语义。清墓碑在提交写之后(裁决 #3):
+        // PUT 失败 → 墓碑保留(软删除不被静默撤销,已删文件不复活);
+        // 清墓碑失败 → Err,重试自愈。未覆盖时零远程请求(性能守卫)。
+        // 双形态门控(F1):rmdir /e 后再写文件 /e —— 目录墓碑 e/ 前缀
+        // 覆盖新文件 key,只清文件形态会静默不可见;此处 is_covered
+        // 裸 key 门控 + 文件/目录两形态一并清除。
+        if let Some(trash) = &self.trash {
+            trash.clear_tombstones_if_covered(self, path).await?;
+        }
+        Ok(())
     }
 
     async fn put_whole_object(&self, path: &str, data: &[u8]) -> Result<()> {
@@ -2977,12 +3298,20 @@ impl ObjectFs {
         self.invalidate_read_cache(path);
         let _budget = self.acquire_upload_budget(size as usize).await?;
         if size > MULTIPART_THRESHOLD {
-            self.write_multipart_from_file(path, src, size).await
+            self.write_multipart_from_file(path, src, size).await?;
         } else {
             let data = tokio::fs::read(src).await.context("read spool file")?;
             let _permit = self.acquire().await?;
-            self.put_whole_object(path, &data).await
+            self.put_whole_object(path, &data).await?;
         }
+        // 清墓碑挂点(C9 裁决修正):WinFsp overwrite 回调经
+        // write_from_file()(winfsp.rs:518),是独立方法不走 write() ——
+        // 与 write() 共享同一语义(同名重建清墓碑,且清墓碑在提交写之后,
+        // 裁决 #3:写失败时墓碑保留)。双形态门控同 write()(F1)。
+        if let Some(trash) = &self.trash {
+            trash.clear_tombstones_if_covered(self, path).await?;
+        }
+        Ok(())
     }
 
     /// Multipart upload reading part chunks directly from `src`, bounded by
@@ -3215,7 +3544,17 @@ impl ObjectFs {
         } else {
             format!("{path}/")
         };
-        self.write(&dir, &[]).await
+        // marker 写提交在前,清墓碑在后(裁决 #3 / F2):marker 写失败 →
+        // 墓碑保留,软删除不被静默撤销(修复前:先清墓碑再写 marker,
+        // 写失败后已删目录复活、trash 追踪丢失)。清双形态(F1):unlink
+        // /e 后再 mkdir /e 的文件墓碑同样被清 —— stat("/e") 立即可用。
+        // write() 内部挂点已对目录 key 清过一次,此处门控 false 即零远程
+        // (幂等,双保险)。
+        self.write(&dir, &[]).await?;
+        if let Some(trash) = &self.trash {
+            trash.clear_tombstones_if_covered(self, path).await?;
+        }
+        Ok(())
     }
 
     /// Delete a single object.
@@ -3225,6 +3564,11 @@ impl ObjectFs {
             // `key_for("/")` is empty; a DELETE against the bucket URL would
             // attempt to delete the bucket itself (#60).
             anyhow::bail!("cannot delete the mount root /");
+        }
+        // 回收站开启 → 软删除:HEAD 原对象 + 写墓碑,原对象不删
+        // (soft_delete_file 内部 acquire 一个 permit,镜像 delete)。
+        if let Some(trash) = &self.trash {
+            return trash.soft_delete_file(self, path).await;
         }
         let _permit = self.acquire().await?;
         self.delete_impl(path).await
@@ -3255,6 +3599,11 @@ impl ObjectFs {
     /// Recursively delete a directory tree (objects under the dir prefix).
     pub async fn delete_dir_recursive(&self, dir: &str) -> Result<()> {
         self.ensure_writable()?;
+        // 回收站开启 → 目录软删:只写一个目录墓碑,不枚举、不 DeleteObjects,
+        // 子树由前缀覆盖隐藏(soft_delete_dir 内部 acquire 一个 permit)。
+        if let Some(trash) = &self.trash {
+            return trash.soft_delete_dir(self, dir).await;
+        }
         let _permit = self.acquire().await?;
         self.delete_dir_recursive_impl(dir).await
     }
@@ -3362,12 +3711,23 @@ impl ObjectFs {
         if new.starts_with(&format!("{old}/")) || old.starts_with(&format!("{new}/")) {
             anyhow::bail!("rename: cannot move a path into its own subtree");
         }
+
+        let old_key = self.key_for(old);
+        let new_key = self.key_for(new);
+
+        // (a) 源被墓碑覆盖 → 拒绝。stat 已被 hidden_key 过滤返回 None,
+        // 不拦会被当"不存在"走 copy —— 隐藏对象被搬出 = 数据泄漏。
+        // is_covered 双形态覆盖文件精确与目录前缀两种情况。
+        if let Some(trash) = &self.trash {
+            if trash.index.read().unwrap().is_covered(&old_key) {
+                anyhow::bail!("rename: source path is in the trash");
+            }
+        }
+
         if !replace_if_exists && self.stat_uncached_impl(new).await?.is_some() {
             anyhow::bail!("rename: target already exists");
         }
 
-        let old_key = self.key_for(old);
-        let new_key = self.key_for(new);
         let source = s3_copy_source(&self.bucket, &old_key);
 
         // Determine directory-ness from S3 instead of assuming a trailing
@@ -3378,6 +3738,9 @@ impl ObjectFs {
         let is_dir = stat.as_ref().map(|e| e.is_dir).unwrap_or(false);
         let size = stat.map(|e| e.size).unwrap_or(0);
 
+        // (0) 目录 rename 的全部失败检查前移到清墓碑之前(裁决 #3):
+        // 超限检查失败时目标墓碑必须原样保留 —— 修复前「先清墓碑再
+        // count」,超限 bail 后已删目录子树永久复活、trash 追踪丢失。
         if is_dir {
             if !self.allow_rename_dir {
                 anyhow::bail!("directory rename is disabled");
@@ -3390,8 +3753,18 @@ impl ObjectFs {
                     );
                 }
             }
+        }
+
+        if is_dir {
             // Directory: copy the marker + every child recursively.
             self.copy_tree(&old_key, &new_key).await?;
+            // (b) 目标被墓碑覆盖 → copy 成功后清墓碑(rename = 覆盖语义)。
+            // 清墓碑在 copy 之后(裁决 #3):copy 失败 → 墓碑保留(软删除
+            // 不被静默撤销);清墓碑失败 → rename 失败,重试自愈。清双形态
+            // (F1):unlink /e 后 rename 目录到 /e 的文件墓碑同样被清。
+            if let Some(trash) = &self.trash {
+                trash.clear_target_tombstones(self, &new_key).await?;
+            }
             self.delete_dir_recursive_impl(old).await
         } else {
             if size >= MULTIPART_COPY_THRESHOLD {
@@ -3409,6 +3782,11 @@ impl ObjectFs {
                     copy = copy.storage_class(sc.clone());
                 }
                 copy.send().await.context("s3 copy")?;
+            }
+            // (b) 文件目标:copy 成功后清墓碑(与目录分支同语义,裁决 #3;
+            // 双形态 F1:rmdir /e 后 rename 文件到 /e 的目录墓碑被清)。
+            if let Some(trash) = &self.trash {
+                trash.clear_target_tombstones(self, &new_key).await?;
             }
             self.delete_impl(old).await
         }
@@ -3821,6 +4199,8 @@ mod tests {
             dirty_budget: None,
             operation_timeout: std::time::Duration::from_secs(60),
             prefix: String::new(),
+            trash: None,
+            trash_refresh_started: AtomicBool::new(false),
         }
     }
 
@@ -3836,6 +4216,47 @@ mod tests {
         assert_eq!(fs2.key_for("/docs/a.txt"), "docs/a.txt");
         assert_eq!(fs2.list_prefix("/docs"), "docs/");
         assert_eq!(fs2.list_prefix("/"), "");
+    }
+
+    #[test]
+    fn hidden_key_gate() {
+        let trash_state = |prefix: &str| {
+            trash::TrashState::new(
+                prefix.to_string(),
+                TrashRefreshMode::Lazy,
+                Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
+                Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+            )
+        };
+        // trash None → 恒 false(零行为变化)
+        let fs = test_fs();
+        assert!(!fs.hidden_key(".trash"));
+        assert!(!fs.hidden_key(".trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key("docs/a.txt"));
+        // ".trash" 裸形态与 ".trash/" 前缀
+        let mut fs = test_fs();
+        fs.trash = Some(trash_state(".trash/"));
+        assert!(fs.hidden_key(".trash"));
+        assert!(fs.hidden_key(".trash/"));
+        assert!(fs.hidden_key(".trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key(".trashx"), "尾斜杠边界:.trashx 不误伤");
+        assert!(!fs.hidden_key(".trashx/a.txt"));
+        // prefix 变体
+        let mut fs = test_fs();
+        fs.prefix = "ossfs/".into();
+        fs.trash = Some(trash_state("ossfs/.trash/"));
+        assert!(fs.hidden_key("ossfs/.trash"));
+        assert!(fs.hidden_key("ossfs/.trash/2026-08-16/a.txt"));
+        assert!(!fs.hidden_key("ossfs/docs/a.txt"));
+        // 索引覆盖(files + dirs)
+        let mut fs = test_fs();
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        assert!(fs.hidden_key("a.txt"));
+        assert!(!fs.hidden_key("b.txt"));
+        fs.trash_insert("/docs", true);
+        assert!(fs.hidden_key("docs/x.txt"));
+        assert!(!fs.hidden_key("docsx/x.txt"));
     }
 
     #[test]
@@ -4143,9 +4564,18 @@ mod tests {
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
             credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
         }
         .normalize();
         assert_eq!(cfg.prefix, "ossfs/");
+        assert!(
+            cfg.trash_dir.is_none(),
+            "normalize 绝不填 trash_dir(None = 回收站关闭,门控不被默认值覆盖)"
+        );
     }
 
     #[test]
@@ -4226,6 +4656,11 @@ mod tests {
             total_mem_read_ratio: 0.5,
             read_cache_max_bytes: None,
             credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
         };
         let cfg = base().normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(DEFAULT_CONNECT_TIMEOUT_SECS));
@@ -4255,6 +4690,104 @@ mod tests {
         let cfg = cfg.normalize();
         assert_eq!(cfg.connect_timeout_secs, Some(3));
         assert_eq!(cfg.readwrite_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn refresh_constants_pinned() {
+        // 阈值独立 commit 规范:TRASH_* 默认值变更必须独立 commit 写明新旧值
+        // 与理由;此断言引用常量本身防漂移。
+        assert_eq!(TRASH_REFRESH_INTERVAL_SECS, 30, "增量刷新周期 30s");
+        assert_eq!(TRASH_REBUILD_INTERVAL_SECS, 600, "全量重建周期 10min");
+        assert_eq!(
+            TRASH_INDEX_ALERT_THRESHOLD, 500_000,
+            "索引规模告警阈值 500k(裁决 #6 新阈值,无旧值)"
+        );
+        assert_eq!(
+            trash::TRASH_EAGER_MIN_POLL_INTERVAL,
+            Duration::from_secs(1),
+            "eager 最小轮询间隔 1s"
+        );
+    }
+
+    #[test]
+    fn normalize_refresh_defaults() {
+        // C4b:阈值默认值在消费单元落地 —— 单元 3 填 refresh_interval=30 /
+        // mode=Lazy;显式值不被覆盖;trash_dir 绝不填(门控不被默认值覆盖)。
+        let base = || OssConfig {
+            bucket: "b".into(),
+            region: "cn-shanghai".into(),
+            endpoint: None,
+            force_path_style: false,
+            prefix: String::new(),
+            max_concurrent_requests: None,
+            list_rate_limit: None,
+            read_only: false,
+            uid: 0,
+            gid: 0,
+            dir_mode: 0o755,
+            file_mode: 0o644,
+            allow_other: false,
+            umask: 0,
+            allow_rename_dir: true,
+            rename_dir_limit: Some(2_000_000),
+            max_upload_bytes: None,
+            read_ahead_bytes: None,
+            ignore_fsync: true,
+            max_dirty_bytes: None,
+            verify_crc64: false,
+            storage_class: None,
+            content_md5: false,
+            notsup_compat_dir: false,
+            connect_timeout_secs: None,
+            readwrite_timeout_secs: None,
+            retries: None,
+            multipart_size: None,
+            multipart_concurrency: None,
+            disk_cache_reserve_diskfree: 0,
+            disk_cache_free_space_ratio: None,
+            disk_cache_dir: None,
+            disk_cache_max_bytes: 0,
+            disk_cache_block_size: None,
+            disk_cache_prefetch_blocks: 1,
+            disk_cache_prefetch_concurrency: 4,
+            disk_cache_verify_etag: false,
+            disk_cache_etag_ttl_secs: 10,
+            negative_cache_ttl_secs: 5,
+            negative_cache_max_entries: 4096,
+            stat_cache_ttl_secs: 3,
+            stat_cache_max_entries: 4096,
+            total_mem_limit: None,
+            total_mem_read_ratio: 0.5,
+            read_cache_max_bytes: None,
+            credential_process: None,
+            trash_dir: None,
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode: None,
+            trash_gc_interval_secs: None,
+        };
+        let cfg = base().normalize();
+        assert_eq!(
+            cfg.trash_refresh_interval_secs,
+            Some(TRASH_REFRESH_INTERVAL_SECS),
+            "None → 默认 30s"
+        );
+        assert_eq!(
+            cfg.trash_refresh_mode,
+            Some(TrashRefreshMode::Lazy),
+            "None → 默认 Lazy"
+        );
+        assert!(
+            cfg.trash_dir.is_none(),
+            "normalize 绝不填 trash_dir(None = 回收站关闭)"
+        );
+        // 显式值不被覆盖
+        let mut cfg = base();
+        cfg.trash_refresh_interval_secs = Some(7);
+        cfg.trash_refresh_mode = Some(TrashRefreshMode::Eager);
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.trash_refresh_interval_secs, Some(7));
+        assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Eager));
     }
 
     #[tokio::test]
@@ -4430,6 +4963,13 @@ mod s3_mock_tests {
         /// `NextContinuationToken` — the unpaggable partial listing the
         /// client must refuse (#60).
         pub(crate) list_truncated_no_token: std::sync::atomic::AtomicBool,
+        /// Number of plain PUT requests to fail with 500 before succeeding
+        /// (exercises trash tombstone write failure semantics).
+        pub(crate) fail_put: AtomicUsize,
+        /// When set, the list branch ignores the `start-after` query param
+        /// and returns every key (simulates stores that do not honor it —
+        /// the trash refresh must detect and degrade, unit 3).
+        pub(crate) ignore_start_after: std::sync::atomic::AtomicBool,
     }
 
     impl MockS3 {
@@ -4474,6 +5014,8 @@ mod s3_mock_tests {
                 head_status: std::sync::atomic::AtomicU16::new(0),
                 complete_no_such_upload: std::sync::atomic::AtomicBool::new(false),
                 list_truncated_no_token: std::sync::atomic::AtomicBool::new(false),
+                fail_put: AtomicUsize::new(0),
+                ignore_start_after: std::sync::atomic::AtomicBool::new(false),
             });
             let server = Arc::clone(&mock);
             tokio::spawn(async move {
@@ -4579,7 +5121,7 @@ mod s3_mock_tests {
         mock.recorded.lock().unwrap().push(MockRequest {
             method: method.clone(),
             target: target.clone(),
-            body,
+            body: body.clone(),
             storage_class: storage_class_header.clone(),
             content_md5: content_md5_header.clone(),
             copy_source: copy_source_header.clone(),
@@ -4604,6 +5146,17 @@ mod s3_mock_tests {
                 .replace("%2F", "/")
                 .replace("%20", " ")
                 .replace('+', " ");
+            // start-after filtering (ListObjectsV2): keys strictly greater
+            // than the cursor. The ignore switch simulates stores that do
+            // not honor the param (trash refresh degrades, unit 3).
+            let start_after: Option<String> = if mock.ignore_start_after.load(Ordering::SeqCst) {
+                None
+            } else {
+                query_raw
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("start-after="))
+                    .map(|v| v.replace("%2F", "/").replace("%20", " ").replace('+', " "))
+            };
             let entries = mock.entries.lock().unwrap().clone();
             // ObjectFs lists without a delimiter; mock entries marked as
             // directories then surface as plain (marker) objects in
@@ -4613,10 +5166,11 @@ mod s3_mock_tests {
             let filtered: Vec<(String, bool)> = entries
                 .into_iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
+                .filter(|(k, _)| start_after.as_deref().is_none_or(|sa| k.as_str() > sa))
                 .collect();
             let sizes = mock.sizes.lock().unwrap().clone();
             let truncated = mock.list_truncated_no_token.load(Ordering::SeqCst);
-            let body = list_xml(&filtered, &sizes, truncated, use_delimiter);
+            let body = list_xml(&filtered, &sizes, truncated, use_delimiter, &prefix);
             http_response(200, "application/xml", Some(&format!("{body}")))
         } else if method == "GET" {
             mock.get_count.fetch_add(1, Ordering::SeqCst);
@@ -4757,17 +5311,97 @@ mod s3_mock_tests {
                 }
             }
         } else {
-            // Plain PutObject / DeleteObject / ...
-            let crc = *mock.crc64.lock().unwrap();
-            format!(
-                "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
+            // Plain PutObject / DeleteObject / CopyObject / ... — really
+            // store/remove so multi-step flows (trash soft delete: HEAD →
+            // PUT tombstone → verify original survives) observe a coherent
+            // store. CopyObject materializes the copy when the source object
+            // exists; tests that rename without seeding data keep the old
+            // no-op 200 (their assertions only cover recorded requests).
+            let path = target.split('?').next().unwrap_or(&target);
+            let key = path
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            if method == "PUT" {
+                if let Some(src) = &copy_source_header {
+                    // x-amz-copy-source: /bucket/percent-encoded-key
+                    let src_key = src
+                        .trim_start_matches('/')
+                        .split_once('/')
+                        .map(|(_, k)| percent_decode(k))
+                        .unwrap_or_default();
+                    let data = mock.objects.lock().unwrap().get(&src_key).cloned();
+                    if let Some(data) = data {
+                        mock.objects.lock().unwrap().insert(key.clone(), data);
+                        let mut entries = mock.entries.lock().unwrap();
+                        if !entries.iter().any(|(k, _)| *k == key) {
+                            entries.push((key, false));
+                        }
+                        drop(entries);
+                    }
+                    let crc = *mock.crc64.lock().unwrap();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else if mock.fail_put.load(Ordering::SeqCst) > 0 {
+                    mock.fail_put.fetch_sub(1, Ordering::SeqCst);
+                    let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
+                    http_response(500, "application/xml", Some(&body.to_string()))
+                } else {
+                    mock.objects
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), body.clone());
+                    let mut entries = mock.entries.lock().unwrap();
+                    if !entries.iter().any(|(k, _)| *k == key) {
+                        entries.push((key, false));
+                    }
+                    drop(entries);
+                    let crc = *mock.crc64.lock().unwrap();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                }
+            } else if method == "DELETE" {
+                mock.objects.lock().unwrap().remove(&key);
+                mock.entries.lock().unwrap().retain(|(k, _)| *k != key);
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let crc = *mock.crc64.lock().unwrap();
+                format!(
+                    "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            }
         };
         let _ = stream.write_all(response.as_bytes()).await;
         if let Some(body) = get_body {
             let _ = stream.write_all(&body).await;
         }
         let _ = stream.shutdown().await;
+    }
+
+    /// Percent-decode a URL-escaped S3 key (%XX hex; '+' → space).
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(h), Some(l)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                )
+            {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            } else {
+                out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     fn http_response(status: u16, content_type: &str, body: Option<&String>) -> String {
@@ -4795,25 +5429,60 @@ mod s3_mock_tests {
         sizes: &HashMap<String, u64>,
         truncated_no_token: bool,
         use_delimiter: bool,
+        prefix: &str,
     ) -> String {
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
-        body.push_str("<Name>bucket</Name><Prefix></Prefix><KeyCount>");
-        body.push_str(&entries.len().to_string());
-        body.push_str("</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>");
-        body.push_str(if truncated_no_token { "true" } else { "false" });
-        body.push_str("</IsTruncated>");
-        for (key, is_dir) in entries {
-            if *is_dir && use_delimiter {
-                // With a delimiter the server folds directory markers into
-                // CommonPrefixes; without one (how ObjectFs lists) a marker
-                // is an ordinary zero-byte object in Contents, matching real
-                // S3/OSS semantics (#60 review).
+        body.push_str("<Name>bucket</Name><Prefix></Prefix>");
+        // delimiter 语义与真实 S3 对齐(裁决 #10 分区枚举的依赖):带
+        // delimiter 时按「前缀之后第一个分隔符」折叠 CommonPrefixes
+        // (去重、升序),仅直接子项进 Contents;目录标记 key 本身就是
+        // 其公共前缀,折叠行为与旧实现一致。不带 delimiter(如何 ObjectFs
+        // 的 max_keys 探测)时标记是普通零字节对象。
+        if use_delimiter {
+            let mut common: Vec<String> = Vec::new();
+            let mut direct: Vec<&(String, bool)> = Vec::new();
+            for e in entries {
+                let rest = e.0.strip_prefix(prefix).unwrap_or(&e.0);
+                match rest.find('/') {
+                    Some(idx) => {
+                        let cp = format!("{prefix}{}", &rest[..=idx]);
+                        if !common.contains(&cp) {
+                            common.push(cp);
+                        }
+                    }
+                    None => direct.push(e),
+                }
+            }
+            common.sort_unstable();
+            body.push_str(&format!(
+                "<KeyCount>{}</KeyCount>",
+                common.len() + direct.len()
+            ));
+            body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>");
+            body.push_str(if truncated_no_token { "true" } else { "false" });
+            body.push_str("</IsTruncated>");
+            for cp in &common {
                 body.push_str(&format!(
-                    "<CommonPrefixes><Prefix>{key}</Prefix></CommonPrefixes>"
+                    "<CommonPrefixes><Prefix>{cp}</Prefix></CommonPrefixes>"
                 ));
-            } else {
+            }
+            for (key, _) in direct {
+                let size = sizes.get(key).copied().unwrap_or(5);
+                body.push_str(&format!(
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+                ));
+            }
+        } else {
+            body.push_str(&format!("<KeyCount>{}</KeyCount>", entries.len()));
+            body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>");
+            body.push_str(if truncated_no_token { "true" } else { "false" });
+            body.push_str("</IsTruncated>");
+            for (key, _) in entries {
+                // Without a delimiter a directory marker is an ordinary
+                // zero-byte object in Contents, matching real S3/OSS
+                // semantics (#60 review).
                 let size = sizes.get(key).copied().unwrap_or(5);
                 body.push_str(&format!(
                     "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;mock&quot;</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
@@ -4884,6 +5553,8 @@ mod s3_mock_tests {
             metrics: Arc::new(Metrics::default()),
             dirty_budget: DirtyBudget::new(max_dirty_bytes.unwrap_or(0)),
             operation_timeout: std::time::Duration::from_secs(60),
+            trash: None,
+            trash_refresh_started: AtomicBool::new(false),
         }
     }
 
@@ -6683,6 +7354,1398 @@ mod s3_mock_tests {
     fn crc64ecma_matches_known_vectors() {
         assert_eq!(crc64ecma(b"123456789"), 0x995DC9BBDF1939FA);
         assert_eq!(crc64ecma(b"a"), 0x330284772E652B05);
+    }
+
+    /// 裁决 #9:trash_insert 必须同步 index_entries gauge(修复前:测试
+    /// 用 trash_insert 建索引后断言 gauge 会得 0 —— 既有集成测试未断言
+    /// 故未暴露;trash_remove 无生产调用点,已删除,trash_insert 为仅存
+    /// 测试驱动接缝)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_insert_updates_gauge() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        assert_eq!(fs.metrics().trash_index_entries, 1, "文件墓碑 gauge=1");
+        fs.trash_insert("/docs", true);
+        assert_eq!(fs.metrics().trash_index_entries, 2, "目录墓碑 gauge=2");
+        fs.trash_insert("/a.txt", false); // 幂等
+        assert_eq!(fs.metrics().trash_index_entries, 2, "重复插入不涨 gauge");
+    }
+
+    /// 回收站集成测试统一手法:直接构造 ObjectFs 不走 connect,手置
+    /// `fs.trash`(避免 connect 的 spawn/head-bucket 干扰 metrics 增量)。
+    /// 默认 lazy 档 + 常量周期;测试可改 pub(crate) 字段定制
+    /// (mode=Eager、强制重建周期)。
+    fn trash_state(prefix: &str) -> Arc<trash::TrashState> {
+        trash::TrashState::new(
+            prefix.to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(TRASH_REFRESH_INTERVAL_SECS),
+            Duration::from_secs(TRASH_REBUILD_INTERVAL_SECS),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_filter_keeps_remote_cost() {
+        // 性能守卫:trash 开启后普通 list 的远程请求数与关闭时一致。
+        let entries = vec![
+            ("a.txt".into(), false),
+            ("docs/".into(), true),
+            ("docs/b.txt".into(), false),
+            (".trash/2026-08-16/a.txt".into(), false), // 墓碑对象
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        // trash 关闭基线
+        let fs = test_fs(port, 32);
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "基线 list = 1 次 s3 list"
+        );
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        assert!(root.iter().any(|e| e.name == "docs"));
+        // trash 开启 + rebuild
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let count = fs.rebuild_trash_index().await.unwrap();
+        assert_eq!(count, 1, "只有文件墓碑被索引");
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "trash 开启 list 的 s3_lists 增量与关闭时一致(过滤零额外远程成本)"
+        );
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "list 无 HEAD");
+        assert!(!root.iter().any(|e| e.name == "a.txt"), "被删文件隐藏");
+        assert!(!root.iter().any(|e| e.name == ".trash"), ".trash 自隐藏");
+        assert!(root.iter().any(|e| e.name == "docs"), "docs 可见");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_hides_tombstoned_dir() {
+        let entries = vec![("docs/".into(), true), ("docs/b.txt".into(), false)];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/docs", true);
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.is_empty(),
+            "docs common_prefix 与 marker 均隐藏: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let before = fs.metrics();
+        let docs = fs.list("/docs").await.unwrap();
+        let after = fs.metrics();
+        assert!(docs.is_empty(), "被删目录内容为空: {:?}", docs);
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "过滤在分页循环内,零重分页"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_hidden_is_local() {
+        // 性能守卫:被删路径 stat 零远程请求(head 都不发),negative cache 续零。
+        let entries = vec![("a.txt".into(), false), ("b.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("b.txt", b"b".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "被删路径 stat 零 HEAD");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // negative cache:再次 stat 仍零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 正向对照:活文件仍走一次 HEAD
+        let before = fs.metrics();
+        assert!(fs.stat("/b.txt").await.unwrap().is_some());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_dir_tombstone_covers_both_forms() {
+        // 回归 stat 复活 bug:目录墓碑存 "docs/",stat("/docs") 得 key "docs"。
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        assert!(fs.stat("/docs").await.unwrap().is_none());
+        assert!(fs.stat("/docs/").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "双形态均零请求");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_self_hiding() {
+        let entries = vec![
+            (".trash/2026-08-16/a.txt".into(), false),
+            ("a.txt".into(), false),
+            ("ossfs/.trash/2026-08-16/a.txt".into(), false),
+            ("ossfs/a.txt".into(), false),
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        // 无命名空间变体
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().all(|e| e.name != ".trash"),
+            "根 list 隐藏 .trash: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        let before = fs.metrics();
+        assert!(
+            fs.stat("/.trash").await.unwrap().is_none(),
+            "stat 裸 key 形态"
+        );
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 命名空间 prefix 变体
+        let mut fs = test_fs(port, 32);
+        fs.prefix = "ossfs/".into();
+        fs.trash = Some(trash_state("ossfs/.trash/"));
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().all(|e| e.name != ".trash"),
+            "prefix 变体同样隐藏: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let before = fs.metrics();
+        assert!(fs.stat("/.trash").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuild_from_mock() {
+        // 特殊字符 key、目录墓碑、垃圾对象(坏日期/裸日期分区/非 trash 前缀)
+        let entries = vec![
+            (".trash/2026-08-16/a b+c%23.txt".into(), false), // 文件墓碑(特殊字符)
+            (".trash/2026-08-16/docs/".into(), true),         // 目录墓碑
+            (".trash/bad-date/x.txt".into(), false),          // 垃圾:坏日期
+            (".trash/2026-08-16/".into(), false),             // 垃圾:裸日期分区
+            ("other/2026-08-16/x.txt".into(), false),         // 非 trash 前缀(列表前缀之外)
+            ("a b+c%23.txt".into(), false),                   // 原对象
+            ("docs/b.txt".into(), false),                     // 原对象
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let before = fs.metrics();
+        let count = fs.rebuild_trash_index().await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(count, 2, "文件+目录墓碑各一条,垃圾跳过");
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "s3_lists 增量 = 分页数"
+        );
+        // 过滤生效
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            !root.iter().any(|e| e.name == "a b+c%23.txt"),
+            "特殊字符 key 被隐藏"
+        );
+        assert!(!root.iter().any(|e| e.name == "docs"), "docs 目录被隐藏");
+        // 索引内容精确(垃圾未入索引)
+        let idx = fs.trash.as_ref().unwrap().index.read().unwrap();
+        assert_eq!(idx.files.len(), 1);
+        assert!(idx.files.contains("a b+c%23.txt"));
+        assert_eq!(idx.dirs, vec!["docs/".to_string()]);
+        drop(idx);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_trash_zero_change() {
+        // --no-trash 语义:同一 bucket 含 .trash 内容,trash None → list 返回
+        // 全部(回收站关闭则软删除语义不存在),远程成本不变。
+        let entries = vec![
+            ("a.txt".into(), false),
+            (".trash/2026-08-16/a.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        let fs = test_fs(port, 32); // trash = None
+        let before = fs.metrics();
+        let root = fs.list("/").await.unwrap();
+        let after = fs.metrics();
+        assert_eq!(after.s3_lists - before.s3_lists, 1);
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        assert!(
+            root.iter().any(|e| e.name.contains(".trash")),
+            "关闭时 .trash 内容可见: {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // stat 不隐藏
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stat_cache_invalidation() {
+        let entries = vec![("a.txt".into(), false), ("docs/b.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("docs/b.txt", b"b".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 正值缓存命中
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_some(),
+            "第二次走正值缓存"
+        );
+        // trash_insert 后立即 None 且零请求
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "失效后不复活");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 目录墓碑 insert 后,先前缓存的 "/docs/b.txt" 正值条目被前缀扫描失效
+        assert!(fs.stat("/docs/b.txt").await.unwrap().is_some());
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        assert!(fs.stat("/docs/b.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "目录后代缓存被扫掉");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    // ===== 单元 2:软删除写墓碑(unlink/rmdir 门控 + 即时索引)=====
+
+    /// 索引含 key 时 soft_delete_file → 幂等 Ok 且零远程请求(性能守卫)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_covered_is_idempotent_zero_remote() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        fs.delete("/a.txt").await.expect("covered → 幂等 Ok");
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_puts - before.s3_puts, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        assert!(
+            mock.recorded.lock().unwrap().is_empty(),
+            "stale handle 二次删除必须零远程"
+        );
+        // 目录被覆盖同理
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        fs.delete_dir_recursive("/docs").await.expect("幂等 Ok");
+        let after = fs.metrics();
+        assert_eq!(after.s3_puts - before.s3_puts, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    /// 未覆盖路径 write → 请求数与 trash 关闭时一致(清墓碑门控零额外成本)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_tombstone_gate_zero_remote() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let before = fs.metrics();
+        fs.write("/fresh.txt", b"x").await.expect("write");
+        let after = fs.metrics();
+        assert_eq!(after.s3_puts - before.s3_puts, 1, "仅一次 PUT");
+        assert_eq!(after.s3_lists - before.s3_lists, 0, "未覆盖不扫描墓碑");
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            1,
+            "与 --no-trash 完全一致的单请求"
+        );
+    }
+
+    /// unlink → HEAD 原对象(etag/size)→ PUT 墓碑;无 DELETE;原对象仍在;
+    /// 挂载视图立即隐藏且 stat 零请求;gauge 与计数器联动。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unlink_writes_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+
+        fs.delete("/a.txt").await.expect("soft delete");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "HEAD + PUT 墓碑: {recorded:?}");
+        assert_eq!(recorded[0].method, "HEAD");
+        assert!(recorded[0].target.ends_with("/a.txt"));
+        assert_eq!(recorded[1].method, "PUT");
+        // SDK 为 PutObject 追加 ?x-id=PutObject 查询串,key 部分按 '?' 剥离
+        let put_target = recorded[1]
+            .target
+            .split('?')
+            .next()
+            .unwrap_or(&recorded[1].target);
+        assert!(
+            put_target.contains("/.trash/"),
+            "墓碑 key 必须带 .trash 前缀: {}",
+            recorded[1].target
+        );
+        assert!(
+            put_target.ends_with("/a.txt"),
+            "墓碑 key 以原 key 结尾: {}",
+            recorded[1].target
+        );
+        let body: trash::TombstoneBody = serde_json::from_slice(&recorded[1].body).unwrap();
+        assert_eq!(
+            body.etag.as_deref(),
+            Some("\"mock-etag\""),
+            "HEAD 原样 etag"
+        );
+        assert_eq!(body.size, Some(5), "HEAD content_length");
+        assert!(!body.is_dir);
+        assert!(
+            !recorded.iter().any(|r| r.method == "DELETE"),
+            "软删除不得 DELETE 原对象"
+        );
+        drop(recorded);
+        // 原对象仍在桶里
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象必须保留"
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 1, "写墓碑计数");
+        assert_eq!(fs.metrics().trash_index_entries, 1, "gauge=1");
+        // 视图立即隐藏;再次 stat 走 negative cache,零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "被删路径 stat 零 HEAD");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // list 不含
+        let root = fs.list("/").await.unwrap();
+        assert!(!root.iter().any(|e| e.name == "a.txt"));
+    }
+
+    /// rmdir → 仅一个 PUT 目录墓碑(尾斜杠,{"is_dir":true});无 list、
+    /// 无 DeleteObjects(对比原逻辑 list+批删);子树 stat 隐藏零请求。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rmdir_writes_dir_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("d/x", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+
+        fs.delete_dir_recursive("/d")
+            .await
+            .expect("soft delete dir");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "仅一个 PUT,无 list、无 DeleteObjects");
+        assert_eq!(recorded[0].method, "PUT");
+        assert!(recorded[0].target.contains("/.trash/"));
+        let put_target = recorded[0]
+            .target
+            .split('?')
+            .next()
+            .unwrap_or(&recorded[0].target);
+        assert!(
+            put_target.ends_with("/d/"),
+            "目录墓碑 key 尾斜杠: {}",
+            recorded[0].target
+        );
+        let body: trash::TombstoneBody = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert!(body.is_dir);
+        assert!(body.etag.is_none() && body.size.is_none());
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_tombstones_written, 1);
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        // 子树隐藏:子文件 stat 零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/d/x").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    /// 失败语义:PUT 墓碑失败 → delete Err、索引未 insert(stat 仍可见)、
+    /// 无墓碑残留;HEAD 404 → delete Ok 且零墓碑(幂等删除)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_failure_semantics() {
+        // ① PUT 全败(10 > SDK 默认 3 次尝试)→ Err
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let err = fs.delete("/a.txt").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put tombstone"), "{err:?}");
+        // 提交点前零副作用:索引未 insert → stat 仍可见(正向 HEAD)
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        // 无墓碑残留
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.contains(".trash"))
+        );
+        assert!(
+            mock.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(k, _)| !k.contains(".trash"))
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 0);
+        // ② HEAD 404 → delete Ok 且零墓碑(幂等删除,不写墓碑隐藏不存在之物)
+        mock.recorded.lock().unwrap().clear(); // 清掉 ① 的 HEAD + 失败 PUT 记录
+        mock.objects.lock().unwrap().remove("a.txt");
+        let mut fs = test_fs(port, 32); // 新实例避免 negative cache 干扰
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("404 → 幂等 Ok");
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|r| r.method != "PUT" || !r.target.contains(".trash")),
+            "404 分支不得写墓碑: {recorded:?}"
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 0);
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 同名重建(覆盖语义):write 前清墓碑 → 立即可见;旧内容随覆盖丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recreate_same_name_clears_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        mock.recorded.lock().unwrap().clear();
+
+        fs.write("/a.txt", b"new").await.expect("recreate");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let trash_deletes = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .count();
+        assert_eq!(trash_deletes, 1, "清墓碑 DELETE: {recorded:?}");
+        let puts = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && !r.target.contains(".trash"))
+            .count();
+        assert_eq!(puts, 1, "新对象 PUT: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "墓碑已清除");
+        // stat/list 立即可见
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        let root = fs.list("/").await.unwrap();
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        // 索引 remove 后再次 stat 走正值缓存,零 HEAD
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+    }
+
+    /// 裁决 #4 回归:外部客户端直接删远端墓碑后(其他挂载端恢复/管理命令),
+    /// 本地索引条目成「幽灵」;同名 write 必须立即可见 —— 清墓碑扫描无命中
+    /// 也要无条件移除索引条目(修复前:扫描为空跳过 index.remove,同名重建
+    /// 文件最长 600s 全量重建周期后才解除隐藏)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recreate_after_external_tombstone_deleted_is_visible() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+
+        // 外部客户端直接删除远端墓碑(mock 移除墓碑对象;索引仍覆盖)
+        mock.entries
+            .lock()
+            .unwrap()
+            .retain(|(k, _)| !k.starts_with(".trash/"));
+        mock.objects
+            .lock()
+            .unwrap()
+            .retain(|k, _| !k.starts_with(".trash/"));
+
+        fs.write("/a.txt", b"new").await.expect("同名重建");
+
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_some(),
+            "外部删墓碑后同名 write 必须立即可见(幽灵索引不得持续隐藏)"
+        );
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            0,
+            "幽灵索引条目必须移除并同步 gauge"
+        );
+    }
+
+    // ===== F1/F2:跨形态同名重建(rmdir 后写文件 / unlink 后建目录)+ mkdir 失败窗口 =====
+
+    /// F1 回归:rmdir /e(目录墓碑 e/)后再写文件 /e —— 目录墓碑前缀覆盖
+    /// 新文件 key,修复前 write 只清文件形态(门控 is_file_covered 不含
+    /// 目录前缀),新文件写入成功但 list/stat 全部隐藏且无自愈(600s 全量
+    /// 重建也救不了,墓碑还在桶里)。修复后清双形态:新文件立即可见,
+    /// 索引无幽灵。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_form_recreate_file_after_rmdir_visible() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // rmdir /e → 目录墓碑 e/(空目录也可软删:不 HEAD、不枚举)
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir");
+        assert!(fs.stat("/e").await.unwrap().is_none(), "rmdir 后隐藏");
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // 跨形态重建:在目录墓碑上写同名文件
+        fs.write("/e", b"new").await.expect("写文件到原目录路径");
+
+        // 目录形态墓碑必须被清除(否则新文件被前缀覆盖隐藏)
+        let recorded = mock.recorded.lock().unwrap();
+        let dir_tomb_delete = recorded.iter().any(|r| {
+            r.method == "DELETE"
+                && r.target
+                    .split('?')
+                    .next()
+                    .is_some_and(|t| t.contains(".trash") && t.ends_with("/e/"))
+        });
+        assert!(dir_tomb_delete, "目录墓碑 e/ 必须被 DELETE: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "索引无幽灵");
+        assert!(fs.stat("/e").await.unwrap().is_some(), "新文件立即可见");
+        let root = fs.list("/").await.unwrap();
+        assert!(
+            root.iter().any(|e| e.name == "e"),
+            "list 立即可见: {root:?}"
+        );
+    }
+
+    /// F1 回归:unlink /e(文件墓碑 e)后再 mkdir /e —— 修复前 mkdir 门控
+    /// is_covered(dir_key "e/") 不命中文件墓碑,目录 marker 写入但
+    /// stat("/e") 返回 None,目录打不开、rename 被「source path is in
+    /// the trash」拦截。修复后清双形态:目录 stat Some、可进入、可写。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_form_recreate_dir_after_unlink_usable() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        // unlink 前原对象必须存在(mock 的 HEAD 只对 set_object 过的 key
+        // 返回 200,否则软删走 404 幂等分支不写墓碑)
+        mock.set_object("e", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/e").await.expect("soft delete file");
+        assert!(fs.stat("/e").await.unwrap().is_none(), "unlink 后隐藏");
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // 跨形态重建:在文件墓碑上建同名目录
+        fs.mkdir("/e").await.expect("mkdir 同名重建");
+
+        // 文件形态墓碑必须被清除(否则 stat("/e") 仍被文件墓碑隐藏)
+        let recorded = mock.recorded.lock().unwrap();
+        let file_tomb_delete = recorded.iter().any(|r| {
+            r.method == "DELETE"
+                && r.target
+                    .split('?')
+                    .next()
+                    .is_some_and(|t| t.contains(".trash") && t.ends_with("/e"))
+        });
+        assert!(file_tomb_delete, "文件墓碑 e 必须被 DELETE: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "索引无幽灵");
+        // 目录可用:stat Some、可进入、可写
+        assert!(fs.stat("/e").await.unwrap().is_some(), "目录立即可用");
+        assert!(fs.list("/e").await.unwrap().is_empty(), "可进入");
+        fs.write("/e/f.txt", b"x").await.expect("目录内可写");
+        assert!(fs.stat("/e/f.txt").await.unwrap().is_some());
+    }
+
+    /// F2 回归(mkdir 失败窗口):mkdir 的 marker 写失败 → 目录墓碑必须
+    /// 保留(软删除不被静默撤销,已删目录不得复活)。修复前:先清墓碑
+    /// 再写 marker,写失败后墓碑已被删、已删目录复活且 trash 追踪丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mkdir_failure_keeps_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("e/x", b"x".to_vec()); // rmdir 前子树对象
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir");
+        assert!(fs.stat("/e").await.unwrap().is_none());
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        mock.recorded.lock().unwrap().clear();
+
+        // marker 写失败(10 > 重试上限)
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let err = fs.mkdir("/e").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put"), "{err:?}");
+
+        // 墓碑仍在 → 索引仍覆盖 → 已删目录不得复活
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with(".trash/")),
+            "mkdir 失败后目录墓碑必须保留(软删除不得被静默撤销)"
+        );
+        assert_eq!(fs.metrics().trash_index_entries, 1, "索引仍覆盖");
+        assert!(
+            fs.stat("/e").await.unwrap().is_none(),
+            "mkdir 失败后已删目录不得复活"
+        );
+
+        // 故障恢复后重试 mkdir 收敛(清墓碑 + marker 写都成功)
+        mock.fail_put.store(0, Ordering::SeqCst);
+        fs.mkdir("/e").await.expect("重试 mkdir");
+        assert!(fs.stat("/e").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 裁决 #8:stat("/d/") 尾斜杠形态先入正值缓存 → soft_delete_dir 后
+    /// 双形态都必须立即失效(修复前:soft_delete_dir 只失效裸形态
+    /// invalidate_stat("/d") + clear_read_cache,stat("/d/") 缓存条目
+    /// 存活至 TTL ≤3s,期间 stat("/d/") 短暂返回存在)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_dir_invalidates_both_stat_forms() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("d/", Vec::new()); // 隐式目录 marker
+        let mut fs = test_fs(port, 32);
+        fs.stat_ttl = Duration::from_secs(3600); // 冻结 TTL:缓存不自然过期,确定性
+        fs.trash = Some(trash_state(".trash/"));
+        // 尾斜杠形态正值缓存(远程 marker 存在)
+        assert!(fs.stat("/d/").await.unwrap().is_some());
+        fs.delete_dir_recursive("/d")
+            .await
+            .expect("soft delete dir");
+        let before = fs.metrics();
+        assert!(
+            fs.stat("/d/").await.unwrap().is_none(),
+            "soft_delete_dir 后 stat(\"/d/\") 尾斜杠形态必须立即失效"
+        );
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "失效后零请求");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // 裸形态同样失效
+        assert!(fs.stat("/d").await.unwrap().is_none());
+    }
+
+    /// 裁决 #3 回归:同名重建 write 的 PUT 失败 → 墓碑必须保留(软删除
+    /// 不被静默撤销)。修复前:先清墓碑再 PUT,PUT 失败后已删文件带旧内容
+    /// 永久可见、trash 索引/GC 追踪丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_put_failure_keeps_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        mock.recorded.lock().unwrap().clear();
+
+        // 之后所有 PUT 失败(10 > SDK 默认 3 次重试)
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let err = fs.write("/a.txt", b"new").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put"), "{err:?}");
+
+        // 墓碑仍在(mock 远端墓碑对象仍在)→ 索引仍覆盖 → 文件仍隐藏
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with(".trash/")),
+            "write PUT 失败后墓碑必须保留(软删除不得被静默撤销)"
+        );
+        assert_eq!(fs.metrics().trash_index_entries, 1, "索引仍覆盖(墓碑未清)");
+        assert!(
+            fs.stat("/a.txt").await.unwrap().is_none(),
+            "PUT 失败后已删文件不得复活"
+        );
+
+        // 故障恢复后重试 write 收敛(清墓碑 + PUT 都成功)
+        mock.fail_put.store(0, Ordering::SeqCst);
+        fs.write("/a.txt", b"new").await.expect("重试 write");
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 裁决 #3 回归:目录 rename 目标被墓碑覆盖 + 源超 rename-dir-limit →
+    /// 失败检查(count)必须发生在清墓碑之前;超限 bail 后墓碑仍在(修复前:
+    /// 先清墓碑再 count,超限 bail 后已删目录子树永久复活、trash 追踪丢失)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_over_limit_keeps_tombstone() {
+        let entries = vec![
+            ("d/a.txt".to_string(), false),
+            ("d/b.txt".to_string(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("d/a.txt", b"x".to_vec());
+        mock.set_object("d/b.txt", b"y".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rename_dir_limit = Some(1);
+        fs.delete_dir_recursive("/e")
+            .await
+            .expect("soft delete dir e");
+        mock.recorded.lock().unwrap().clear();
+
+        let err = fs.rename("/d", "/e", false).await.unwrap_err();
+        assert!(err.to_string().contains("rename-dir-limit"), "{err:?}");
+        // 失败检查在清墓碑之前:超限 bail 前不得发生任何 .trash DELETE
+        // (锁在作用域块内释放,不跨后续 await 持有)
+        {
+            let recorded = mock.recorded.lock().unwrap();
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
+                "超限 bail 前不得清墓碑: {recorded:?}"
+            );
+        }
+        // 墓碑仍在 → 索引仍覆盖 → 视图仍隐藏(已删目录不得复活)
+        assert_eq!(fs.metrics().trash_index_entries, 1, "目录墓碑索引必须保留");
+        assert!(
+            fs.stat("/e").await.unwrap().is_none(),
+            "rename 超限失败后已删目录不得复活"
+        );
+    }
+
+    /// rename 源被墓碑覆盖 → Err 且零 copy 请求(隐藏对象不得被搬出)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_source_covered_bails() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+
+        let err = fs.rename("/a.txt", "/b.txt", false).await.unwrap_err();
+        assert!(err.to_string().contains("in the trash"), "{err:?}");
+        // guard 不得跨后续锁(同线程重入 std Mutex 自死锁)
+        assert!(mock.recorded.lock().unwrap().is_empty(), "bail 前零远程");
+        // 目录源被目录墓碑覆盖同样拒绝
+        fs.trash_insert("/docs", true);
+        mock.recorded.lock().unwrap().clear();
+        let err = fs.rename("/docs", "/docs2", false).await.unwrap_err();
+        assert!(err.to_string().contains("in the trash"), "{err:?}");
+        assert!(mock.recorded.lock().unwrap().is_empty());
+    }
+
+    /// rename 目标被墓碑覆盖 → 先清墓碑再 copy,stat(new) 立即可见。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_target_covered_clears_first() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        mock.set_object("b.txt", b"y".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/b.txt").await.expect("soft delete b");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.rename("/a.txt", "/b.txt", false)
+            .await
+            .expect("rename onto covered target");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let trash_deletes = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .count();
+        assert_eq!(trash_deletes, 1, "提交点前清墓碑: {recorded:?}");
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "PUT" && r.copy_source.is_some()),
+            "copy 发生: {recorded:?}"
+        );
+        drop(recorded);
+        // 目标立即可见(旧墓碑已清)
+        assert!(fs.stat("/b.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 目录 rename:源树真实 DeleteObjects(尾部删除保持,移动语义不留墓碑);
+    /// 目标被目录墓碑覆盖 → 清目录墓碑后成功。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_dir_source_real_delete() {
+        let entries = vec![("d/".into(), true), ("d/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("d/", Vec::new());
+        mock.set_object("d/a.txt", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 目标 e 已被软删除(目录墓碑)
+        fs.delete_dir_recursive("/e").await.expect("soft delete e");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.rename("/d", "/e", false)
+            .await
+            .expect("rename dir onto covered target");
+
+        let recorded = mock.recorded.lock().unwrap();
+        // 提交点前清目录墓碑
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
+            "清目录墓碑: {recorded:?}"
+        );
+        // 源树真实批删(移动语义:尾部真实删除,不留目录墓碑)
+        let lc = |t: &str| t.to_lowercase();
+        let batches = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .count();
+        assert_eq!(batches, 1, "源目录 DeleteObjects 批删: {recorded:?}");
+        // 未产生新目录墓碑
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.method == "PUT" && r.target.contains(".trash"))
+                .count(),
+            0
+        );
+        drop(recorded);
+        // 目标可见
+        assert!(fs.stat("/e").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// C9 裁决回归:WinFsp overwrite 回调经 write_from_file()(独立方法
+    /// 不走 write())—— 同名重建同样必须清墓碑。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overwrite_callback_clears_tombstone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"new").expect("spool");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.bin", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.bin").await.expect("soft delete");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.write_from_file("/a.bin", &src).await.expect("overwrite");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+                .count(),
+            1,
+            "write_from_file 路径必须清墓碑: {recorded:?}"
+        );
+        drop(recorded);
+        assert!(fs.stat("/a.bin").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    // ===== 单元 3:多端同步刷新调度 =====
+
+    /// bootstrap 预置墓碑(文件×2 + 目录×1)→ 过滤生效,s3_lists = 分页数;
+    /// gauge 联动。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bootstrap_builds_index() {
+        let entries = vec![
+            ("a.txt".into(), false),
+            ("b.txt".into(), false),
+            ("docs/c.txt".into(), false),
+            (".trash/2026-08-16/a.txt".into(), false),
+            (".trash/2026-08-16/b.txt".into(), false),
+            (".trash/2026-08-16/docs/".into(), true),
+        ];
+        let (_mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let before = fs.metrics();
+        fs.trash_bootstrap().await.expect("bootstrap");
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            1,
+            "bootstrap = 单页 1 次 list"
+        );
+        assert_eq!(after.trash_index_entries, 3, "gauge = 3 条墓碑");
+        // 过滤生效:文件/目录墓碑与 .trash 自隐藏,活文件可见
+        let root = fs.list("/").await.unwrap();
+        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"a.txt"), "被删文件隐藏: {names:?}");
+        assert!(!names.contains(&"b.txt"));
+        assert!(!names.contains(&"docs"), "目录墓碑隐藏 common_prefix");
+        assert!(!names.contains(&".trash"), ".trash 自隐藏");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        assert!(fs.stat("/b.txt").await.unwrap().is_none());
+        assert!(fs.stat("/docs").await.unwrap().is_none());
+    }
+
+    /// 两个挂载实例共享同一 mock(各自独立 index/cursor):A 删除 → A 即时
+    /// 隐藏;B 未刷新仍可见;第一次增量后 B 隐藏;**第二次刷新的 start-after
+    /// 列表 == 第一轮游标(游标推进正确)**;**同分区先删 z 再删 a 的字典序
+    /// 逆序新墓碑不得被游标漏掉(裁决 #2:增量轮次对当前 UTC 日期分区
+    /// 始终完整扫描)**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_instance_incremental_sync() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("z.txt", b"zz".to_vec());
+        mock.set_object("a.txt", b"aa".to_vec());
+        let mut a = test_fs(port, 32);
+        let mut b = test_fs(port, 32);
+        a.trash = Some(trash_state(".trash/"));
+        b.trash = Some(trash_state(".trash/"));
+        a.trash_bootstrap().await.expect("A bootstrap");
+        b.trash_bootstrap().await.expect("B bootstrap");
+
+        // 同分区先删 z 再删 a:游标推进到 z 墓碑后,字典序更小的 a 墓碑
+        // 不得被 start-after 游标永远跳过(修复前 a.txt 最长 600s 不可见)
+        a.delete("/z.txt").await.expect("A soft delete z");
+        assert!(a.stat("/z.txt").await.unwrap().is_none(), "A 立即隐藏");
+        assert!(
+            b.stat("/z.txt").await.unwrap().is_some(),
+            "B 未刷新前仍可见(多端窗口)"
+        );
+        // B 第一次增量刷新(bootstrap 时桶空,游标 None)
+        b.trash_refresh_once().await.expect("B 第一次增量");
+        assert!(b.stat("/z.txt").await.unwrap().is_none(), "B 增量后 z 隐藏");
+        assert_eq!(b.metrics().trash_refresh_incrementals, 1);
+
+        // 墓碑 key = A 的 PUT target(剥离查询串与桶前缀)
+        let z_tomb_key: String = {
+            let recorded = mock.recorded.lock().unwrap();
+            let put = recorded
+                .iter()
+                .find(|r| r.method == "PUT" && r.target.contains(".trash"))
+                .expect("A 写墓碑");
+            let target = put.target.split('?').next().unwrap();
+            target
+                .split(".trash/")
+                .nth(1)
+                .map(|k| format!(".trash/{k}"))
+                .expect("target 含 .trash 前缀")
+        };
+        // 游标推进断言:第二轮刷新的 start-after 列表 == 第一轮游标(z 墓碑
+        // key);今天分区完整扫描的列表不带 start-after,不计入。锁在块内
+        // 释放,不得跨后续 await 持有(mock 请求记录锁由连接任务使用)。
+        let second_lists: Vec<String>;
+        {
+            let lists_before = mock.requests.lock().unwrap().len();
+            b.trash_refresh_once().await.expect("B 第二次刷新");
+            let requests = mock.requests.lock().unwrap();
+            second_lists = requests[lists_before..]
+                .iter()
+                .filter(|t| t.contains("list-type=2") && t.contains("start-after="))
+                .cloned()
+                .collect();
+        }
+        assert_eq!(
+            second_lists.len(),
+            1,
+            "第二轮刷新恰好 1 次 start-after 增量列表"
+        );
+        let sa = second_lists[0]
+            .split("start-after=")
+            .nth(1)
+            .map(|v| v.split('&').next().unwrap())
+            .unwrap_or("");
+        let sa_decoded = sa.replace("%2F", "/").replace("%20", " ");
+        assert_eq!(
+            sa_decoded, z_tomb_key,
+            "第二轮刷新的 start-after == 第一轮游标(z 墓碑 key)"
+        );
+        assert_eq!(b.metrics().trash_refresh_incrementals, 2);
+
+        // 同分区新墓碑(字典序 ≤ 游标):A 再删 a.txt,B 必须感知 ——
+        // 增量轮次对当前 UTC 日期分区始终完整扫描(裁决 #2)
+        a.delete("/a.txt").await.expect("A soft delete a");
+        assert!(
+            b.stat("/a.txt").await.unwrap().is_some(),
+            "B 未刷新前仍可见(多端窗口)"
+        );
+        b.trash_refresh_once().await.expect("B 第三轮刷新");
+        assert!(
+            b.stat("/a.txt").await.unwrap().is_none(),
+            "同日新墓碑必须被 B 感知:游标不得漏掉字典序更小的新墓碑"
+        );
+        assert!(b.stat("/z.txt").await.unwrap().is_none());
+    }
+
+    /// 其他端恢复:远端墓碑被外部 DELETE → 全量重建 diff 移除 → 本端复活
+    /// (缓存失效纪律:不复活则 stats 正向缓存旧文件仍可见);未刷新的 A
+    /// 仍隐藏。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_delete_surfaces_on_full_rebuild() {
+        let entries = vec![(".trash/2026-08-16/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut a = test_fs(port, 32);
+        let mut b = test_fs(port, 32);
+        a.trash = Some(trash_state(".trash/"));
+        b.trash = Some(trash_state(".trash/"));
+        a.trash_bootstrap().await.expect("A bootstrap");
+        b.trash_bootstrap().await.expect("B bootstrap");
+        assert!(a.stat("/a.txt").await.unwrap().is_none());
+        assert!(b.stat("/a.txt").await.unwrap().is_none());
+
+        // 外部恢复:远端墓碑被删(mock entries 移除墓碑对象)
+        mock.entries
+            .lock()
+            .unwrap()
+            .retain(|(k, _)| !k.starts_with(".trash/"));
+
+        // B 强制到全量重建周期 → refresh_once 走 full_rebuild → diff 移除
+        {
+            let t = b.trash.as_ref().unwrap();
+            *t.last_full_rebuild.lock().unwrap() = Instant::now()
+                .checked_sub(Duration::from_secs(601))
+                .unwrap();
+        }
+        b.trash_refresh_once().await.expect("full rebuild");
+        assert_eq!(b.metrics().trash_refresh_rebuilds, 1);
+        assert_eq!(b.metrics().trash_index_entries, 0, "diff 移除墓碑");
+        assert!(
+            b.stat("/a.txt").await.unwrap().is_some(),
+            "B 全量重建后复活(缓存已失效)"
+        );
+        // A 未刷新仍隐藏
+        assert!(a.stat("/a.txt").await.unwrap().is_none());
+    }
+
+    /// eager 档:远端写墓碑后本端一次 list 即隐藏(先拉后滤);节流 ≥1s:
+    /// 连续 100 次 list 的增量拉取 ≤ 上界;lazy 下 list 请求数与关闭时
+    /// 一致(性能守卫:lazy 零额外远程成本)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eager_throttles() {
+        let (mock, port) = MockS3::start(
+            vec![("a.txt".into(), false), ("b.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_object("b.txt", b"b".to_vec());
+        let mut eager = test_fs(port, 32);
+        let mut state = trash_state(".trash/");
+        Arc::get_mut(&mut state).expect("独占引用").mode = TrashRefreshMode::Eager;
+        eager.trash = Some(state);
+        eager.trash_bootstrap().await.expect("bootstrap");
+
+        // 其他端删除 b.txt:只写墓碑对象(远端状态),本端索引未感知
+        mock.entries
+            .lock()
+            .unwrap()
+            .push((".trash/2026-08-16/b.txt".into(), false));
+        // 一次 list 即隐藏(先拉后滤)
+        let root = eager.list("/").await.unwrap();
+        assert!(
+            !root.iter().any(|e| e.name == "b.txt"),
+            "eager 一次 list 即感知远端墓碑"
+        );
+        assert!(root.iter().any(|e| e.name == "a.txt"), "活文件仍可见");
+        let incr_after_one = eager.metrics().trash_refresh_incrementals;
+
+        // 连续 100 次 list:节流不变量为「每 1s 至多一次增量拉取」—— 断言
+        // 随真实墙钟缩放(满载 CI 下 100 次 list 可能超过 1s,固定上界会
+        // 误报 flake;按 elapsed 秒 + 1 的上界仍精确验证节流)。
+        let tick_start = Instant::now();
+        for _ in 0..100 {
+            let _ = eager.list("/").await.unwrap();
+        }
+        let bound = tick_start.elapsed().as_secs() + 1;
+        let incr_delta = eager.metrics().trash_refresh_incrementals - incr_after_one;
+        assert!(
+            incr_delta <= bound,
+            "节流必须 ≤ 每秒一次:100 次 list 增量 {incr_delta} 次,墙钟上界 {bound}"
+        );
+
+        // lazy 性能守卫:mode=lazy 时 list 的 s3_lists 增量 == 关闭时
+        let mut lazy = test_fs(port, 32);
+        lazy.trash = Some(trash_state(".trash/"));
+        let base = lazy.metrics().s3_lists;
+        for _ in 0..10 {
+            let _ = lazy.list("/").await.unwrap();
+        }
+        assert_eq!(
+            lazy.metrics().s3_lists - base,
+            10,
+            "lazy 下 list 无额外远程成本"
+        );
+
+        // 阳性对照(裁决 #1):eager + ignore_start_after(降级)下,全量重建
+        // 次数受 last_full_rebuild 周期节流 —— 连续多轮 eager poll 至多
+        // 一次全量(修复前:降级分支每轮都 full_rebuild,5 轮 poll = 5 次
+        // 全量,每分钟 ~60 次全量 ≈ 3000 次 list/分)。
+        mock.ignore_start_after.store(true, Ordering::SeqCst);
+        let rebuilds_before = eager.metrics().trash_refresh_rebuilds;
+        {
+            let t = eager.trash.as_ref().unwrap();
+            *t.last_full_rebuild.lock().unwrap() = Instant::now()
+                .checked_sub(Duration::from_secs(601))
+                .unwrap();
+        }
+        let tick_start = Instant::now();
+        for _ in 0..5 {
+            // 手动拨快 eager 节流戳:绕过 1s 节流,保证 5 轮都真正执行 poll
+            {
+                let t = eager.trash.as_ref().unwrap();
+                *t.last_eager_poll.lock().unwrap() =
+                    Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+            }
+            let _ = eager.list("/").await.unwrap();
+        }
+        let rebuild_delta = eager.metrics().trash_refresh_rebuilds - rebuilds_before;
+        // 节流断言随真实墙钟缩放(LESSON):全量重建 ≤ 每 rebuild_interval 一次
+        let bound = tick_start.elapsed().as_secs() / TRASH_REBUILD_INTERVAL_SECS + 1;
+        assert!(
+            rebuild_delta <= bound,
+            "降级 eager 全量重建必须受周期节流:5 轮 poll 全量 {rebuild_delta} 次,上界 {bound}(修复前为 5)"
+        );
+    }
+
+    /// 裁决 #10:清墓碑按日期分区反向扫描(先查今天分区)—— 请求数从
+    /// O(墓碑总数/页) 收紧为 O(分区数);全量覆盖(不做「首个命中即停」:
+    /// 旧分区残留墓碑会让已提交写入在下次刷新后重新隐藏);今天分区最先
+    /// 探测。修复前:全量分页枚举 .trash(1 次 list),本测试断言
+    /// 1+2×分区数次列表(文件+目录双形态,常量因子)与探测顺序,旧实现
+    /// 必红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_tombstones_partition_scan_bounded_and_full_coverage() {
+        let today = trash::date_partition_utc(std::time::SystemTime::now());
+        let yesterday = today.pred_opt().expect("today 非纪元首日");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 今天分区墓碑(软删除真实写入)+ 昨天分区墓碑 + 无关墓碑
+        fs.delete("/a.txt").await.expect("soft delete");
+        mock.recorded.lock().unwrap().clear();
+        let old_tomb = format!(".trash/{yesterday}/a.txt");
+        mock.set_object(&old_tomb, br#"{"is_dir":false}"#.to_vec());
+        mock.entries.lock().unwrap().push((old_tomb, false));
+        let unrelated = format!(".trash/{today}/b.txt");
+        mock.set_object(&unrelated, br#"{"is_dir":false}"#.to_vec());
+        mock.entries
+            .lock()
+            .unwrap()
+            .push((unrelated.clone(), false));
+        let today_tomb = format!(".trash/{today}/a.txt");
+
+        fs.write("/a.txt", b"new").await.expect("同名重建");
+
+        let recorded = mock.recorded.lock().unwrap();
+        // 全量覆盖:两个分区的同名墓碑都必须删除;无关墓碑保留
+        let trash_deletes: Vec<&str> = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .map(|r| {
+                r.target
+                    .split('?')
+                    .next()
+                    .unwrap_or(&r.target)
+                    .split(".trash/")
+                    .nth(1)
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(
+            trash_deletes.len(),
+            2,
+            "跨分区同名墓碑全清: {trash_deletes:?}"
+        );
+        assert!(
+            trash_deletes.iter().any(|k| *k == format!("{today}/a.txt")),
+            "今天分区墓碑被删: {trash_deletes:?}"
+        );
+        assert!(
+            trash_deletes
+                .iter()
+                .any(|k| *k == format!("{yesterday}/a.txt")),
+            "旧分区墓碑被删: {trash_deletes:?}"
+        );
+        drop(recorded);
+        assert!(
+            mock.objects.lock().unwrap().contains_key(&unrelated),
+            "无关墓碑不得误删"
+        );
+        // 请求数有界:1 次分区枚举(delimiter)+ 分区数 × 2 形态(文件 +
+        // 目录)探测 —— 与墓碑总数无关,仅双形态常量因子(修复前单形态
+        // 为 1 次全量分页枚举,本断言约束 O(分区数) 上界不回归)
+        let lists: Vec<String> = mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.contains("list-type=2"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            lists.len(),
+            5,
+            "1 delimiter 枚举 + 2 分区 × 2 形态探测: {lists:?}"
+        );
+        assert!(
+            lists[0].contains("delimiter="),
+            "第一笔必须是分区枚举(delimiter): {lists:?}"
+        );
+        // 反向顺序:今天分区最先探测
+        let today_idx = lists
+            .iter()
+            .position(|t| t.contains(&format!("prefix=")) && t.contains(&today.to_string()))
+            .expect("今天分区探测存在");
+        let yesterday_idx = lists
+            .iter()
+            .position(|t| t.contains(&yesterday.to_string()))
+            .expect("旧分区探测存在");
+        assert!(today_idx < yesterday_idx, "今天分区必须最先探测: {lists:?}");
+        // 重建后立即可见,gauge 归零
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 裁决 #7:refresh_once 入口统一 poll_inflight 互斥 —— 周期循环与
+    /// eager 挂点共用一把锁(失败即跳过,天然限 1)。占住互斥位时周期
+    /// 刷新必须零远程请求(修复前:eager 挂点与周期 refresh_loop 可并发
+    /// refresh_once,两轮全量 list + 双倍 S3 成本)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_once_skips_when_inflight_held() {
+        let (mock, port) = MockS3::start(
+            vec![(".trash/2026-08-16/a.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_bootstrap().await.expect("bootstrap");
+        // 模拟并发中的增量/重建:占住互斥位
+        fs.trash
+            .as_ref()
+            .unwrap()
+            .poll_inflight
+            .store(true, Ordering::SeqCst);
+        let before = fs.metrics();
+        fs.trash_refresh_once()
+            .await
+            .expect("占锁时刷新必须静默跳过(Ok)");
+        let after = fs.metrics();
+        assert_eq!(
+            after.s3_lists - before.s3_lists,
+            0,
+            "占锁时周期刷新必须零远程列表(与 eager 共用 poll_inflight)"
+        );
+        assert_eq!(
+            after.trash_refresh_incrementals - before.trash_refresh_incrementals,
+            0,
+            "占锁时不得计数增量"
+        );
+        assert_eq!(
+            after.trash_refresh_rebuilds - before.trash_refresh_rebuilds,
+            0,
+            "占锁时不得计数全量重建"
+        );
+        // 释放后恢复正常刷新
+        fs.trash
+            .as_ref()
+            .unwrap()
+            .poll_inflight
+            .store(false, Ordering::SeqCst);
+        fs.trash_refresh_once().await.expect("释放后刷新正常");
+    }
+
+    /// 刷新失败不拖垮挂载:强制 trash list 报错(分页无 token 护栏)→
+    /// refresh_once Err + trash_refresh_errors 计数;故障恢复后上层
+    /// list/stat 正常、索引未被破坏;下一轮刷新自愈。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_failure_does_not_fail_mount() {
+        let entries = vec![(".trash/2026-08-16/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_bootstrap().await.expect("bootstrap");
+
+        // 截断无 continuation token → next_page_token 护栏 bail(等价 list 故障)
+        mock.list_truncated_no_token.store(true, Ordering::SeqCst);
+        let err = fs
+            .trash_refresh_once()
+            .await
+            .expect_err("截断无 token 必须报错");
+        assert!(
+            err.to_string().contains("continuation token"),
+            "next_page_token 护栏: {err:?}"
+        );
+        assert_eq!(fs.metrics().trash_refresh_errors, 1);
+
+        // 故障恢复:上层操作正常,索引未被故障破坏(墓碑仍隐藏)
+        mock.list_truncated_no_token.store(false, Ordering::SeqCst);
+        let root = fs.list("/").await.unwrap();
+        assert!(!root.iter().any(|e| e.name == "a.txt"));
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        // 下一轮刷新自愈
+        fs.trash_refresh_once().await.expect("刷新自愈");
+    }
+
+    /// start-after 自动探测降级:mock 忽略 start-after(返回全部 key)→
+    /// 当轮 start_after_supported=false、转全量重建、计数联动;后续每轮
+    /// 退化为全量(正确性不损)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn start_after_detection_degrades() {
+        let entries = vec![(".trash/2026-08-16/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 先 bootstrap(游标 = 最后 key);再让 store 忽略 start-after
+        fs.trash_bootstrap().await.expect("bootstrap");
+        mock.ignore_start_after.store(true, Ordering::SeqCst);
+        fs.trash_refresh_once().await.expect("降级全量必须成功");
+        let m = fs.metrics();
+        assert_eq!(m.trash_start_after_ignored, 1, "探测计数");
+        assert_eq!(m.trash_refresh_rebuilds, 1, "降级当轮计入全量重建");
+        assert!(
+            !fs.trash
+                .as_ref()
+                .unwrap()
+                .start_after_supported
+                .load(Ordering::SeqCst),
+            "探测后 start_after_supported=false"
+        );
+        // 后续刷新退化为「今天分区扫描 + 周期节流全量」(裁决 #1):
+        // 探测当轮的全量重建已重置 last_full_rebuild,非到期轮不再重复
+        // 全量(修复前:每轮都 full_rebuild,降级 eager 每分钟数百次全量)
+        fs.trash_refresh_once().await.expect("降级后的刷新");
+        assert_eq!(
+            fs.metrics().trash_refresh_rebuilds,
+            1,
+            "降级全量受 last_full_rebuild 周期节流(600s 内至多一次)"
+        );
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
     }
 }
 

@@ -777,6 +777,14 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
         }
     }
 
+    // 回收站:挂载启动全量建索引(bootstrap 失败仅 warn + 计数,不阻塞挂载;
+    // 周期刷新自愈)+ 启动周期刷新循环(tokio::spawn,不受 WinFsp 同步回调
+    // 栈限制影响)。
+    if fs.trash_enabled() {
+        let _ = fs.trash_bootstrap().await;
+        fs.trash_refresh_start();
+    }
+
     let rt = Handle::current();
     let read_only = fs.read_only();
     let dirty_budget = fs.dirty_budget();

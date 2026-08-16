@@ -35,8 +35,55 @@ metadata database (s3fs-style layout).
 - Runtime records: `ossmount` writes per-instance JSON under
   `%TEMP%\ossfs-oss` (used by the tray to list/stop mounts).
 
+## Trash (soft delete)
+
+Deletion is soft by default: `unlink`/`rmdir` no longer remove the object —
+they write a small JSON tombstone under the hidden `.trash/` prefix
+(`.trash/<YYYY-MM-DD>/<original-key>`, partitioned by the UTC deletion date)
+while the original object stays in the bucket. The mount filters tombstoned
+keys out of `list`/`stat`, so deleted paths disappear from the drive view
+without any extra remote requests. Restore = delete the tombstone; real space
+reclamation = GC purging expired tombstones and their original objects
+(default retention: 30 days; management commands and GC scheduling land in
+the same release). `--no-trash` restores the previous immediate
+permanent-delete behavior; `--trash-dir NAME` (default `.trash`) selects the
+tombstone prefix.
+
+The default soft-delete semantics deliberately deviate from POSIX and are
+documented here:
+
+1. **Deleting no longer frees space.** `unlink`/`rmdir` keep the original
+   objects until GC purges them (default 30 days). `--no-trash` restores
+   immediate permanent deletion.
+2. **"Deleted" is a client-side illusion of this mount.** The OSS console,
+   other S3 clients, and other mounts that have not synced the tombstones
+   still see the "deleted" original objects.
+3. **Restore does not guarantee the content as of deletion time.** A tombstone
+   records only the key and an etag. If the same key was overwritten after
+   deletion, restoring yields the new content; restore checks the etag and
+   warns in that case.
+4. **Deletion takes effect with a delay window.** A remote deletion becomes
+   visible on this mount within the refresh interval (default 30 s) plus OSS
+   eventual consistency (seconds); restore propagates the same way, with the
+   longest delay being the full-rebuild period (10 min).
+5. **Directory GC uses an mtime heuristic** to decide whether objects under a
+   tombstoned directory predate the tombstone date — it is not guaranteed to
+   be perfect.
+
+- **Bucket versioning**: versioning preserves content — every version and
+  delete marker stays in the bucket and is recoverable from the console/SDK —
+  while tombstones manage interaction: what the mount view hides and how
+  restore/GC behave. The two are complementary and can be enabled together.
+- **Operations**: the `.trash/` prefix stays in the bucket and is hidden from
+  the mount view (creating it succeeds but it is immediately hidden from the
+  view, so a real `.trash` directory at the namespace root is unavailable).
+  Recreating a path with the same name first clears its tombstone, so the new
+  content is immediately visible (overwrite semantics).
+
 ## Known POSIX / FUSE limitations
 
+- (Trash soft-delete further deviates from POSIX — see
+  [Trash (soft delete)](#trash-soft-delete) above.)
 - `generic/075` (xfstests) and LTP `iogen01` remain excluded from default test
   profiles: buffered FUSE mmap after truncate/extend can expose stale
   page-cache data, and the tiny-overlap direct-I/O profile has a

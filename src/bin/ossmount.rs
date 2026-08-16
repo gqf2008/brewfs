@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use ossfs::{ObjectFs, OssConfig};
+use ossfs::{ObjectFs, OssConfig, TrashRefreshMode};
 
 fn usage_text() -> String {
     "usage: ossmount [mount] [--config PATH] --bucket BUCKET [--endpoint URL] [--region REGION] [--version]\n\
@@ -46,9 +46,17 @@ fn usage_text() -> String {
                  [--metrics-listen ADDR]\n\
                  [--log-dir PATH] [--log-level LEVEL] [--metrics-log-interval N]\n\
                  [--total-mem-limit N] [--total-mem-read-ratio R] [--read-cache-max-bytes N]\n\
+                 [--trash-dir NAME] [--trash-refresh-mode lazy|eager] [--no-trash]\n\
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
+         --trash-dir NAME:  trash (soft delete) directory, default ON as .trash\n\
+                           (deleted objects stay until GC, default 30-day retention;\n\
+                           restore / GC commands land in 0.2.0);\n\
+                           --no-trash restores immediate permanent delete\n\
+         --trash-refresh-mode lazy|eager:  trash refresh policy, default lazy\n\
+                           (eager refreshes tombstones before every list/stat,\n\
+                           shrinking the remote-deletion visibility window)\n\
          env:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY\n\
          --config PATH:  JSON config file; keys are long option names (CLI\n\
                           args override file values). access_key_id /\n\
@@ -134,6 +142,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "log-dir",
     "log-level",
     "metrics-log-interval",
+    "trash-dir",
+    "trash-refresh-mode",
+    "no-trash",
 ];
 
 /// Expand a JSON config file into CLI arguments. Each top-level key maps
@@ -206,6 +217,23 @@ fn parse_args() -> (
     Option<String>,
     u64,
 ) {
+    parse_args_from(env::args().skip(1).collect())
+}
+
+/// [`parse_args`] 的可测形态:参数显式传入(测试驱动,真实入口经
+/// env::args 收集后转发)。无效值仍走 usage() 退出,与 CLI 行为一致。
+fn parse_args_from(
+    raw_args: Vec<String>,
+) -> (
+    OssConfig,
+    PathBuf,
+    u64,
+    Option<String>,
+    Option<PathBuf>,
+    Option<String>,
+    u64,
+) {
+    let mut raw = raw_args;
     let mut bucket = String::new();
     let mut endpoint: Option<String> = None;
     let mut region = "us-east-1".to_string();
@@ -258,8 +286,10 @@ fn parse_args() -> (
     let mut disk_cache_reserve_diskfree: u64 = 0;
     let mut disk_cache_free_space_ratio: Option<f64> = None;
     let mut mount_point: Option<PathBuf> = None;
+    let mut trash_dir: Option<String> = None;
+    let mut trash_refresh_mode: Option<TrashRefreshMode> = None;
+    let mut no_trash = false;
 
-    let mut raw: Vec<String> = env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("mount") {
         raw.remove(0);
     }
@@ -539,6 +569,23 @@ fn parse_args() -> (
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            "--no-trash" => no_trash = true,
+            "--trash-dir" => {
+                let v = iter.next().unwrap_or_else(|| usage());
+                // 单段名校验(与 build_trash_state 一致):含 '/'、'.'、'..'、空 → usage()
+                if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                    usage();
+                }
+                trash_dir = Some(v);
+            }
+            "--trash-refresh-mode" => {
+                let v = iter.next().unwrap_or_else(|| usage());
+                trash_refresh_mode = Some(match v.as_str() {
+                    "lazy" => TrashRefreshMode::Lazy,
+                    "eager" => TrashRefreshMode::Eager,
+                    _ => usage(),
+                });
+            }
             other if other.starts_with("--") => {
                 eprintln!("ossmount: unknown option: {other}");
                 usage();
@@ -598,6 +645,17 @@ fn parse_args() -> (
             retries,
             multipart_size,
             multipart_concurrency,
+            // CLI 默认开启回收站(D5);--no-trash 优先级最高。其余四字段由
+            // 单元 3/4 落地(本单元仅声明,None = 未设置)。
+            trash_dir: if no_trash {
+                None
+            } else {
+                Some(trash_dir.unwrap_or_else(|| ".trash".to_string()))
+            },
+            trash_retention_days: None,
+            trash_refresh_interval_secs: None,
+            trash_refresh_mode,
+            trash_gc_interval_secs: None,
         },
         mount_point,
         refresh_secs,
@@ -697,7 +755,35 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KNOWN_CONFIG_KEYS, expand_config_file, parse_mode};
+    use super::{
+        KNOWN_CONFIG_KEYS, TrashRefreshMode, expand_config_file, parse_args_from, parse_mode,
+    };
+
+    #[test]
+    fn parses_trash_refresh_mode_flag() {
+        // --trash-refresh-mode eager → OssConfig.trash_refresh_mode = Some(Eager)
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--trash-refresh-mode".to_string(),
+            "eager".to_string(),
+            "Z:".to_string(),
+        ]);
+        assert_eq!(
+            cfg.trash_refresh_mode,
+            Some(TrashRefreshMode::Eager),
+            "--trash-refresh-mode eager 必须映射到 Some(Eager)"
+        );
+        // lazy 显式值同样可解析(默认值形态)
+        let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
+            "--bucket".to_string(),
+            "b".to_string(),
+            "--trash-refresh-mode".to_string(),
+            "lazy".to_string(),
+            "Z:".to_string(),
+        ]);
+        assert_eq!(cfg.trash_refresh_mode, Some(TrashRefreshMode::Lazy));
+    }
 
     #[test]
     fn config_file_expands_flags_and_skips_false_switches() {

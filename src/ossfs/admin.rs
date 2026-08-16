@@ -257,6 +257,13 @@ mod tests {
             prefetch_failed: 12,
             list_throttled: 13,
             crc64_mismatches: 8,
+            trash_tombstones_written: 0,
+            trash_index_entries: 0,
+            trash_refresh_incrementals: 0,
+            trash_refresh_rebuilds: 0,
+            trash_refresh_errors: 0,
+            trash_start_after_ignored: 0,
+            trash_bootstrap_failures: 0,
         });
         assert!(body.contains("ossfs_reads_total 1\n"));
         assert!(body.contains("ossfs_crc64_mismatches_total 8\n"));
