@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -83,8 +83,10 @@ thread_local! {
 
 /// dirs(升序)中精确二分查找 prefix;每轮比较计数一次(裁决 #5 测试断言
 /// 复杂度上界用)。非 test 构建下闭包只做比较,零额外开销。
-fn dirs_binary_search_covered(dirs: &[String], prefix: &str) -> bool {
-    dirs.binary_search_by(|d| {
+/// 裁决 R4:dirs 携带 date(系统回收站视图冷路径按索引 date 反查墓碑 key),
+/// 二分键仍是 `.0`(比较计数插桩保持)。
+fn dirs_binary_search_covered(dirs: &[(String, chrono::NaiveDate)], prefix: &str) -> bool {
+    dirs.binary_search_by(|(d, _)| {
         #[cfg(test)]
         {
             if COUNT_IS_COVERED.with(|c| c.get()) {
@@ -97,14 +99,19 @@ fn dirs_binary_search_covered(dirs: &[String], prefix: &str) -> bool {
 }
 
 /// 被删 key 索引。精确命中(文件墓碑)或前缀覆盖(目录墓碑)。
-/// files 用 HashSet(精确匹配),dirs 用排序 Vec(前缀二分)—— 不用布隆过滤器的
-/// 理由见设计稿 D2:布隆不可删除(与恢复冲突),且误报方向是藏起活文件。
+/// files 用 HashMap(精确匹配,date = 最新墓碑日期),dirs 用排序 Vec
+/// (前缀二分)—— 不用布隆过滤器的理由见设计稿 D2:布隆不可删除(与恢复
+/// 冲突),且误报方向是藏起活文件。
+/// 裁决 R4:date 随墓碑 key 免费可得(解码时已有,原被丢弃),一并索引 ——
+/// 系统回收站视图冷路径(body 反查)与渲染需要 date,避免二次解码。内存
+/// 增量 ≈ 16-24B/条(500k 条 ≈ 10MB,不含 size/etag/recycle_name)。
 #[derive(Debug, Default)]
 pub struct TombstoneIndex {
-    /// 被删精确 key(文件,含命名空间前缀,无尾斜杠)
-    pub files: HashSet<String>,
-    /// 被删目录前缀(一律以 '/' 结尾,含命名空间前缀),升序、无重复
-    pub dirs: Vec<String>,
+    /// 被删精确 key(文件,含命名空间前缀,无尾斜杠)→ 最新墓碑日期
+    pub files: HashMap<String, chrono::NaiveDate>,
+    /// 被删目录前缀(一律以 '/' 结尾,含命名空间前缀),按 key 升序、无
+    /// 重复(key 去重保留最新日期)
+    pub dirs: Vec<(String, chrono::NaiveDate)>,
 }
 
 impl TombstoneIndex {
@@ -113,7 +120,7 @@ impl TombstoneIndex {
     /// (stat("/docs") 得 key "docs",目录墓碑存 "docs/";只对 key 前缀匹配会漏,
     /// 经 marker HEAD 把已删目录复活。)
     pub fn is_covered(&self, key: &str) -> bool {
-        if self.files.contains(key) {
+        if self.files.contains_key(key) {
             return true;
         }
         if self.dirs.is_empty() {
@@ -147,19 +154,33 @@ impl TombstoneIndex {
         false
     }
 
-    /// 插入墓碑。is_dir=true 归一化补尾斜杠并保 dirs 升序;重复插入幂等。
-    pub fn insert(&mut self, key: &str, is_dir: bool) {
+    /// 插入墓碑。is_dir=true 归一化补尾斜杠并保 dirs 升序;重复插入幂等,
+    /// date 取最新(同名多日期墓碑只留一条,裁决 R7 —— 系统视图冷路径按
+    /// 索引 date 反查墓碑 key,必须指向最新墓碑)。
+    pub fn insert(&mut self, key: &str, is_dir: bool, date: chrono::NaiveDate) {
         if is_dir {
             let dir = if key.ends_with('/') {
                 key.to_string()
             } else {
                 format!("{key}/")
             };
-            if let Err(pos) = self.dirs.binary_search(&dir) {
-                self.dirs.insert(pos, dir);
+            match self.dirs.binary_search_by(|(k, _)| k.as_str().cmp(&dir)) {
+                Ok(pos) => {
+                    if date > self.dirs[pos].1 {
+                        self.dirs[pos].1 = date;
+                    }
+                }
+                Err(pos) => self.dirs.insert(pos, (dir, date)),
             }
         } else {
-            self.files.insert(key.to_string());
+            self.files
+                .entry(key.to_string())
+                .and_modify(|d| {
+                    if date > *d {
+                        *d = date;
+                    }
+                })
+                .or_insert(date);
         }
     }
 
@@ -171,7 +192,7 @@ impl TombstoneIndex {
             } else {
                 format!("{key}/")
             };
-            if let Ok(pos) = self.dirs.binary_search(&dir) {
+            if let Ok(pos) = self.dirs.binary_search_by(|(k, _)| k.as_str().cmp(&dir)) {
                 self.dirs.remove(pos);
             }
         } else {
@@ -179,26 +200,47 @@ impl TombstoneIndex {
         }
     }
 
-    /// 整体替换;dirs sort_unstable+dedup;files 由 HashSet 天然去重(同名多日期墓碑)。
-    pub fn rebuild(&mut self, tombstones: impl Iterator<Item = (String, bool)>) {
-        let mut files = HashSet::new();
-        let mut dirs = Vec::new();
-        for (key, is_dir) in tombstones {
+    /// 整体替换;dirs 按 key sort + 去重(保留最新 date);files 由 HashMap
+    /// 天然按 key 去重(同名多日期墓碑只留最新 date)。
+    pub fn rebuild(
+        &mut self,
+        tombstones: impl Iterator<Item = (String, bool, chrono::NaiveDate)>,
+    ) {
+        let mut files = HashMap::new();
+        let mut dirs: Vec<(String, chrono::NaiveDate)> = Vec::new();
+        for (key, is_dir, date) in tombstones {
             if is_dir {
                 let dir = if key.ends_with('/') {
                     key
                 } else {
                     format!("{key}/")
                 };
-                dirs.push(dir);
+                dirs.push((dir, date));
             } else {
-                files.insert(key);
+                files
+                    .entry(key)
+                    .and_modify(|d: &mut chrono::NaiveDate| {
+                        if date > *d {
+                            *d = date;
+                        }
+                    })
+                    .or_insert(date);
             }
         }
-        dirs.sort_unstable();
-        dirs.dedup();
+        dirs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut deduped: Vec<(String, chrono::NaiveDate)> = Vec::with_capacity(dirs.len());
+        for (k, date) in dirs {
+            match deduped.last_mut() {
+                Some(last) if last.0 == k => {
+                    if date > last.1 {
+                        last.1 = date;
+                    }
+                }
+                _ => deduped.push((k, date)),
+            }
+        }
         self.files = files;
-        self.dirs = dirs;
+        self.dirs = deduped;
     }
 }
 
@@ -262,7 +304,7 @@ pub(crate) async fn fetch_all_tombstones(
     list_trash_keys(fs, None, None, |page| {
         for key in page {
             if let Some(t) = decode_tombstone_key(&prefix, &key) {
-                index.insert(&t.original_key, t.is_dir);
+                index.insert(&t.original_key, t.is_dir, t.date);
             }
             last_key = Some(key);
         }
@@ -356,12 +398,12 @@ impl TrashState {
     }
 
     /// 应用新增墓碑:短写锁批量 insert + 锁外缓存失效 + gauge(锁不跨
-    /// await;insert 幂等,同名多日期墓碑只留一条)。
+    /// await;insert 幂等,同名多日期墓碑只留最新一条)。
     /// 代际校验(L4):调用方传入开始拉取时捕获的 generation_snapshot,若
     /// 期间 trash_gc 已完成(代际推进)则本轮快照已陈旧 —— 其中可能含
     /// GC 刚删掉的墓碑,整体丢弃返回 false(游标不推进,下轮重试),绝不
     /// 把已删墓碑重插回索引。
-    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool)], gen_snapshot: u64) -> bool {
+    fn apply_added(&self, fs: &ObjectFs, added: &[(String, bool, chrono::NaiveDate)], gen_snapshot: u64) -> bool {
         if self.generation.load(Ordering::SeqCst) != gen_snapshot {
             return false; // GC 并发完成:陈旧快照整体丢弃(L4)
         }
@@ -370,30 +412,47 @@ impl TrashState {
         }
         {
             let mut idx = self.index.write().unwrap();
-            // 裁决 #13:锁内一次性整体换入 —— dirs 批量 extend + sort_unstable
-            // + dedup(O((n+m)log(n+m))),取代逐条 binary_search+insert 的
-            // O(m×n) memmove(数十万 dirs + 上千新增时写锁持续毫秒到秒级,
+            // 裁决 #13:锁内一次性整体换入 —— dirs 批量 extend + 按 key 排序
+            // + 去重(保留最新 date,裁决 R4),取代逐条 binary_search+insert
+            // 的 O(m×n) memmove(数十万 dirs + 上千新增时写锁持续毫秒到秒级,
             // 期间全部 list/stat 读锁被阻塞)。mem::take 零克隆换出原 Vec,
-            // 排序期间读侧被写锁遮挡;files 由 HashSet 批量 extend(O(m))。
+            // 排序期间读侧被写锁遮挡;files 由 HashMap 批量 entry(O(m))。
             let mut dirs = std::mem::take(&mut idx.dirs);
-            dirs.extend(added.iter().filter(|(_, is_dir)| *is_dir).map(|(k, _)| {
+            dirs.extend(added.iter().filter(|(_, is_dir, _)| *is_dir).map(|(k, _, date)| {
                 if k.ends_with('/') {
-                    k.clone()
+                    (k.clone(), *date)
                 } else {
-                    format!("{k}/")
+                    (format!("{k}/"), *date)
                 }
             }));
-            dirs.sort_unstable();
-            dirs.dedup();
-            idx.dirs = dirs;
-            for (key, is_dir) in added {
+            dirs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut deduped: Vec<(String, chrono::NaiveDate)> = Vec::with_capacity(dirs.len());
+            for (k, date) in dirs {
+                match deduped.last_mut() {
+                    Some(last) if last.0 == k => {
+                        if date > last.1 {
+                            last.1 = date;
+                        }
+                    }
+                    _ => deduped.push((k, date)),
+                }
+            }
+            idx.dirs = deduped;
+            for (key, is_dir, date) in added {
                 if !*is_dir {
-                    idx.files.insert(key.clone());
+                    idx.files
+                        .entry(key.clone())
+                        .and_modify(|d| {
+                            if *date > *d {
+                                *d = *date;
+                            }
+                        })
+                        .or_insert(*date);
                 }
             }
             self.store_index_entries(idx.len());
         }
-        for (key, is_dir) in added {
+        for (key, is_dir, _) in added {
             invalidate_key(fs, key, *is_dir);
         }
         true
@@ -416,13 +475,13 @@ impl TrashState {
         let today = date_partition_utc(SystemTime::now());
         let today_prefix = format!("{}{}/", self.prefix, today);
         let prefix = self.prefix.clone();
-        let mut added: Vec<(String, bool)> = Vec::new();
+        let mut added: Vec<(String, bool, chrono::NaiveDate)> = Vec::new();
         let mut last_key_phase1: Option<String> = None;
         // 阶段一:今天分区完整扫描(游标无关)
         list_trash_keys(fs, None, Some(&today_prefix), |page| {
             for key in page {
                 if let Some(t) = decode_tombstone_key(&prefix, &key) {
-                    added.push((t.original_key, t.is_dir));
+                    added.push((t.original_key, t.is_dir, t.date));
                 }
                 last_key_phase1 = Some(key);
             }
@@ -469,7 +528,7 @@ impl TrashState {
                     continue; // 今天分区已由阶段一完整覆盖
                 }
                 if let Some(t) = decode_tombstone_key(&prefix, &key) {
-                    added.push((t.original_key, t.is_dir));
+                    added.push((t.original_key, t.is_dir, t.date));
                 }
                 last_key_phase2 = Some(key);
             }
@@ -524,12 +583,14 @@ impl TrashState {
         // 不分配)后归并扫描 —— 省两个 HashSet(500k 条目时每 HashSet 约
         // 16B/桶 + 哈希运算,归并扫描峰值约减半)。语义与 HashSet 差集
         // 等价:removed = prev - new(被恢复/被 GC 移除),added = new - prev。
+        // 裁决 R4:entries 带 date —— 同名同形态跨日期条目在归并中自然产生
+        // removed+added 对(缓存失效重复一次无害;索引以 new 整体换入)。
         let mut prev_sorted = prev;
         prev_sorted.sort_unstable();
         let mut new_sorted = index.entries();
         new_sorted.sort_unstable();
-        let mut removed: Vec<(String, bool)> = Vec::new();
-        let mut added: Vec<(String, bool)> = Vec::new();
+        let mut removed: Vec<(String, bool, chrono::NaiveDate)> = Vec::new();
+        let mut added: Vec<(String, bool, chrono::NaiveDate)> = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);
         while i < prev_sorted.len() && j < new_sorted.len() {
             match prev_sorted[i].cmp(&new_sorted[j]) {
@@ -559,7 +620,7 @@ impl TrashState {
             fs.stats.lock().unwrap().clear();
             fs.negative.lock().unwrap().clear();
         } else {
-            for (key, is_dir) in removed.iter().chain(added.iter()) {
+            for (key, is_dir, _) in removed.iter().chain(added.iter()) {
                 invalidate_key(fs, key, *is_dir);
             }
         }
@@ -636,7 +697,8 @@ fn invalidate_key(fs: &ObjectFs, key: &str, is_dir: bool) {
 }
 
 /// 墓碑 body(serde 往返;serde_json 已是直接依赖)。serde 默认忽略未知
-/// 字段 → 前向兼容。
+/// 字段 → 前向兼容;新增字段一律 `#[serde(default, skip_serializing_if = ...)]`
+/// —— 旧版本客户端读新墓碑不炸、旧墓碑读入新字段默认 None。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TombstoneBody {
     /// 文件墓碑:HEAD 原样 e_tag(OSS 带引号大写 / S3 小写;恢复比较忽略大小写)
@@ -647,6 +709,15 @@ pub struct TombstoneBody {
     pub size: Option<u64>,
     /// 目录墓碑 = {"is_dir":true}
     pub is_dir: bool,
+    /// 回收站条目名(裁决 R2):Windows = Explorer 的 $R 名(必须记录,
+    /// Explorer 还原按自己生成的 $R 名 rename);macOS = Finder 改名后的
+    /// 条目名(与原名一致时 None,渲染回退 basename)。反向索引键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recycle_name: Option<String>,
+    /// 捕获的 $I 文件原始字节(裁决 R8,含盘符原始路径),上限 4KiB;不真实
+    /// 落桶(软删零数据复制)。stat/read($I) 由此服务;缺失时读时合成回退。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recycle_i: Option<Vec<u8>>,
 }
 
 // ---------- 单元 4:管理命令与 GC 类型 ----------
@@ -742,14 +813,19 @@ impl TombstoneIndex {
     /// (soft_delete_file:索引已覆盖 → 幂等 Ok,零远程;重建入口的双形态
     /// 门控见 [`Self::clear_tombstones_if_covered`])。
     pub fn is_file_covered(&self, key: &str) -> bool {
-        self.files.contains(key)
+        self.files.contains_key(key)
     }
 
-    /// 全量枚举(files+dirs),供 full_rebuild diff(单元 3)。
-    pub fn entries(&self) -> Vec<(String, bool)> {
+    /// 全量枚举(files+dirs,带 date),供 full_rebuild diff(单元 3)与
+    /// 系统回收站视图渲染(单元 1)。
+    pub fn entries(&self) -> Vec<(String, bool, chrono::NaiveDate)> {
         let mut out = Vec::with_capacity(self.files.len() + self.dirs.len());
-        out.extend(self.files.iter().cloned().map(|k| (k, false)));
-        out.extend(self.dirs.iter().cloned().map(|k| (k, true)));
+        out.extend(
+            self.files
+                .iter()
+                .map(|(k, d)| (k.clone(), false, *d)),
+        );
+        out.extend(self.dirs.iter().map(|(k, d)| (k.clone(), true, *d)));
         out
     }
 
@@ -811,13 +887,15 @@ impl TrashState {
                 etag,
                 size,
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         )
         .await?;
         // 提交点后:索引 + 缓存失效 + 计数(put 失败则以上全部不发生)
         {
             let mut idx = self.index.write().unwrap();
-            idx.insert(&key, false);
+            idx.insert(&key, false, date_partition_utc(SystemTime::now()));
             self.store_index_entries(idx.len());
         }
         fs.invalidate_stat(path);
@@ -853,12 +931,14 @@ impl TrashState {
                 etag: None,
                 size: None,
                 is_dir: true,
+                recycle_name: None,
+                recycle_i: None,
             },
         )
         .await?;
         {
             let mut idx = self.index.write().unwrap();
-            idx.insert(&dir_key, true);
+            idx.insert(&dir_key, true, date_partition_utc(SystemTime::now()));
             self.store_index_entries(idx.len());
         }
         // 双形态缓存失效(裁决 #8):invalidate_trash_cached 覆盖裸形态
@@ -1680,10 +1760,14 @@ pub(crate) async fn list_trash_keys(
 mod tests {
     use super::*;
 
+    fn d(ymd: (i32, u32, u32)) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(ymd.0, ymd.1, ymd.2).unwrap()
+    }
+
     fn index_with_dirs(dirs: &[&str]) -> TombstoneIndex {
         let mut idx = TombstoneIndex::default();
-        for d in dirs {
-            idx.insert(d, true);
+        for dir in dirs {
+            idx.insert(dir, true, d((2026, 8, 16)));
         }
         idx
     }
@@ -1692,7 +1776,7 @@ mod tests {
     fn is_covered_matrix() {
         // 文件精确命中
         let mut idx = TombstoneIndex::default();
-        idx.files.insert("docs/a.txt".into());
+        idx.insert("docs/a.txt", false, d((2026, 8, 16)));
         assert!(idx.is_covered("docs/a.txt"));
         assert!(!idx.is_covered("docs/b.txt"));
 
@@ -1733,10 +1817,10 @@ mod tests {
         // release 零开销),而非镜像实现 —— 生产路径本身被断言。
         let mut dirs = Vec::new();
         for i in 0..1000 {
-            dirs.push(format!("common/prefix/shared/dir{i:04}/"));
+            dirs.push((format!("common/prefix/shared/dir{i:04}/"), d((2026, 8, 16))));
         }
         let idx = TombstoneIndex {
-            files: HashSet::new(),
+            files: HashMap::new(),
             dirs,
         };
         // 查询落在公共前缀之下但无精确覆盖(最坏回扫场景)
@@ -1773,10 +1857,10 @@ mod tests {
         );
         assert!(!TrashState::index_size_alert(500_000), "等于阈值不告警");
         assert!(TrashState::index_size_alert(500_001), "超阈值 1 条即告警");
-        // 索引插入 500_001 条触发告警条件(纯内存 HashSet,快)
+        // 索引插入 500_001 条触发告警条件(纯内存 HashMap,快)
         let mut idx = TombstoneIndex::default();
         for i in 0..500_001 {
-            idx.files.insert(format!("f{i:06}"));
+            idx.files.insert(format!("f{i:06}"), d((2026, 8, 16)));
         }
         assert_eq!(idx.len(), 500_001);
         assert!(
@@ -1802,14 +1886,14 @@ mod tests {
 
     #[test]
     fn dirs_sorted_invariant() {
-        // 乱序插入后 dirs 保持升序、无重复(二分的前提)
+        // 乱序插入后 dirs 保持升序、无重复(二分的前提);date 随 key 保存
         let mut idx = TombstoneIndex::default();
-        for d in ["z/", "a/", "m/", "b/", "a/"] {
-            idx.insert(d, true);
+        for dir in ["z/", "a/", "m/", "b/", "a/"] {
+            idx.insert(dir, true, d((2026, 8, 16)));
         }
         for i in 1..idx.dirs.len() {
             assert!(
-                idx.dirs[i - 1] < idx.dirs[i],
+                idx.dirs[i - 1].0 < idx.dirs[i].0,
                 "dirs must stay sorted: {:?}",
                 idx.dirs
             );
@@ -1817,8 +1901,8 @@ mod tests {
         assert_eq!(idx.dirs.len(), 4, "重复插入必须幂等去重");
         // insert("docs", true) 归一化补尾斜杠
         let mut idx = TombstoneIndex::default();
-        idx.insert("docs", true);
-        assert_eq!(idx.dirs, vec!["docs/".to_string()]);
+        idx.insert("docs", true, d((2026, 8, 16)));
+        assert_eq!(idx.dirs, vec![("docs/".to_string(), d((2026, 8, 16)))]);
         // 固定种子伪随机序列(长度 > 二分扫描最坏回扫深度)
         let mut seed = 0x5eed_u64;
         let mut idx = TombstoneIndex::default();
@@ -1827,10 +1911,10 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let n = (seed % 30) as usize;
-            idx.insert(&format!("dir{n}/sub"), true);
+            idx.insert(&format!("dir{n}/sub"), true, d((2026, 8, 16)));
         }
         for i in 1..idx.dirs.len() {
-            assert!(idx.dirs[i - 1] < idx.dirs[i], "sorted invariant");
+            assert!(idx.dirs[i - 1].0 < idx.dirs[i].0, "sorted invariant");
         }
     }
 
@@ -1838,7 +1922,7 @@ mod tests {
     fn remove_flips_coverage() {
         // 文件移除
         let mut idx = TombstoneIndex::default();
-        idx.insert("a.txt", false);
+        idx.insert("a.txt", false, d((2026, 8, 16)));
         assert!(idx.is_covered("a.txt"));
         idx.remove("a.txt", false);
         assert!(!idx.is_covered("a.txt"));
@@ -1857,8 +1941,8 @@ mod tests {
 
         // 文件与目录同名互不干扰
         let mut idx = TombstoneIndex::default();
-        idx.insert("x", false);
-        idx.insert("x", true);
+        idx.insert("x", false, d((2026, 8, 16)));
+        idx.insert("x", true, d((2026, 8, 16)));
         assert!(idx.is_covered("x"));
         idx.remove("x", false);
         assert!(idx.is_covered("x"), "目录墓碑仍覆盖");
@@ -1869,14 +1953,18 @@ mod tests {
     #[test]
     fn rebuild_replaces_and_dedups() {
         let mut idx = index_with_dirs(&["old/"]);
-        idx.files.insert("old.txt".into());
+        idx.insert("old.txt", false, d((2026, 8, 16)));
         let tombstones = vec![
-            ("docs/a.txt".to_string(), false),
-            ("docs/".to_string(), true),
-            ("docs/a.txt".to_string(), false), // 同名多日期墓碑只留一条
-            ("z/".to_string(), true),
-            ("docs".to_string(), true), // 无尾斜杠归一化
-            ("a/".to_string(), true),
+            ("docs/a.txt".to_string(), false, d((2026, 8, 16))),
+            ("docs/".to_string(), true, d((2026, 8, 16))),
+            (
+                "docs/a.txt".to_string(),
+                false,
+                d((2026, 8, 16)), // 同名多日期墓碑只留一条
+            ),
+            ("z/".to_string(), true, d((2026, 8, 16))),
+            ("docs".to_string(), true, d((2026, 8, 16))), // 无尾斜杠归一化
+            ("a/".to_string(), true, d((2026, 8, 16))),
         ];
         idx.rebuild(tombstones.into_iter());
         // 整体替换:旧条目消失
@@ -1885,9 +1973,65 @@ mod tests {
         // 排序去重:docs/ 只有一条
         assert_eq!(
             idx.dirs,
-            vec!["a/".to_string(), "docs/".to_string(), "z/".to_string()]
+            vec![
+                ("a/".to_string(), d((2026, 8, 16))),
+                ("docs/".to_string(), d((2026, 8, 16))),
+                ("z/".to_string(), d((2026, 8, 16))),
+            ]
         );
         assert_eq!(idx.files.len(), 1);
+    }
+
+    #[test]
+    fn index_keeps_latest_date_per_key() {
+        // 裁决 R4/R7:同名多日期墓碑只留一条,date 保留最新(系统视图冷路径
+        // 按索引 date 反查墓碑 key —— 必须指向最新墓碑)。
+        let mut idx = TombstoneIndex::default();
+        // 先旧后新(远端列表字典序 = 日期分区升序,旧日期先出现)
+        idx.insert("docs/a.txt", false, d((2026, 8, 15)));
+        idx.insert("docs/a.txt", false, d((2026, 8, 16)));
+        assert_eq!(
+            idx.files.get("docs/a.txt"),
+            Some(&d((2026, 8, 16))),
+            "文件索引保留最新 date"
+        );
+        // 乱序回填(增量批次:今天分区先、昨天分区后)也不能覆盖成旧 date
+        idx.insert("docs/b.txt", false, d((2026, 8, 16)));
+        idx.insert("docs/b.txt", false, d((2026, 8, 15)));
+        assert_eq!(idx.files.get("docs/b.txt"), Some(&d((2026, 8, 16))));
+        // 目录同语义
+        idx.insert("docs", true, d((2026, 8, 15)));
+        idx.insert("docs", true, d((2026, 8, 16)));
+        assert_eq!(idx.dirs, vec![("docs/".to_string(), d((2026, 8, 16)))]);
+        // rebuild 去重保留最新
+        let mut idx = TombstoneIndex::default();
+        idx.rebuild(
+            vec![
+                ("x/".to_string(), true, d((2026, 8, 15))),
+                ("x/".to_string(), true, d((2026, 8, 16))),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(idx.dirs, vec![("x/".to_string(), d((2026, 8, 16)))]);
+        // 移除只按 key(不关心 date)
+        idx.remove("x", true);
+        assert!(idx.dirs.is_empty());
+    }
+
+    #[test]
+    fn entries_carry_dates() {
+        let mut idx = TombstoneIndex::default();
+        idx.insert("a.txt", false, d((2026, 8, 16)));
+        idx.insert("docs", true, d((2026, 8, 15)));
+        let mut entries = idx.entries();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                ("a.txt".to_string(), false, d((2026, 8, 16))),
+                ("docs/".to_string(), true, d((2026, 8, 15))),
+            ]
+        );
     }
 
     #[test]
@@ -1950,6 +2094,8 @@ mod tests {
             etag: Some("\"mock-etag\"".into()),
             size: Some(42),
             is_dir: false,
+            recycle_name: None,
+            recycle_i: None,
         };
         let json = serde_json::to_vec(&file).unwrap();
         let back: TombstoneBody = serde_json::from_slice(&json).unwrap();
@@ -1961,6 +2107,8 @@ mod tests {
             etag: None,
             size: None,
             is_dir: true,
+            recycle_name: None,
+            recycle_i: None,
         };
         let json = serde_json::to_vec(&dir).unwrap();
         assert_eq!(json, br#"{"is_dir":true}"#.to_vec());
@@ -1973,13 +2121,40 @@ mod tests {
         assert_eq!(back.etag.as_deref(), Some("e"));
         assert_eq!(back.size, Some(1));
         assert!(!back.is_dir);
+        // 系统回收站字段(裁决 R2/R8):recycle_name/recycle_i 往返 + 缺失默认 None
+        let sys = TombstoneBody {
+            etag: None,
+            size: Some(42),
+            is_dir: false,
+            recycle_name: Some("$R4de00001a.txt".into()),
+            recycle_i: Some(vec![1, 2, 3]),
+        };
+        let json = serde_json::to_vec(&sys).unwrap();
+        let back: TombstoneBody = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.recycle_name.as_deref(), Some("$R4de00001a.txt"));
+        assert_eq!(back.recycle_i.as_deref(), Some(&vec![1, 2, 3][..]));
+        // 旧版墓碑(无新字段)→ None(前向兼容)
+        let legacy = br#"{"is_dir":false,"size":42}"#;
+        let back: TombstoneBody = serde_json::from_slice(legacy).unwrap();
+        assert!(back.recycle_name.is_none());
+        assert!(back.recycle_i.is_none());
+        // None 字段不序列化(保持旧版字节兼容:旧客户端读取新墓碑不炸)
+        let none_i = TombstoneBody {
+            etag: None,
+            size: Some(7),
+            is_dir: false,
+            recycle_name: None,
+            recycle_i: None,
+        };
+        let json = serde_json::to_vec(&none_i).unwrap();
+        assert_eq!(json, br#"{"size":7,"is_dir":false}"#.to_vec());
     }
 
     #[test]
     fn tombstone_index_is_file_covered_and_entries() {
         let mut idx = TombstoneIndex::default();
-        idx.insert("a.txt", false);
-        idx.insert("docs", true); // 归一化 "docs/"
+        idx.insert("a.txt", false, d((2026, 8, 16)));
+        idx.insert("docs", true, d((2026, 8, 16))); // 归一化 "docs/"
         // is_file_covered 仅 files 精确命中(清墓碑门控:目录覆盖不算)
         assert!(idx.is_file_covered("a.txt"));
         assert!(!idx.is_file_covered("docs"));
@@ -1987,12 +2162,15 @@ mod tests {
             !idx.is_file_covered("docs/x.txt"),
             "目录覆盖不进 files 门控"
         );
-        // entries 全量枚举
+        // entries 全量枚举(带 date,裁决 R4)
         let mut entries = idx.entries();
         entries.sort();
         assert_eq!(
             entries,
-            vec![("a.txt".to_string(), false), ("docs/".to_string(), true)]
+            vec![
+                ("a.txt".to_string(), false, d((2026, 8, 16))),
+                ("docs/".to_string(), true, d((2026, 8, 16))),
+            ]
         );
         // len = files + dirs
         assert_eq!(idx.len(), 2);
@@ -2041,7 +2219,11 @@ mod tests {
         // GC 并发完成:代际推进(trash_gc 收尾的同一操作)
         state.generation.fetch_add(1, Ordering::SeqCst);
         // refresh 把陈旧快照(含 GC 刚删的墓碑 x.txt)交给 apply
-        let applied = state.apply_added(&fs, &[("x.txt".to_string(), false)], stale_gen);
+        let applied = state.apply_added(
+            &fs,
+            &[("x.txt".to_string(), false, d((2026, 8, 16)))],
+            stale_gen,
+        );
         assert!(!applied, "旧代际快照必须被丢弃(L4)");
         assert!(
             !state.index.read().unwrap().is_covered("x.txt"),
@@ -2049,7 +2231,11 @@ mod tests {
         );
         // 当前代际的 apply 正常工作
         let cur_gen = state.generation.load(Ordering::SeqCst);
-        let applied = state.apply_added(&fs, &[("y.txt".to_string(), false)], cur_gen);
+        let applied = state.apply_added(
+            &fs,
+            &[("y.txt".to_string(), false, d((2026, 8, 16)))],
+            cur_gen,
+        );
         assert!(applied, "当前代际快照正常应用");
         assert!(state.index.read().unwrap().is_covered("y.txt"));
     }

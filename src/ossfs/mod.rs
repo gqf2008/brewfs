@@ -2283,7 +2283,11 @@ impl ObjectFs {
         let key = self.key_for(path);
         {
             let mut idx = trash.index.write().unwrap();
-            idx.insert(&key, is_dir);
+            idx.insert(
+                &key,
+                is_dir,
+                trash::date_partition_utc(std::time::SystemTime::now()),
+            );
             trash.store_index_entries(idx.len());
         }
         self.invalidate_trash_cached(path, is_dir);
@@ -7806,8 +7810,9 @@ mod s3_mock_tests {
         // 索引内容精确(垃圾未入索引)
         let idx = fs.trash.as_ref().unwrap().index.read().unwrap();
         assert_eq!(idx.files.len(), 1);
-        assert!(idx.files.contains("a b+c%23.txt"));
-        assert_eq!(idx.dirs, vec!["docs/".to_string()]);
+        assert!(idx.files.contains_key("a b+c%23.txt"));
+        assert_eq!(idx.dirs.len(), 1);
+        assert_eq!(idx.dirs[0].0, "docs/");
         drop(idx);
     }
 
@@ -9210,6 +9215,8 @@ mod s3_mock_tests {
                     etag: Some("\"mock-etag\"".into()),
                     size: Some(1),
                     is_dir: false,
+                    recycle_name: None,
+                    recycle_i: None,
                 },
             );
         }
@@ -9288,6 +9295,8 @@ mod s3_mock_tests {
                     etag: Some("\"mock-etag\"".into()),
                     size: Some(1),
                     is_dir: false,
+                    recycle_name: None,
+                    recycle_i: None,
                 },
             );
         }
@@ -9337,6 +9346,8 @@ mod s3_mock_tests {
                 etag: Some("\"same-etag\"".into()),
                 size: Some(2),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         seed_tombstone(
@@ -9346,6 +9357,8 @@ mod s3_mock_tests {
                 etag: Some("\"old-etag\"".into()),
                 size: Some(2),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         mock.set_etag("a.txt", "same-etag"); // 一致 → 删
@@ -9409,6 +9422,8 @@ mod s3_mock_tests {
                 etag: None,
                 size: None,
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         // 原对象不存在(外部已删)
@@ -9440,6 +9455,8 @@ mod s3_mock_tests {
                 etag: Some("\"e\"".into()),
                 size: Some(2),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs3 = test_fs(port3, 32);
@@ -9540,6 +9557,8 @@ mod s3_mock_tests {
                     etag: Some("\"mock-etag\"".into()),
                     size: Some(1),
                     is_dir: false,
+                    recycle_name: None,
+                    recycle_i: None,
                 },
             );
         }
@@ -9607,6 +9626,8 @@ mod s3_mock_tests {
                     etag: Some("\"mock-etag\"".into()),
                     size: Some(1),
                     is_dir: false,
+                    recycle_name: None,
+                    recycle_i: None,
                 },
             );
         }
@@ -9662,6 +9683,8 @@ mod s3_mock_tests {
                 etag: Some("\"mock-etag\"".into()),
                 size: Some(1),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs = test_fs(port, 32);
@@ -9727,6 +9750,8 @@ mod s3_mock_tests {
                 etag: Some("\"mock-etag\"".into()),
                 size: Some(1),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs = test_fs(port, 32);
@@ -9785,6 +9810,8 @@ mod s3_mock_tests {
                 etag: Some("\"mock-etag\"".into()),
                 size: Some(1),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs = test_fs(port, 32);
@@ -9873,6 +9900,8 @@ mod s3_mock_tests {
                 etag: Some("\"mock-etag\"".into()),
                 size: Some(1),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs = test_fs(port, 32);
@@ -9926,6 +9955,8 @@ mod s3_mock_tests {
                 etag: Some("\"e1\"".into()),
                 size: Some(5),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         seed_tombstone(
@@ -9935,6 +9966,8 @@ mod s3_mock_tests {
                 etag: Some("\"e2\"".into()),
                 size: Some(7),
                 is_dir: false,
+                recycle_name: None,
+                recycle_i: None,
             },
         );
         let mut fs = test_fs(port, 32);
