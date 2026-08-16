@@ -2347,7 +2347,6 @@ mod tests {
             .expect("freshly created arc is uniquely owned")
             .system = Some(crate::ossfs::trash::SystemTrash {
             dir_name: ".Trashes".into(),
-            key_prefix: ".Trashes/".into(),
             platform: crate::ossfs::trash::SystemTrashPlatform::MacOsTrashes,
             macos_uid_dirs: vec![501],
         });
@@ -2392,7 +2391,6 @@ mod tests {
             .expect("freshly created arc is uniquely owned")
             .system = Some(crate::ossfs::trash::SystemTrash {
             dir_name: "$Recycle.Bin".into(),
-            key_prefix: "$Recycle.Bin/".into(),
             platform: crate::ossfs::trash::SystemTrashPlatform::WindowsRecycleBin,
             macos_uid_dirs: vec![],
         });
