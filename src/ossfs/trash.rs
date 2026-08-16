@@ -10,6 +10,7 @@
 use crate::ossfs::{ObjectFs, TrashRefreshMode, is_s3_not_found, next_page_token};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -226,12 +227,34 @@ pub(crate) struct TrashState {
     /// 增量/重建互斥:swap(true) 抢锁,失败即跳过(天然限 1 —— eager 挂点
     /// 不 acquire limiter permit,靠它防并发放大)。
     pub(crate) poll_inflight: AtomicBool,
-    /// gauge:索引条目数(files+dirs)。insert/remove/rebuild 后 store,
-    /// `ObjectFs::metrics()` 注入 snapshot(prefetch_inflight 先例,§0.3)。
+    /// gauge:索引条目数(files+dirs)。统一经 [`Self::store_index_entries`]
+    /// store(含超阈值告警,裁决 #6/#9),`ObjectFs::metrics()` 注入
+    /// snapshot(prefetch_inflight 先例,§0.3)。
     pub index_entries: AtomicU64,
 }
 
 impl TrashState {
+    /// 索引规模是否超告警阈值(裁决 #6):超过 TRASH_INDEX_ALERT_THRESHOLD
+    /// 仅告警不换行为 —— 不换入/清缓存会让已删文件可见性偏离远端(正确性
+    /// 优先),告警让 full_rebuild 的 diff 内存尖峰可观测,缓解手段是
+    /// GC/trash-clean。纯函数化便于断言(阈值规范:新阈值落地带验证)。
+    fn index_size_alert(len: usize) -> bool {
+        len > crate::ossfs::TRASH_INDEX_ALERT_THRESHOLD
+    }
+
+    /// gauge 统一落点(裁决 #6/#9):store + 超阈值告警。所有索引变更
+    /// (软删/增量/重建/清墓碑)经此更新,告警随任何增长路径触发。
+    pub(crate) fn store_index_entries(&self, len: usize) {
+        self.index_entries.store(len as u64, Ordering::Relaxed);
+        if Self::index_size_alert(len) {
+            tracing::warn!(
+                index_entries = len,
+                threshold = crate::ossfs::TRASH_INDEX_ALERT_THRESHOLD,
+                "trash index above alert threshold; diff 重建内存尖峰可见,请评估 trash-clean/GC"
+            );
+        }
+    }
+
     /// 构造(含调度字段默认值)。refresh_interval/mode 由 connect 读
     /// normalized config 传入;rebuild_interval 传常量。测试经 `new` 或
     /// 直接改 pub(crate) 字段定制(eager 档、重建周期强制)。
@@ -338,8 +361,7 @@ impl TrashState {
                     idx.files.insert(key.clone());
                 }
             }
-            self.index_entries
-                .store(idx.len() as u64, Ordering::Relaxed);
+            self.store_index_entries(idx.len());
         }
         for (key, is_dir) in added {
             invalidate_key(fs, key, *is_dir);
@@ -460,16 +482,39 @@ impl TrashState {
             Ok(())
         })
         .await?;
-        // diff:prev - new = 被恢复/被 GC 移除的墓碑;new - prev = 新增
-        let prev_set: HashSet<(String, bool)> = prev.into_iter().collect();
-        let new_set: HashSet<(String, bool)> = index.entries().into_iter().collect();
-        let removed: Vec<(String, bool)> = prev_set.difference(&new_set).cloned().collect();
-        let added: Vec<(String, bool)> = new_set.difference(&prev_set).cloned().collect();
+        // diff(裁决 #6 内存尖峰守卫):prev 与 new 各自 sort_unstable(原地、
+        // 不分配)后归并扫描 —— 省两个 HashSet(500k 条目时每 HashSet 约
+        // 16B/桶 + 哈希运算,归并扫描峰值约减半)。语义与 HashSet 差集
+        // 等价:removed = prev - new(被恢复/被 GC 移除),added = new - prev。
+        let mut prev_sorted = prev;
+        prev_sorted.sort_unstable();
+        let mut new_sorted = index.entries();
+        new_sorted.sort_unstable();
+        let mut removed: Vec<(String, bool)> = Vec::new();
+        let mut added: Vec<(String, bool)> = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < prev_sorted.len() && j < new_sorted.len() {
+            match prev_sorted[i].cmp(&new_sorted[j]) {
+                CmpOrdering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                CmpOrdering::Less => {
+                    removed.push(prev_sorted[i].clone());
+                    i += 1;
+                }
+                CmpOrdering::Greater => {
+                    added.push(new_sorted[j].clone());
+                    j += 1;
+                }
+            }
+        }
+        removed.extend(prev_sorted.into_iter().skip(i));
+        added.extend(new_sorted.into_iter().skip(j));
         let diff_total = removed.len() + added.len();
         // 短写锁整体换入:diff 计算期间不持锁
         *self.index.write().unwrap() = index;
-        self.index_entries
-            .store(self.index.read().unwrap().len() as u64, Ordering::Relaxed);
+        self.store_index_entries(self.index.read().unwrap().len());
         *self.cursor.lock().unwrap() = last_key;
         *self.last_full_rebuild.lock().unwrap() = Instant::now();
         if diff_total > FULL_REBUILD_DIFF_CLEAR_THRESHOLD {
@@ -646,8 +691,7 @@ impl TrashState {
         {
             let mut idx = self.index.write().unwrap();
             idx.insert(&key, false);
-            self.index_entries
-                .store(idx.len() as u64, Ordering::Relaxed);
+            self.store_index_entries(idx.len());
         }
         fs.invalidate_stat(path);
         fs.invalidate_read_cache(path);
@@ -688,8 +732,7 @@ impl TrashState {
         {
             let mut idx = self.index.write().unwrap();
             idx.insert(&dir_key, true);
-            self.index_entries
-                .store(idx.len() as u64, Ordering::Relaxed);
+            self.store_index_entries(idx.len());
         }
         fs.invalidate_stat(dir);
         fs.clear_read_cache();
@@ -803,8 +846,7 @@ impl TrashState {
         {
             let mut idx = self.index.write().unwrap();
             idx.remove(target, is_dir);
-            self.index_entries
-                .store(idx.len() as u64, Ordering::Relaxed);
+            self.store_index_entries(idx.len());
         }
         Ok(())
     }
@@ -977,6 +1019,42 @@ mod tests {
         assert!(
             comps >= depth * 7,
             "is_covered 比较次数 {comps} 过低 —— 疑似 O(n) 线性回扫回归(每级必须二分)"
+        );
+    }
+
+    #[test]
+    fn index_alert_threshold_executable() {
+        // 裁决 #6 + 阈值规范(新阈值落地带验证):500k 告警决策可执行化
+        // —— 决策纯函数 + 真实插入规模 + gauge 落点,缺一不可。
+        assert_eq!(
+            crate::ossfs::TRASH_INDEX_ALERT_THRESHOLD,
+            500_000,
+            "索引规模告警阈值(规格 C5;常量防漂移另见 mod.rs refresh_constants_pinned)"
+        );
+        assert!(!TrashState::index_size_alert(500_000), "等于阈值不告警");
+        assert!(TrashState::index_size_alert(500_001), "超阈值 1 条即告警");
+        // 索引插入 500_001 条触发告警条件(纯内存 HashSet,快)
+        let mut idx = TombstoneIndex::default();
+        for i in 0..500_001 {
+            idx.files.insert(format!("f{i:06}"));
+        }
+        assert_eq!(idx.len(), 500_001);
+        assert!(
+            TrashState::index_size_alert(idx.len()),
+            "500_001 条插入后超阈值"
+        );
+        // store_index_entries 必须落到 gauge(告警与 gauge 同源)
+        let state = TrashState::new(
+            ".trash/".to_string(),
+            TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+        );
+        state.store_index_entries(idx.len());
+        assert_eq!(
+            state.index_entries.load(Ordering::Relaxed),
+            500_001,
+            "gauge 与 store_index_entries 同步"
         );
     }
 

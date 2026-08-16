@@ -2231,10 +2231,8 @@ impl ObjectFs {
         .await?;
         // 短写锁整体换入:离线构建期间读路径继续用旧索引
         *trash.index.write().unwrap() = index;
-        // gauge:整体换入后刷新条目数(§0.3 维护点)
-        trash
-            .index_entries
-            .store(trash.index.read().unwrap().len() as u64, Ordering::Relaxed);
+        // gauge 统一落点(裁决 #6/#9):整体换入后刷新条目数 + 超阈值告警
+        trash.store_index_entries(trash.index.read().unwrap().len());
         self.stats.lock().unwrap().clear();
         self.negative.lock().unwrap().clear();
         Ok(count)
