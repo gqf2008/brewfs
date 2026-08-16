@@ -4697,8 +4697,7 @@ mod tests {
         assert_eq!(TRASH_REFRESH_INTERVAL_SECS, 30, "增量刷新周期 30s");
         assert_eq!(TRASH_REBUILD_INTERVAL_SECS, 600, "全量重建周期 10min");
         assert_eq!(
-            TRASH_INDEX_ALERT_THRESHOLD,
-            500_000,
+            TRASH_INDEX_ALERT_THRESHOLD, 500_000,
             "索引规模告警阈值 500k(裁决 #6 新阈值,无旧值)"
         );
         assert_eq!(
@@ -5455,7 +5454,10 @@ mod s3_mock_tests {
                 }
             }
             common.sort_unstable();
-            body.push_str(&format!("<KeyCount>{}</KeyCount>", common.len() + direct.len()));
+            body.push_str(&format!(
+                "<KeyCount>{}</KeyCount>",
+                common.len() + direct.len()
+            ));
             body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>");
             body.push_str(if truncated_no_token { "true" } else { "false" });
             body.push_str("</IsTruncated>");
@@ -8421,7 +8423,10 @@ mod s3_mock_tests {
         mock.entries.lock().unwrap().push((old_tomb, false));
         let unrelated = format!(".trash/{today}/b.txt");
         mock.set_object(&unrelated, br#"{"is_dir":false}"#.to_vec());
-        mock.entries.lock().unwrap().push((unrelated.clone(), false));
+        mock.entries
+            .lock()
+            .unwrap()
+            .push((unrelated.clone(), false));
         let today_tomb = format!(".trash/{today}/a.txt");
 
         fs.write("/a.txt", b"new").await.expect("同名重建");
@@ -8441,11 +8446,13 @@ mod s3_mock_tests {
                     .unwrap_or("")
             })
             .collect();
-        assert_eq!(trash_deletes.len(), 2, "跨分区同名墓碑全清: {trash_deletes:?}");
+        assert_eq!(
+            trash_deletes.len(),
+            2,
+            "跨分区同名墓碑全清: {trash_deletes:?}"
+        );
         assert!(
-            trash_deletes
-                .iter()
-                .any(|k| *k == format!("{today}/a.txt")),
+            trash_deletes.iter().any(|k| *k == format!("{today}/a.txt")),
             "今天分区墓碑被删: {trash_deletes:?}"
         );
         assert!(
@@ -8483,10 +8490,7 @@ mod s3_mock_tests {
             .iter()
             .position(|t| t.contains(&yesterday.to_string()))
             .expect("旧分区探测存在");
-        assert!(
-            today_idx < yesterday_idx,
-            "今天分区必须最先探测: {lists:?}"
-        );
+        assert!(today_idx < yesterday_idx, "今天分区必须最先探测: {lists:?}");
         // 重建后立即可见,gauge 归零
         assert!(fs.stat("/a.txt").await.unwrap().is_some());
         assert_eq!(fs.metrics().trash_index_entries, 0);
@@ -8498,9 +8502,11 @@ mod s3_mock_tests {
     /// refresh_once,两轮全量 list + 双倍 S3 成本)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refresh_once_skips_when_inflight_held() {
-        let (mock, port) =
-            MockS3::start(vec![(".trash/2026-08-16/a.txt".into(), false)], Duration::from_millis(1))
-                .await;
+        let (mock, port) = MockS3::start(
+            vec![(".trash/2026-08-16/a.txt".into(), false)],
+            Duration::from_millis(1),
+        )
+        .await;
         let mut fs = test_fs(port, 32);
         fs.trash = Some(trash_state(".trash/"));
         fs.trash_bootstrap().await.expect("bootstrap");

@@ -802,10 +802,7 @@ impl TrashState {
     /// 的 "YYYY-MM-DD" 字符串。1+ 次 list 请求(分区数 >1000 才多页,
     /// 现实中远低于此)。s3_lists 计数与 list_impl 对齐(每页 +1)。
     /// 不 acquire permit:调用方(clear 路径)已持。
-    async fn list_partitions_desc(
-        fs: &ObjectFs,
-        trash_prefix: &str,
-    ) -> Result<Vec<String>> {
+    async fn list_partitions_desc(fs: &ObjectFs, trash_prefix: &str) -> Result<Vec<String>> {
         let mut token: Option<String> = None;
         let mut parts: Vec<String> = Vec::new();
         loop {
