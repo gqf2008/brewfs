@@ -2250,7 +2250,14 @@ impl ObjectFs {
             return Ok(0);
         };
         let _permit = self.acquire().await?;
+        // 代际捕获(L3/L4):挂载期周期 GC 与 bootstrap 并发时,本快照可能
+        // 含 GC 刚删的墓碑 —— 换入前检测代际变化则整体丢弃(索引空 →
+        // 周期刷新自愈,绝不把已删墓碑重新隐藏进索引)。
+        let gen_snapshot = trash.generation.load(Ordering::SeqCst);
         let (index, last_key) = trash::fetch_all_tombstones(self, trash).await?;
+        if trash.generation.load(Ordering::SeqCst) != gen_snapshot {
+            return Ok(0); // GC 并发完成:丢弃陈旧快照,下轮刷新自愈
+        }
         let count = index.len();
         // 短写锁整体换入:离线构建期间读路径继续用旧索引
         *trash.index.write().unwrap() = index;
@@ -9570,6 +9577,154 @@ mod s3_mock_tests {
         assert!(
             mock.objects.lock().unwrap().contains_key("docs/new.txt"),
             "新对象必须存活"
+        );
+    }
+
+    /// L1 回归:dry-run 只跳过 S3 DELETE,不改变任何状态 —— 索引 remove
+    /// 与 invalidate_key 必须门控 !dry_run(dry-run 契约:判定照做、删除
+    /// 不落、状态不变;否则未来挂载进程内复用 dry-run 会错误解除墓碑
+    /// 隐藏并清缓存)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_gc_dry_run_keeps_index_untouched() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let state = fs.trash.clone().unwrap();
+        assert!(
+            state.index.read().unwrap().is_covered("a.txt"),
+            "前置:索引含墓碑"
+        );
+        let report = fs
+            .trash_gc(trash::GcOptions {
+                before: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.files_removed, 1, "dry-run 仍完成 etag 判定");
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象未删"
+        );
+        assert!(
+            mock.objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!(".trash/{d_old}/a.txt")),
+            "墓碑未删"
+        );
+        assert!(
+            state.index.read().unwrap().is_covered("a.txt"),
+            "dry-run 不得改变索引状态(L1)"
+        );
+        assert_eq!(
+            fs.metrics().trash_index_entries,
+            1,
+            "dry-run 后索引条目必须保留"
+        );
+    }
+
+    /// L5 回归:GC 读到并发 restore 已删的墓碑(404)必须跳过该墓碑,绝不
+    /// 动原对象 —— 旧实现把 404 的空 body 当「无 etag」按 matched 处理,
+    /// 恢复成功瞬间原对象又被 GC 永久删除(规格 4.4 风险 2 的窗口被
+    /// 放大为 GET 之后任意时点)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_skips_tombstone_deleted_by_concurrent_restore() {
+        let d_old = days_before(31);
+        let entries = vec![(format!(".trash/{d_old}/a.txt"), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"a".to_vec());
+        mock.set_etag("a.txt", "mock-etag");
+        seed_tombstone(
+            &mock,
+            &format!(".trash/{d_old}/a.txt"),
+            &trash::TombstoneBody {
+                etag: Some("\"mock-etag\"".into()),
+                size: Some(1),
+                is_dir: false,
+            },
+        );
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.rebuild_trash_index().await.expect("rebuild");
+        // 模拟并发 restore 已删墓碑(索引未动 —— 同进程双任务竞态)
+        mock.objects
+            .lock()
+            .unwrap()
+            .remove(&format!(".trash/{d_old}/a.txt"));
+        let report = fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(report.files_removed, 0, "404 墓碑不得删除原对象(L5)");
+        assert_eq!(report.files_skipped_etag, 0);
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象必须存活"
+        );
+    }
+
+    /// L2 回归:trash_restore 入口持一个 permit 覆盖 find_tombstone 之后
+    /// 的 HEAD/GET/DELETE —— 并发上限=1 下必须仍能完成(delete_tombstone
+    /// 改「调用方已持 permit」后,二次 acquire 会造成饱和池死锁,本测试
+    /// 钉死该不变量)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_restore_works_with_single_permit() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 1); // max_concurrent_requests = 1
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("软删");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let out = fs.trash_restore("/a.txt", None).await.unwrap();
+        assert_eq!(
+            out,
+            trash::RestoreOutcome::Restored {
+                etag_mismatch: false
+            },
+            "单 permit 下 restore 必须完成且不二次 acquire 死锁(L2)"
+        );
+        assert!(fs.stat("/a.txt").await.unwrap().is_some(), "恢复后可见");
+    }
+
+    /// L4:trash_gc(非 dry-run)完成后代际必须推进,dry-run 不推进 ——
+    /// refresh/rebuild 凭代际丢弃陈旧快照(apply_added_discards 测试
+    /// 在 trash.rs 钉机制,这里是 GC 侧的代际推进钉)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trash_gc_bumps_generation_but_dry_run_does_not() {
+        let (_mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let state = fs.trash.clone().unwrap();
+        fs.rebuild_trash_index().await.expect("rebuild");
+        let gen0 = state.generation.load(Ordering::SeqCst);
+        fs.trash_gc(trash::GcOptions {
+            before: None,
+            dry_run: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.generation.load(Ordering::SeqCst),
+            gen0,
+            "dry-run 零状态变更,不推进代际"
+        );
+        fs.trash_gc(trash::GcOptions::default()).await.unwrap();
+        assert_eq!(
+            state.generation.load(Ordering::SeqCst),
+            gen0 + 1,
+            "GC 完成后代际推进(L4)"
         );
     }
 
