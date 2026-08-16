@@ -9666,6 +9666,164 @@ mod s3_mock_tests {
         assert_eq!(mock.recorded.lock().unwrap().len(), before, "重入零请求");
     }
 
+    /// F1(high):purge_all 目录分支删除前重查墓碑 body —— 多端交错下
+    /// 索引可能陈旧(他端已 restore/GC/永久删),修复前无条件递归删会
+    /// 连带删除墓碑消失后他端写入的新数据(数据丢失)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_purge_all_skips_dir_tree_when_tombstone_gone() {
+        // 远端墓碑已消失(他端已处理),本端索引陈旧仍覆盖 dir/;
+        // 桶中原对象(他端新写入的 x.txt)必须存活 —— 仅清墓碑。
+        let entries = vec![("dir/".into(), true), ("dir/x.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("dir/x.txt", b"new-data".to_vec());
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert("dir/", true, sys_date());
+            trash.store_index_entries(idx.len());
+        }
+
+        fs.delete_dir_recursive("/$Recycle.Bin")
+            .await
+            .expect("清空系统回收站");
+
+        assert!(
+            mock.objects.lock().unwrap().contains_key("dir/x.txt"),
+            "墓碑已消失:原树不得被删(多端交错数据保全)"
+        );
+        assert!(
+            trash.index.read().unwrap().is_empty(),
+            "仅清墓碑:索引条目移除"
+        );
+    }
+
+    /// F1(high):permanent_delete_entry 目录分支同款重查 —— 单端
+    /// purge_all 与 restore 交错 / 多端交错均触发。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_permanent_delete_dir_skips_tree_when_tombstone_gone() {
+        let entries = vec![("dir/".into(), true), ("dir/x.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("dir/x.txt", b"new-data".to_vec());
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        let tomb_key = trash::encode_tombstone_key(".trash/", sys_date(), "dir/", true);
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert("dir/", true, sys_date());
+            trash.store_index_entries(idx.len());
+        }
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$Rdir".into(), tomb_key);
+
+        fs.delete("/$Recycle.Bin/S-1-5-21-1/$Rdir")
+            .await
+            .expect("目录永久删");
+
+        assert!(
+            mock.objects.lock().unwrap().contains_key("dir/x.txt"),
+            "墓碑已消失:原树不得被删"
+        );
+        assert!(trash.index.read().unwrap().is_empty(), "索引条目移除");
+    }
+
+    /// F2(high):restore_via_system 还原到原 key 子树内/祖先 → 拒绝
+    /// (镜像 rename_impl 的子树检查;修复前 new 落子树内 → copy_tree
+    /// 自拷贝无限膨胀,还原到祖先 → 拷贝落入源前缀)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn system_restore_into_own_subtree_or_ancestor_rejected() {
+        let entries = vec![
+            (".trash/2026-08-16/dir/".into(), true),
+            (".trash/2026-08-16/docs/dir/a.txt".into(), false),
+            ("dir/".into(), true),
+            ("dir/x.txt".into(), false),
+            ("docs/dir/a.txt".into(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object(".trash/2026-08-16/dir/", tombstone_dir_json(Some("$Rdir")));
+        mock.set_object(
+            ".trash/2026-08-16/docs/dir/a.txt",
+            tombstone_json(Some("$Rf"), Some(1), None),
+        );
+        mock.set_object("dir/x.txt", b"x".to_vec());
+        mock.set_object("docs/dir/a.txt", b"a".to_vec());
+        let mut fs = test_fs(port, 32);
+        let trash = system_trash_state(".trash/", win_sys());
+        fs.trash = Some(trash.clone());
+        // 目录条目:原 key "dir/"(还原进自身子树)
+        let tomb_key = trash::encode_tombstone_key(".trash/", sys_date(), "dir/", true);
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert("dir/", true, sys_date());
+            trash.store_index_entries(idx.len());
+        }
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$Rdir".into(), tomb_key);
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_key
+            .insert("dir/".into(), "$Rdir".into());
+        // 文件条目:原 key "docs/dir/a.txt"(还原到自身祖先)
+        let tomb_key_f =
+            trash::encode_tombstone_key(".trash/", sys_date(), "docs/dir/a.txt", false);
+        {
+            let mut idx = trash.index.write().unwrap();
+            idx.insert("docs/dir/a.txt", false, sys_date());
+            trash.store_index_entries(idx.len());
+        }
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_name
+            .insert("$Rf".into(), tomb_key_f);
+        trash
+            .recycle_names
+            .write()
+            .unwrap()
+            .by_key
+            .insert("docs/dir/a.txt".into(), "$Rf".into());
+
+        // 还原进原 key 子树:new = /dir/sub → 拒绝
+        let err = fs
+            .rename("/$Recycle.Bin/S-1-5-21-1/$Rdir", "/dir/sub", false)
+            .await
+            .expect_err("还原进自身子树必须拒绝");
+        assert!(
+            err.to_string().contains("subtree"),
+            "unexpected error: {err:?}"
+        );
+        // 还原到自身祖先:new = /docs/dir → 拒绝
+        let err = fs
+            .rename("/$Recycle.Bin/S-1-5-21-1/$Rf", "/docs/dir", false)
+            .await
+            .expect_err("还原到自身祖先必须拒绝");
+        assert!(
+            err.to_string().contains("subtree"),
+            "unexpected error: {err:?}"
+        );
+        // 拒绝后:墓碑不动、原树完好(零 copy)
+        assert!(trash.index.read().unwrap().is_covered("dir/"));
+        assert!(trash.index.read().unwrap().is_covered("docs/dir/a.txt"));
+        assert!(mock.objects.lock().unwrap().contains_key("dir/x.txt"));
+        assert!(
+            mock.objects.lock().unwrap().contains_key("docs/dir/a.txt"),
+            "还原到祖先被拒:文件不得拷贝到 /docs/dir 覆盖原 key"
+        );
+    }
+
     /// 测试 3(rmdir SID 目录):有残余墓碑 → Err(directory not empty);
     /// 空 → Ok 零远程。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

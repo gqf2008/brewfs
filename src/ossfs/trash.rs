@@ -1807,6 +1807,21 @@ impl TrashState {
         let new_key = fs.key_for(new);
         let same_place = new_key.trim_end_matches('/') == original_key.trim_end_matches('/');
 
+        // F2(high):还原目标与原 key 的子树关系校验(镜像 rename_impl 的
+        // EINVAL 检查 —— restore_via_system 此前缺失,审查确认的遗漏):
+        // new 落在原 key 子树内 → copy_tree 自拷贝,ListObjectsV2 续页
+        // 持续包含新拷贝 → 无限生成对象;还原到祖先 → 拷贝对象落入源
+        // 前缀,同样错乱。同 key 还原(same_place)不受影响(前缀检查带
+        // '/' 边界,相等不可能命中)。
+        let new_bare = new_key.trim_end_matches('/');
+        let orig_bare = original_key.trim_end_matches('/');
+        if new_bare != orig_bare
+            && (new_bare.starts_with(&format!("{orig_bare}/"))
+                || orig_bare.starts_with(&format!("{new_bare}/")))
+        {
+            anyhow::bail!("restore: cannot restore a path into its own subtree");
+        }
+
         // 还原主体(HEAD/copy/清墓碑):持一个 permit(镜像 trash_restore
         // 入口;resolve_entry_original 的冷路径 acquire 已先行释放)。
         let _permit = fs.acquire().await?;
@@ -1923,7 +1938,18 @@ impl TrashState {
         let _permit = fs.acquire().await?;
         // 3. 先原对象后墓碑(裁决 R6)
         if resolved.is_dir {
-            // 目录:无条件递归删(镜像 rmdir 语义)
+            // F1(high):目录永久删前重查墓碑 body 仍在 —— 多端交错下索引
+            // 可能陈旧(他端已 restore/GC/永久删),修复前无条件递归删会
+            // 连带删除墓碑消失后他端写入的新数据。已消失 → 仅清墓碑,
+            // 绝不动无法核验的原对象(镜像 permanent_delete_file 的 L5
+            // 口径,目录路径此前无对等校验,属实现不对称缺陷)。
+            let Some(_) = self.read_tombstone(fs, &resolved.tomb_key).await? else {
+                self.clear_tombstones_both_forms(fs, &resolved.original_key)
+                    .await?;
+                fs.invalidate_trash_cached(path, true);
+                fs.invalidate_read_cache(path);
+                return Ok(());
+            };
             let view = key_view_path(fs, &resolved.original_key);
             fs.delete_dir_recursive_impl(&view).await?;
         } else {
@@ -1996,6 +2022,13 @@ impl TrashState {
         let _permit = fs.acquire().await?;
         for (original_key, is_dir, date) in entries {
             if is_dir {
+                // F1(high):删除前重查墓碑 body(索引快照可能陈旧 —— 他端
+                // 已 restore/GC/永久删)。已消失 → 仅清墓碑,不动原树。
+                let tomb_key = encode_tombstone_key(&self.prefix, date, &original_key, true);
+                if self.read_tombstone(fs, &tomb_key).await?.is_none() {
+                    self.clear_tombstones_both_forms(fs, &original_key).await?;
+                    continue;
+                }
                 let view = key_view_path(fs, &original_key);
                 fs.delete_dir_recursive_impl(&view).await?;
             } else {
