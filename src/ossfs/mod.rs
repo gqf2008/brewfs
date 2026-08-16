@@ -1309,6 +1309,7 @@ pub struct Metrics {
     prefetch_failed: AtomicU64,
     list_throttled: AtomicU64,
     crc64_mismatches: AtomicU64,
+    trash_tombstones_written: AtomicU64,
 }
 
 /// Point-in-time snapshot of [`Metrics`] counters.
@@ -1343,6 +1344,9 @@ pub struct MetricsSnapshot {
     pub prefetch_failed: u64,
     pub list_throttled: u64,
     pub crc64_mismatches: u64,
+    pub trash_tombstones_written: u64,
+    /// 回收站索引条目数 gauge(TrashState.index_entries 注入,prefetch_inflight 先例)。
+    pub trash_index_entries: usize,
 }
 
 impl Metrics {
@@ -1377,6 +1381,8 @@ impl Metrics {
             prefetch_failed: self.prefetch_failed.load(Ordering::Relaxed),
             list_throttled: self.list_throttled.load(Ordering::Relaxed),
             crc64_mismatches: self.crc64_mismatches.load(Ordering::Relaxed),
+            trash_tombstones_written: self.trash_tombstones_written.load(Ordering::Relaxed),
+            trash_index_entries: 0, // gauge 由 metrics() 注入(TrashState.index_entries)
         }
     }
 }
@@ -1832,6 +1838,7 @@ fn build_trash_state(config: &OssConfig) -> Result<Option<Arc<trash::TrashState>
     Ok(Some(Arc::new(trash::TrashState {
         prefix: format!("{}{}/", config.prefix, dir),
         index: RwLock::new(trash::TombstoneIndex::default()),
+        index_entries: AtomicU64::new(0),
     })))
 }
 
@@ -2010,6 +2017,11 @@ impl ObjectFs {
     pub fn metrics(&self) -> MetricsSnapshot {
         let mut snapshot = self.metrics.snapshot();
         snapshot.prefetch_inflight = self.prefetch_inflight.lock().unwrap().len();
+        // gauge 注入:TrashState 持计数(prefetch_inflight 先例),None → 0。
+        snapshot.trash_index_entries = self
+            .trash
+            .as_ref()
+            .map_or(0, |t| t.index_entries.load(Ordering::Relaxed) as usize);
         snapshot
     }
 
@@ -2156,6 +2168,10 @@ impl ObjectFs {
         .await?;
         // 短写锁整体换入:离线构建期间读路径继续用旧索引
         *trash.index.write().unwrap() = index;
+        // gauge:整体换入后刷新条目数(§0.3 维护点)
+        trash
+            .index_entries
+            .store(trash.index.read().unwrap().len() as u64, Ordering::Relaxed);
         self.stats.lock().unwrap().clear();
         self.negative.lock().unwrap().clear();
         Ok(count)
@@ -2913,6 +2929,12 @@ impl ObjectFs {
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
+        // 清墓碑挂点(C9 裁决):FUSE create / WinFsp create 均收敛到
+        // write() —— 同名重建 = 覆盖语义,PUT 前清该路径墓碑。
+        // 未覆盖时零远程请求(性能守卫)。
+        if let Some(trash) = &self.trash {
+            trash.clear_file_tombstone_if_covered(self, path).await?;
+        }
         let _budget = self.acquire_upload_budget(data.len()).await?;
         if data.len() as u64 > MULTIPART_THRESHOLD {
             self.write_multipart(path, data).await
@@ -3122,6 +3144,12 @@ impl ObjectFs {
             .fetch_add(size, Ordering::Relaxed);
         self.invalidate_stat(path);
         self.invalidate_read_cache(path);
+        // 清墓碑挂点(C9 裁决修正):WinFsp overwrite 回调经
+        // write_from_file()(winfsp.rs:518),是独立方法不走 write() ——
+        // 与 write() 共享同一语义(同名重建清墓碑)。
+        if let Some(trash) = &self.trash {
+            trash.clear_file_tombstone_if_covered(self, path).await?;
+        }
         let _budget = self.acquire_upload_budget(size as usize).await?;
         if size > MULTIPART_THRESHOLD {
             self.write_multipart_from_file(path, src, size).await
@@ -3357,6 +3385,12 @@ impl ObjectFs {
             anyhow::bail!("directory / already exists");
         }
         self.invalidate_stat(path);
+        // 清目录墓碑:mkdir 同名重建 = 覆盖语义(目录墓碑精确项)。
+        // 未覆盖 → 零远程请求。mkdir 内部还会调 write() → 文件清墓碑
+        // 对目录 key 为 no-op(files 不含目录 key),可接受。
+        if let Some(trash) = &self.trash {
+            trash.clear_dir_tombstone_if_covered(self, path).await?;
+        }
         let dir = if path.ends_with('/') {
             path.to_string()
         } else {
@@ -3372,6 +3406,11 @@ impl ObjectFs {
             // `key_for("/")` is empty; a DELETE against the bucket URL would
             // attempt to delete the bucket itself (#60).
             anyhow::bail!("cannot delete the mount root /");
+        }
+        // 回收站开启 → 软删除:HEAD 原对象 + 写墓碑,原对象不删
+        // (soft_delete_file 内部 acquire 一个 permit,镜像 delete)。
+        if let Some(trash) = &self.trash {
+            return trash.soft_delete_file(self, path).await;
         }
         let _permit = self.acquire().await?;
         self.delete_impl(path).await
@@ -3402,6 +3441,11 @@ impl ObjectFs {
     /// Recursively delete a directory tree (objects under the dir prefix).
     pub async fn delete_dir_recursive(&self, dir: &str) -> Result<()> {
         self.ensure_writable()?;
+        // 回收站开启 → 目录软删:只写一个目录墓碑,不枚举、不 DeleteObjects,
+        // 子树由前缀覆盖隐藏(soft_delete_dir 内部 acquire 一个 permit)。
+        if let Some(trash) = &self.trash {
+            return trash.soft_delete_dir(self, dir).await;
+        }
         let _permit = self.acquire().await?;
         self.delete_dir_recursive_impl(dir).await
     }
@@ -3509,12 +3553,23 @@ impl ObjectFs {
         if new.starts_with(&format!("{old}/")) || old.starts_with(&format!("{new}/")) {
             anyhow::bail!("rename: cannot move a path into its own subtree");
         }
+
+        let old_key = self.key_for(old);
+        let new_key = self.key_for(new);
+
+        // (a) 源被墓碑覆盖 → 拒绝。stat 已被 hidden_key 过滤返回 None,
+        // 不拦会被当"不存在"走 copy —— 隐藏对象被搬出 = 数据泄漏。
+        // is_covered 双形态覆盖文件精确与目录前缀两种情况。
+        if let Some(trash) = &self.trash {
+            if trash.index.read().unwrap().is_covered(&old_key) {
+                anyhow::bail!("rename: source path is in the trash");
+            }
+        }
+
         if !replace_if_exists && self.stat_uncached_impl(new).await?.is_some() {
             anyhow::bail!("rename: target already exists");
         }
 
-        let old_key = self.key_for(old);
-        let new_key = self.key_for(new);
         let source = s3_copy_source(&self.bucket, &old_key);
 
         // Determine directory-ness from S3 instead of assuming a trailing
@@ -3524,6 +3579,20 @@ impl ObjectFs {
         let stat = self.stat_uncached_impl(old).await?;
         let is_dir = stat.as_ref().map(|e| e.is_dir).unwrap_or(false);
         let size = stat.map(|e| e.size).unwrap_or(0);
+
+        // (b) 目标被墓碑覆盖 → 提交点前清墓碑(rename = 覆盖语义)。
+        // 文件目标:files 精确命中;目录目标:dirs 前缀覆盖。清墓碑失败
+        // → rename 整体失败(提交点前零副作用)。
+        if let Some(trash) = &self.trash {
+            if is_dir {
+                let dir_new_key = format!("{new_key}/");
+                if trash.index.read().unwrap().is_covered(&dir_new_key) {
+                    trash.clear_dir_tombstone(self, &new_key).await?;
+                }
+            } else if trash.index.read().unwrap().is_file_covered(&new_key) {
+                trash.clear_file_tombstone(self, &new_key).await?;
+            }
+        }
 
         if is_dir {
             if !self.allow_rename_dir {
@@ -3992,6 +4061,7 @@ mod tests {
             Arc::new(trash::TrashState {
                 prefix: prefix.to_string(),
                 index: RwLock::new(trash::TombstoneIndex::default()),
+                index_entries: AtomicU64::new(0),
             })
         };
         // trash None → 恒 false(零行为变化)
@@ -4982,16 +5052,37 @@ mod s3_mock_tests {
             // Plain PutObject / DeleteObject / CopyObject / ... — really
             // store/remove so multi-step flows (trash soft delete: HEAD →
             // PUT tombstone → verify original survives) observe a coherent
-            // store. CopyObject (PUT + copy-source) is answered as before
-            // without materializing the copy; its result is never read back.
+            // store. CopyObject materializes the copy when the source object
+            // exists; tests that rename without seeding data keep the old
+            // no-op 200 (their assertions only cover recorded requests).
             let path = target.split('?').next().unwrap_or(&target);
             let key = path
                 .trim_start_matches('/')
                 .split_once('/')
                 .map(|(_, k)| k.to_string())
                 .unwrap_or_default();
-            if method == "PUT" && copy_source_header.is_none() {
-                if mock.fail_put.load(Ordering::SeqCst) > 0 {
+            if method == "PUT" {
+                if let Some(src) = &copy_source_header {
+                    // x-amz-copy-source: /bucket/percent-encoded-key
+                    let src_key = src
+                        .trim_start_matches('/')
+                        .split_once('/')
+                        .map(|(_, k)| percent_decode(k))
+                        .unwrap_or_default();
+                    let data = mock.objects.lock().unwrap().get(&src_key).cloned();
+                    if let Some(data) = data {
+                        mock.objects.lock().unwrap().insert(key.clone(), data);
+                        let mut entries = mock.entries.lock().unwrap();
+                        if !entries.iter().any(|(k, _)| *k == key) {
+                            entries.push((key, false));
+                        }
+                        drop(entries);
+                    }
+                    let crc = *mock.crc64.lock().unwrap();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nx-oss-hash-crc64ecma: {crc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else if mock.fail_put.load(Ordering::SeqCst) > 0 {
                     mock.fail_put.fetch_sub(1, Ordering::SeqCst);
                     let body = "<Error><Code>InternalError</Code><Message>mock</Message></Error>";
                     http_response(500, "application/xml", Some(&body.to_string()))
@@ -5026,6 +5117,29 @@ mod s3_mock_tests {
             let _ = stream.write_all(&body).await;
         }
         let _ = stream.shutdown().await;
+    }
+
+    /// Percent-decode a URL-escaped S3 key (%XX hex; '+' → space).
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(h), Some(l)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                )
+            {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            } else {
+                out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     fn http_response(status: u16, content_type: &str, body: Option<&String>) -> String {
@@ -6950,6 +7064,7 @@ mod s3_mock_tests {
         Arc::new(trash::TrashState {
             prefix: prefix.to_string(),
             index: RwLock::new(trash::TombstoneIndex::default()),
+            index_entries: AtomicU64::new(0),
         })
     }
 
@@ -7197,6 +7312,373 @@ mod s3_mock_tests {
         let after = fs.metrics();
         assert_eq!(after.s3_heads - before.s3_heads, 0, "目录后代缓存被扫掉");
         assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    // ===== 单元 2:软删除写墓碑(unlink/rmdir 门控 + 即时索引)=====
+
+    /// 索引含 key 时 soft_delete_file → 幂等 Ok 且零远程请求(性能守卫)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_covered_is_idempotent_zero_remote() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+        let before = fs.metrics();
+        fs.delete("/a.txt").await.expect("covered → 幂等 Ok");
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_puts - before.s3_puts, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        assert!(
+            mock.recorded.lock().unwrap().is_empty(),
+            "stale handle 二次删除必须零远程"
+        );
+        // 目录被覆盖同理
+        fs.trash_insert("/docs", true);
+        let before = fs.metrics();
+        fs.delete_dir_recursive("/docs").await.expect("幂等 Ok");
+        let after = fs.metrics();
+        assert_eq!(after.s3_puts - before.s3_puts, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    /// 未覆盖路径 write → 请求数与 trash 关闭时一致(清墓碑门控零额外成本)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_tombstone_gate_zero_remote() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let before = fs.metrics();
+        fs.write("/fresh.txt", b"x").await.expect("write");
+        let after = fs.metrics();
+        assert_eq!(after.s3_puts - before.s3_puts, 1, "仅一次 PUT");
+        assert_eq!(after.s3_lists - before.s3_lists, 0, "未覆盖不扫描墓碑");
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            1,
+            "与 --no-trash 完全一致的单请求"
+        );
+    }
+
+    /// unlink → HEAD 原对象(etag/size)→ PUT 墓碑;无 DELETE;原对象仍在;
+    /// 挂载视图立即隐藏且 stat 零请求;gauge 与计数器联动。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unlink_writes_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"hello".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+
+        fs.delete("/a.txt").await.expect("soft delete");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "HEAD + PUT 墓碑: {recorded:?}");
+        assert_eq!(recorded[0].method, "HEAD");
+        assert!(recorded[0].target.ends_with("/a.txt"));
+        assert_eq!(recorded[1].method, "PUT");
+        // SDK 为 PutObject 追加 ?x-id=PutObject 查询串,key 部分按 '?' 剥离
+        let put_target = recorded[1]
+            .target
+            .split('?')
+            .next()
+            .unwrap_or(&recorded[1].target);
+        assert!(
+            put_target.contains("/.trash/"),
+            "墓碑 key 必须带 .trash 前缀: {}",
+            recorded[1].target
+        );
+        assert!(
+            put_target.ends_with("/a.txt"),
+            "墓碑 key 以原 key 结尾: {}",
+            recorded[1].target
+        );
+        let body: trash::TombstoneBody = serde_json::from_slice(&recorded[1].body).unwrap();
+        assert_eq!(
+            body.etag.as_deref(),
+            Some("\"mock-etag\""),
+            "HEAD 原样 etag"
+        );
+        assert_eq!(body.size, Some(5), "HEAD content_length");
+        assert!(!body.is_dir);
+        assert!(
+            !recorded.iter().any(|r| r.method == "DELETE"),
+            "软删除不得 DELETE 原对象"
+        );
+        drop(recorded);
+        // 原对象仍在桶里
+        assert!(
+            mock.objects.lock().unwrap().contains_key("a.txt"),
+            "原对象必须保留"
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 1, "写墓碑计数");
+        assert_eq!(fs.metrics().trash_index_entries, 1, "gauge=1");
+        // 视图立即隐藏;再次 stat 走 negative cache,零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0, "被删路径 stat 零 HEAD");
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+        // list 不含
+        let root = fs.list("/").await.unwrap();
+        assert!(!root.iter().any(|e| e.name == "a.txt"));
+    }
+
+    /// rmdir → 仅一个 PUT 目录墓碑(尾斜杠,{"is_dir":true});无 list、
+    /// 无 DeleteObjects(对比原逻辑 list+批删);子树 stat 隐藏零请求。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rmdir_writes_dir_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("d/x", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+
+        fs.delete_dir_recursive("/d")
+            .await
+            .expect("soft delete dir");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "仅一个 PUT,无 list、无 DeleteObjects");
+        assert_eq!(recorded[0].method, "PUT");
+        assert!(recorded[0].target.contains("/.trash/"));
+        let put_target = recorded[0]
+            .target
+            .split('?')
+            .next()
+            .unwrap_or(&recorded[0].target);
+        assert!(
+            put_target.ends_with("/d/"),
+            "目录墓碑 key 尾斜杠: {}",
+            recorded[0].target
+        );
+        let body: trash::TombstoneBody = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert!(body.is_dir);
+        assert!(body.etag.is_none() && body.size.is_none());
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_tombstones_written, 1);
+        assert_eq!(fs.metrics().trash_index_entries, 1);
+        // 子树隐藏:子文件 stat 零请求
+        let before = fs.metrics();
+        assert!(fs.stat("/d/x").await.unwrap().is_none());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+        assert_eq!(after.s3_lists - before.s3_lists, 0);
+    }
+
+    /// 失败语义:PUT 墓碑失败 → delete Err、索引未 insert(stat 仍可见)、
+    /// 无墓碑残留;HEAD 404 → delete Ok 且零墓碑(幂等删除)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_delete_failure_semantics() {
+        // ① PUT 全败(10 > SDK 默认 3 次尝试)→ Err
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        mock.fail_put.store(10, Ordering::SeqCst);
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        let err = fs.delete("/a.txt").await.unwrap_err();
+        assert!(err.to_string().contains("s3 put tombstone"), "{err:?}");
+        // 提交点前零副作用:索引未 insert → stat 仍可见(正向 HEAD)
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        // 无墓碑残留
+        assert!(
+            !mock
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.contains(".trash"))
+        );
+        assert!(
+            mock.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(k, _)| !k.contains(".trash"))
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 0);
+        // ② HEAD 404 → delete Ok 且零墓碑(幂等删除,不写墓碑隐藏不存在之物)
+        mock.recorded.lock().unwrap().clear(); // 清掉 ① 的 HEAD + 失败 PUT 记录
+        mock.objects.lock().unwrap().remove("a.txt");
+        let mut fs = test_fs(port, 32); // 新实例避免 negative cache 干扰
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("404 → 幂等 Ok");
+        let recorded = mock.recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|r| r.method != "PUT" || !r.target.contains(".trash")),
+            "404 分支不得写墓碑: {recorded:?}"
+        );
+        assert_eq!(fs.metrics().trash_tombstones_written, 0);
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 同名重建(覆盖语义):write 前清墓碑 → 立即可见;旧内容随覆盖丢失。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recreate_same_name_clears_tombstone() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.txt").await.expect("soft delete");
+        assert!(fs.stat("/a.txt").await.unwrap().is_none());
+        mock.recorded.lock().unwrap().clear();
+
+        fs.write("/a.txt", b"new").await.expect("recreate");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let trash_deletes = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .count();
+        assert_eq!(trash_deletes, 1, "清墓碑 DELETE: {recorded:?}");
+        let puts = recorded
+            .iter()
+            .filter(|r| r.method == "PUT" && !r.target.contains(".trash"))
+            .count();
+        assert_eq!(puts, 1, "新对象 PUT: {recorded:?}");
+        drop(recorded);
+        assert_eq!(fs.metrics().trash_index_entries, 0, "墓碑已清除");
+        // stat/list 立即可见
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        let root = fs.list("/").await.unwrap();
+        assert!(root.iter().any(|e| e.name == "a.txt"));
+        // 索引 remove 后再次 stat 走正值缓存,零 HEAD
+        let before = fs.metrics();
+        assert!(fs.stat("/a.txt").await.unwrap().is_some());
+        let after = fs.metrics();
+        assert_eq!(after.s3_heads - before.s3_heads, 0);
+    }
+
+    /// rename 源被墓碑覆盖 → Err 且零 copy 请求(隐藏对象不得被搬出)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_source_covered_bails() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.trash_insert("/a.txt", false);
+
+        let err = fs.rename("/a.txt", "/b.txt", false).await.unwrap_err();
+        assert!(err.to_string().contains("in the trash"), "{err:?}");
+        // guard 不得跨后续锁(同线程重入 std Mutex 自死锁)
+        assert!(mock.recorded.lock().unwrap().is_empty(), "bail 前零远程");
+        // 目录源被目录墓碑覆盖同样拒绝
+        fs.trash_insert("/docs", true);
+        mock.recorded.lock().unwrap().clear();
+        let err = fs.rename("/docs", "/docs2", false).await.unwrap_err();
+        assert!(err.to_string().contains("in the trash"), "{err:?}");
+        assert!(mock.recorded.lock().unwrap().is_empty());
+    }
+
+    /// rename 目标被墓碑覆盖 → 先清墓碑再 copy,stat(new) 立即可见。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_target_covered_clears_first() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.txt", b"x".to_vec());
+        mock.set_object("b.txt", b"y".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/b.txt").await.expect("soft delete b");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.rename("/a.txt", "/b.txt", false)
+            .await
+            .expect("rename onto covered target");
+
+        let recorded = mock.recorded.lock().unwrap();
+        let trash_deletes = recorded
+            .iter()
+            .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+            .count();
+        assert_eq!(trash_deletes, 1, "提交点前清墓碑: {recorded:?}");
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "PUT" && r.copy_source.is_some()),
+            "copy 发生: {recorded:?}"
+        );
+        drop(recorded);
+        // 目标立即可见(旧墓碑已清)
+        assert!(fs.stat("/b.txt").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// 目录 rename:源树真实 DeleteObjects(尾部删除保持,移动语义不留墓碑);
+    /// 目标被目录墓碑覆盖 → 清目录墓碑后成功。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rename_dir_source_real_delete() {
+        let entries = vec![("d/".into(), true), ("d/a.txt".into(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("d/", Vec::new());
+        mock.set_object("d/a.txt", b"x".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        // 目标 e 已被软删除(目录墓碑)
+        fs.delete_dir_recursive("/e").await.expect("soft delete e");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.rename("/d", "/e", false)
+            .await
+            .expect("rename dir onto covered target");
+
+        let recorded = mock.recorded.lock().unwrap();
+        // 提交点前清目录墓碑
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.method == "DELETE" && r.target.contains(".trash")),
+            "清目录墓碑: {recorded:?}"
+        );
+        // 源树真实批删(移动语义:尾部真实删除,不留目录墓碑)
+        let lc = |t: &str| t.to_lowercase();
+        let batches = recorded
+            .iter()
+            .filter(|r| r.method == "POST" && lc(&r.target).contains("delete"))
+            .count();
+        assert_eq!(batches, 1, "源目录 DeleteObjects 批删: {recorded:?}");
+        // 未产生新目录墓碑
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.method == "PUT" && r.target.contains(".trash"))
+                .count(),
+            0
+        );
+        drop(recorded);
+        // 目标可见
+        assert!(fs.stat("/e").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
+    }
+
+    /// C9 裁决回归:WinFsp overwrite 回调经 write_from_file()(独立方法
+    /// 不走 write())—— 同名重建同样必须清墓碑。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overwrite_callback_clears_tombstone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"new").expect("spool");
+        let (mock, port) = MockS3::start(Vec::new(), Duration::from_millis(1)).await;
+        mock.set_object("a.bin", b"old".to_vec());
+        let mut fs = test_fs(port, 32);
+        fs.trash = Some(trash_state(".trash/"));
+        fs.delete("/a.bin").await.expect("soft delete");
+        mock.recorded.lock().unwrap().clear();
+
+        fs.write_from_file("/a.bin", &src).await.expect("overwrite");
+
+        let recorded = mock.recorded.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.method == "DELETE" && r.target.contains(".trash"))
+                .count(),
+            1,
+            "write_from_file 路径必须清墓碑: {recorded:?}"
+        );
+        drop(recorded);
+        assert!(fs.stat("/a.bin").await.unwrap().is_some());
+        assert_eq!(fs.metrics().trash_index_entries, 0);
     }
 }
 

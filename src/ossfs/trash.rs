@@ -7,11 +7,13 @@
 //!
 //! metadata-less 原则:墓碑本身就是唯一状态源,本模块不引入本地元数据库。
 
-use crate::ossfs::{ObjectFs, next_page_token};
+use crate::ossfs::{ObjectFs, is_s3_not_found, next_page_token};
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::RwLock;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 /// 墓碑 key 结构:`<date>` 为删除时 UTC 日期分区;original_key 为完整原对象 key
 /// (含命名空间 prefix,与 `key_for()` / `obj.key()` 零转换);is_dir 由 original_key
@@ -166,6 +168,292 @@ pub(crate) struct TrashState {
     pub prefix: String,
     /// 本地索引(files + dirs)
     pub index: RwLock<TombstoneIndex>,
+    /// gauge:索引条目数(files+dirs)。insert/remove/rebuild 后 store,
+    /// `ObjectFs::metrics()` 注入 snapshot(prefetch_inflight 先例,§0.3)。
+    pub index_entries: AtomicU64,
+}
+
+/// 墓碑 body(serde 往返;serde_json 已是直接依赖)。serde 默认忽略未知
+/// 字段 → 前向兼容。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TombstoneBody {
+    /// 文件墓碑:HEAD 原样 e_tag(OSS 带引号大写 / S3 小写;恢复比较忽略大小写)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// HEAD content_length
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// 目录墓碑 = {"is_dir":true}
+    pub is_dir: bool,
+}
+
+impl TombstoneIndex {
+    /// 仅 files 精确命中(不含 dirs 前缀覆盖)—— 清墓碑门控专用
+    /// (write/rename 目标门控:目录墓碑覆盖下的子路径创建不清祖先墓碑,V1 不做)。
+    pub fn is_file_covered(&self, key: &str) -> bool {
+        self.files.contains(key)
+    }
+
+    /// 全量枚举(files+dirs),供 full_rebuild diff(单元 3)。
+    pub fn entries(&self) -> Vec<(String, bool)> {
+        let mut out = Vec::with_capacity(self.files.len() + self.dirs.len());
+        out.extend(self.files.iter().cloned().map(|k| (k, false)));
+        out.extend(self.dirs.iter().cloned().map(|k| (k, true)));
+        out
+    }
+
+    /// 条目总数(files + dirs),gauge 与规模告警用。
+    pub fn len(&self) -> usize {
+        self.files.len() + self.dirs.len()
+    }
+
+    /// 是否为空(clippy len_without_is_empty)。
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty()
+    }
+}
+
+impl TrashState {
+    /// 文件软删(trash 开启时 [`ObjectFs::delete`] 的替代)。步骤:
+    /// key = fs.key_for(path);索引已覆盖 → 幂等 Ok(零远程);
+    /// HEAD 原对象:404 → 幂等 Ok(不写墓碑,防隐藏不存在之物);
+    /// 成功取 e_tag/content_length → 写墓碑(提交点)→ 索引 insert +
+    /// invalidate_stat + invalidate_read_cache + trash_tombstones_written+1。
+    /// 任一非 404 错误 → Err(删除失败,文件还在,提交点前零副作用)。
+    /// 全程持一个 limiter permit(镜像 delete:并发上限不可回归)。
+    pub(crate) async fn soft_delete_file(&self, fs: &ObjectFs, path: &str) -> Result<()> {
+        let _permit = fs.acquire().await?;
+        let key = fs.key_for(path);
+        if self.index.read().unwrap().is_file_covered(&key) {
+            return Ok(()); // 已隐藏:stale handle 二次删除,幂等,零远程
+        }
+        fs.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+        fs.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
+        let head = fs
+            .client
+            .head_object()
+            .bucket(&fs.bucket)
+            .key(&key)
+            .send()
+            .await;
+        let (etag, size) = match head {
+            Ok(resp) => (
+                resp.e_tag().map(|s| s.to_string()),
+                resp.content_length().map(|l| l.max(0) as u64),
+            ),
+            Err(e) if is_s3_not_found(&e) => return Ok(()), // 原对象不存在 → 幂等删除
+            Err(e) => {
+                fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e).context("s3 head for soft delete");
+            }
+        };
+        let tomb_key = encode_tombstone_key(
+            &self.prefix,
+            date_partition_utc(SystemTime::now()),
+            &key,
+            false,
+        );
+        self.write_tombstone(
+            fs,
+            &tomb_key,
+            &TombstoneBody {
+                etag,
+                size,
+                is_dir: false,
+            },
+        )
+        .await?;
+        // 提交点后:索引 + 缓存失效 + 计数(put 失败则以上全部不发生)
+        {
+            let mut idx = self.index.write().unwrap();
+            idx.insert(&key, false);
+            self.index_entries
+                .store(idx.len() as u64, Ordering::Relaxed);
+        }
+        fs.invalidate_stat(path);
+        fs.invalidate_read_cache(path);
+        fs.metrics
+            .trash_tombstones_written
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 目录软删(trash 开启时 [`ObjectFs::delete_dir_recursive`] 的替代)。
+    /// 无需 HEAD/枚举(隐式目录也无 marker,统一写墓碑);不枚举、不
+    /// DeleteObjects —— 前缀覆盖隐藏整个子树。步骤:
+    /// dir_key 带尾斜杠 → 已覆盖 → 幂等 Ok;写墓碑 {is_dir:true} →
+    /// 索引 insert + invalidate_stat + clear_read_cache(镜像
+    /// delete_dir_recursive_impl 的缓存清理)。
+    pub(crate) async fn soft_delete_dir(&self, fs: &ObjectFs, dir: &str) -> Result<()> {
+        let _permit = fs.acquire().await?;
+        let dir_key = format!("{}/", fs.key_for(dir).trim_end_matches('/'));
+        if self.index.read().unwrap().is_covered(&dir_key) {
+            return Ok(()); // 幂等,零远程
+        }
+        let tomb_key = encode_tombstone_key(
+            &self.prefix,
+            date_partition_utc(SystemTime::now()),
+            &dir_key,
+            true,
+        );
+        self.write_tombstone(
+            fs,
+            &tomb_key,
+            &TombstoneBody {
+                etag: None,
+                size: None,
+                is_dir: true,
+            },
+        )
+        .await?;
+        {
+            let mut idx = self.index.write().unwrap();
+            idx.insert(&dir_key, true);
+            self.index_entries
+                .store(idx.len() as u64, Ordering::Relaxed);
+        }
+        fs.invalidate_stat(dir);
+        fs.clear_read_cache();
+        fs.metrics
+            .trash_tombstones_written
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// write 挂点(文件):仅当索引 files 精确覆盖 key 才动作 —— list
+    /// `.trash` 前缀,decode 精确匹配 `original_key == key && !is_dir` 的
+    /// 项逐个 DELETE(跨全部日期分区)→ index.remove + invalidate_stat(path)。
+    /// 未覆盖 → 零远程请求(性能守卫)。删除失败 → Err(write 失败)。
+    /// 入口级:调用链无外层 permit(write/write_from_file 的 permit 在
+    /// put_whole_object 内部),此处持一个 permit 完成列表+删除。
+    pub(crate) async fn clear_file_tombstone_if_covered(
+        &self,
+        fs: &ObjectFs,
+        path: &str,
+    ) -> Result<()> {
+        let key = fs.key_for(path);
+        if !self.index.read().unwrap().is_file_covered(&key) {
+            return Ok(());
+        }
+        let _permit = fs.acquire().await?;
+        self.clear_tombstones_matching(fs, &key, false).await?;
+        fs.invalidate_stat(path);
+        Ok(())
+    }
+
+    /// mkdir 挂点:dir_key 带尾斜杠;is_covered(dir_key) → 清目录墓碑
+    /// (匹配 `original_key == dir_key && is_dir` 的精确项,跨全部分区)。
+    /// 子路径个体墓碑不清(文档化)。未覆盖 → 零远程请求。
+    pub(crate) async fn clear_dir_tombstone_if_covered(
+        &self,
+        fs: &ObjectFs,
+        dir_path: &str,
+    ) -> Result<()> {
+        let dir_key = format!("{}/", fs.key_for(dir_path).trim_end_matches('/'));
+        if !self.index.read().unwrap().is_covered(&dir_key) {
+            return Ok(());
+        }
+        let _permit = fs.acquire().await?;
+        self.clear_dir_tombstone(fs, &dir_key).await?;
+        fs.invalidate_stat(dir_path);
+        Ok(())
+    }
+
+    /// rename 目标用:精确 key,跨所有日期分区,不预检。调用方
+    /// (rename_impl)已持 limiter permit —— 内部 helper 不再 acquire
+    /// (饱和池阻塞第二次 acquire 会死锁,#55 纪律)。
+    pub(crate) async fn clear_file_tombstone(&self, fs: &ObjectFs, key: &str) -> Result<()> {
+        self.clear_tombstones_matching(fs, key, false).await
+    }
+
+    /// rename 目标用:精确目录 key(内部归一化补尾斜杠),跨所有日期分区。
+    pub(crate) async fn clear_dir_tombstone(&self, fs: &ObjectFs, dir_key: &str) -> Result<()> {
+        let dir_key = if dir_key.ends_with('/') {
+            dir_key.to_string()
+        } else {
+            format!("{dir_key}/")
+        };
+        self.clear_tombstones_matching(fs, &dir_key, true).await
+    }
+
+    /// 分页 list trash 前缀,decode 精确匹配 `original_key == target &&
+    /// is_dir` 后逐个 DELETE;全部成功后索引 remove + gauge store。
+    /// 任一 DELETE 失败 → Err(调用方决定整体失败)。
+    /// 锁纪律:列表/删除期间不持 index 锁,仅收尾时短写锁。
+    /// 不 acquire permit:permit 由入口(_if_covered 变体)或调用方
+    /// (rename_impl 的外层 permit)负责,此处只做请求。
+    async fn clear_tombstones_matching(
+        &self,
+        fs: &ObjectFs,
+        target: &str,
+        is_dir: bool,
+    ) -> Result<()> {
+        let prefix = self.prefix.clone();
+        let mut to_delete: Vec<String> = Vec::new();
+        list_trash_keys(fs, None, |page| {
+            for k in page {
+                if let Some(t) = decode_tombstone_key(&prefix, &k)
+                    && t.is_dir == is_dir
+                    && t.original_key == target
+                {
+                    to_delete.push(k);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        for k in &to_delete {
+            fs.client
+                .delete_object()
+                .bucket(&fs.bucket)
+                .key(k)
+                .send()
+                .await
+                .inspect_err(|_| {
+                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .inspect_err(|_| {
+                    fs.metrics.s3_delete_errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .context("s3 delete tombstone")?;
+        }
+        if !to_delete.is_empty() {
+            let mut idx = self.index.write().unwrap();
+            idx.remove(target, is_dir);
+            self.index_entries
+                .store(idx.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// PUT 墓碑小对象:serde_json body + content_type("application/json");
+    /// content_md5 配置开启时显式加头(镜像 put_whole_object,防 OSS 拒收 ——
+    /// #74 教训);不传 storage_class(墓碑走默认存储类,免 Archive 类墓碑
+    /// 冻结 GC/恢复读)。错误 → s3_errors/s3_put_errors 计数。
+    async fn write_tombstone(
+        &self,
+        fs: &ObjectFs,
+        tomb_key: &str,
+        body: &TombstoneBody,
+    ) -> Result<()> {
+        let json = serde_json::to_vec(body).context("serialize tombstone body")?;
+        let mut put = fs
+            .client
+            .put_object()
+            .bucket(&fs.bucket)
+            .key(tomb_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(json.clone()))
+            .content_type("application/json");
+        if fs.content_md5 {
+            put = put.content_md5(crate::ossfs::content_md5(&json));
+        }
+        if let Err(e) = put.send().await {
+            fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+            fs.metrics.s3_put_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(e).context("s3 put tombstone");
+        }
+        Ok(())
+    }
 }
 
 /// 以 trash_prefix 分页枚举墓碑对象 key。start_after 传 Some 时携带
@@ -407,6 +695,61 @@ mod tests {
                 "must reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn tombstone_body_serde_roundtrip() {
+        // 文件墓碑:etag/size 保留,is_dir=false
+        let file = TombstoneBody {
+            etag: Some("\"mock-etag\"".into()),
+            size: Some(42),
+            is_dir: false,
+        };
+        let json = serde_json::to_vec(&file).unwrap();
+        let back: TombstoneBody = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.etag.as_deref(), Some("\"mock-etag\""));
+        assert_eq!(back.size, Some(42));
+        assert!(!back.is_dir);
+        // 目录墓碑 = {"is_dir":true}(无 etag/size,skip_serializing_if 生效)
+        let dir = TombstoneBody {
+            etag: None,
+            size: None,
+            is_dir: true,
+        };
+        let json = serde_json::to_vec(&dir).unwrap();
+        assert_eq!(json, br#"{"is_dir":true}"#.to_vec());
+        let back: TombstoneBody = serde_json::from_slice(&json).unwrap();
+        assert!(back.is_dir);
+        assert!(back.etag.is_none() && back.size.is_none());
+        // 未知字段忽略(serde 默认,前向兼容)
+        let extra = br#"{"is_dir":false,"etag":"e","size":1,"future_field":true}"#;
+        let back: TombstoneBody = serde_json::from_slice(extra).unwrap();
+        assert_eq!(back.etag.as_deref(), Some("e"));
+        assert_eq!(back.size, Some(1));
+        assert!(!back.is_dir);
+    }
+
+    #[test]
+    fn tombstone_index_is_file_covered_and_entries() {
+        let mut idx = TombstoneIndex::default();
+        idx.insert("a.txt", false);
+        idx.insert("docs", true); // 归一化 "docs/"
+        // is_file_covered 仅 files 精确命中(清墓碑门控:目录覆盖不算)
+        assert!(idx.is_file_covered("a.txt"));
+        assert!(!idx.is_file_covered("docs"));
+        assert!(
+            !idx.is_file_covered("docs/x.txt"),
+            "目录覆盖不进 files 门控"
+        );
+        // entries 全量枚举
+        let mut entries = idx.entries();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![("a.txt".to_string(), false), ("docs/".to_string(), true)]
+        );
+        // len = files + dirs
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]
