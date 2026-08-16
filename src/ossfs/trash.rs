@@ -756,35 +756,88 @@ impl TrashState {
     /// 结构识别(同步零远程):段切分后精确匹配 dir_name + 固定段数。
     /// "$Recycle.Bin/<SID>/<name>" 第 3 段为条目名;更深(>2 层)不拦截、
     /// 原样可见(风险:桶中真实用户数据,裁决:深层文件不隐藏)。第二段
-    /// 任意接受(SID/uid 只是视图分区,跨段共享同一墓碑集,裁决 R14)。
+    /// Windows 任意接受(SID 只是视图分区,跨段共享同一墓碑集,裁决 R14);
+    /// macOS 先经 uid 范围过滤(裁决 R17:仅 macos_uid_dirs,空 = 当前
+    /// 用户 uid;非数字 uid 不拦截),范围外返回 None 走普通路径。
     pub(crate) fn match_system_trash(&self, path: &str) -> Option<SystemTrashMatch> {
         let sys = self.system.as_ref()?;
         let dir_name = sys.dir_name.as_str();
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
         match segments.as_slice() {
             [d] if *d == dir_name => Some(SystemTrashMatch::Dir { level: 0 }),
-            [d, _] if *d == dir_name => Some(SystemTrashMatch::Dir { level: 1 }),
-            [d, _, name] if *d == dir_name => Some(SystemTrashMatch::Entry {
-                entry_name: (*name).to_string(),
-            }),
+            [d, uid] if *d == dir_name && uid_in_scope(sys, uid) => {
+                Some(SystemTrashMatch::Dir { level: 1 })
+            }
+            [d, uid, name] if *d == dir_name && uid_in_scope(sys, uid) => {
+                Some(SystemTrashMatch::Entry {
+                    entry_name: (*name).to_string(),
+                })
+            }
             _ => None,
         }
     }
 
     /// Windows:mkdir/rename 拦截时记录 SID 段(裁决 R14)。仅
-    /// WindowsRecycleBin 平台、level 1 目录命中时记录;macOS 不使用。
-    /// 幂等(集合去重)。
+    /// WindowsRecycleBin 平台记录;mkdir 命中 SID 目录(level 1)、rename
+    /// 软删命中条目(Entry)都记录第 2 段。macOS 不使用。幂等(集合去重)。
     pub(crate) fn record_seen_sid(&self, path: &str) {
         let Some(sys) = &self.system else { return };
         if sys.platform != SystemTrashPlatform::WindowsRecycleBin {
             return;
         }
-        if let Some(SystemTrashMatch::Dir { level: 1 }) = self.match_system_trash(path) {
-            if let Some(sid) = path.trim_matches('/').split('/').nth(1) {
-                if !sid.is_empty() {
-                    self.seen_sids.write().unwrap().insert(sid.to_string());
-                }
+        let sid = matches!(
+            self.match_system_trash(path),
+            Some(SystemTrashMatch::Dir { level: 1 }) | Some(SystemTrashMatch::Entry { .. })
+        )
+        .then(|| path.trim_matches('/').split('/').nth(1))
+        .flatten();
+        if let Some(sid) = sid
+            && !sid.is_empty()
+        {
+            self.seen_sids.write().unwrap().insert(sid.to_string());
+        }
+    }
+
+    /// 软删(rename 目标在回收站条目层,单元 2):判定源形态后分派
+    /// soft_delete_file_impl / soft_delete_dir_impl,带 recycle_name
+    /// (Windows 恒写 $R 名,Explorer 还原按此 rename;macOS 仅 Finder
+    /// 改名时写,与 basename 一致时 None,渲染回退 basename)。
+    /// 幂等:索引已覆盖 → Ok(零远程)。**调用方已持 limiter permit**
+    /// (rename 拦截持有,#55 纪律:内部不再 acquire)。
+    pub(crate) async fn soft_delete_via_system(
+        &self,
+        fs: &ObjectFs,
+        old: &str,
+        entry_name: &str,
+    ) -> Result<()> {
+        let key = fs.key_for(old);
+        // 幂等:索引已覆盖 → Ok(零远程)。is_covered 双形态(文件精确 +
+        // 目录前缀),隐藏条目在视图不可见,rename 不应到达。
+        if self
+            .index
+            .read()
+            .unwrap()
+            .is_covered(key.trim_end_matches('/'))
+        {
+            return Ok(());
+        }
+        // 源形态判定:文件 vs 目录(目录无 marker,HEAD 404 不可判 —— 目录
+        // 墓碑形如 ".trash/<date>/<key>/",故必须 stat 一次;命中 3s stat
+        // 缓存时零额外请求)。
+        let stat = fs.stat_uncached_impl(old).await?;
+        let Some(entry) = stat else {
+            anyhow::bail!("rename: source not found: {old}");
+        };
+        let recycle_name = match self.system.as_ref().expect("system view").platform {
+            SystemTrashPlatform::WindowsRecycleBin => Some(entry_name.to_string()),
+            SystemTrashPlatform::MacOsTrashes => {
+                (entry_name != basename(&key)).then(|| entry_name.to_string())
             }
+        };
+        if entry.is_dir {
+            self.soft_delete_dir_impl(fs, old, recycle_name).await
+        } else {
+            self.soft_delete_file_impl(fs, old, recycle_name).await
         }
     }
 
@@ -1256,6 +1309,23 @@ fn current_uid() -> u32 {
     0
 }
 
+/// 裁决 R17:macOS `.Trashes/<uid>` 段的渲染/拦截范围判定。Windows SID
+/// 段任意接受(非数字也不拦截 —— SID 形态本身非数字);macOS 仅
+/// macos_uid_dirs(空 = 当前挂载用户 uid)内命中,非数字 uid 不拦截。
+fn uid_in_scope(sys: &SystemTrash, uid: &str) -> bool {
+    if sys.platform != SystemTrashPlatform::MacOsTrashes {
+        return true;
+    }
+    let Ok(uid) = uid.parse::<u32>() else {
+        return false;
+    };
+    if sys.macos_uid_dirs.is_empty() {
+        uid == current_uid()
+    } else {
+        sys.macos_uid_dirs.contains(&uid)
+    }
+}
+
 /// 条目解析结果:原 key + 墓碑 key + 目录形态(全部带命名空间前缀)。
 #[derive(Debug, Clone)]
 struct ResolvedEntry {
@@ -1441,8 +1511,28 @@ impl TrashState {
     /// invalidate_stat + invalidate_read_cache + trash_tombstones_written+1。
     /// 任一非 404 错误 → Err(删除失败,文件还在,提交点前零副作用)。
     /// 全程持一个 limiter permit(镜像 delete:并发上限不可回归)。
-    pub(crate) async fn soft_delete_file(&self, fs: &ObjectFs, path: &str) -> Result<()> {
+    /// `recycle_name`:系统回收站软删(单元 2)的视图条目名(Windows = $R
+    /// 名;macOS = Finder 改名后的条目名,与原名一致时 None);普通软删
+    /// 传 None,零行为变化。
+    pub(crate) async fn soft_delete_file(
+        &self,
+        fs: &ObjectFs,
+        path: &str,
+        recycle_name: Option<String>,
+    ) -> Result<()> {
         let _permit = fs.acquire().await?;
+        self.soft_delete_file_impl(fs, path, recycle_name).await
+    }
+
+    /// 无 permit 变体:调用方已持 limiter permit(单元 2 rename 拦截镜像
+    /// clear_target_tombstones 的 #55 纪律 —— 饱和池二次 acquire 死锁)。
+    /// 语义与 [`Self::soft_delete_file`] 相同。
+    async fn soft_delete_file_impl(
+        &self,
+        fs: &ObjectFs,
+        path: &str,
+        recycle_name: Option<String>,
+    ) -> Result<()> {
         let key = fs.key_for(path);
         if self.index.read().unwrap().is_file_covered(&key) {
             return Ok(()); // 已隐藏:stale handle 二次删除,幂等,零远程
@@ -1480,7 +1570,7 @@ impl TrashState {
                 etag,
                 size,
                 is_dir: false,
-                recycle_name: None,
+                recycle_name: recycle_name.clone(),
                 recycle_i: None,
             },
         )
@@ -1491,6 +1581,9 @@ impl TrashState {
             idx.insert(&key, false, date_partition_utc(SystemTime::now()));
             self.store_index_entries(idx.len());
         }
+        // 提交点后:recycle_names 与墓碑同生命周期(裁决 R3 ① —— 本地软删
+        // 写入;仅系统视图软删带 recycle_name)。
+        self.insert_recycle_names(&tomb_key, &key, &recycle_name);
         fs.invalidate_stat(path);
         fs.invalidate_read_cache(path);
         fs.metrics
@@ -1505,8 +1598,24 @@ impl TrashState {
     /// dir_key 带尾斜杠 → 已覆盖 → 幂等 Ok;写墓碑 {is_dir:true} →
     /// 索引 insert + invalidate_stat + clear_read_cache(镜像
     /// delete_dir_recursive_impl 的缓存清理)。
-    pub(crate) async fn soft_delete_dir(&self, fs: &ObjectFs, dir: &str) -> Result<()> {
+    /// `recycle_name` 语义同 [`Self::soft_delete_file`]。
+    pub(crate) async fn soft_delete_dir(
+        &self,
+        fs: &ObjectFs,
+        dir: &str,
+        recycle_name: Option<String>,
+    ) -> Result<()> {
         let _permit = fs.acquire().await?;
+        self.soft_delete_dir_impl(fs, dir, recycle_name).await
+    }
+
+    /// 无 permit 变体:调用方已持 limiter permit(单元 2 rename 拦截)。
+    async fn soft_delete_dir_impl(
+        &self,
+        fs: &ObjectFs,
+        dir: &str,
+        recycle_name: Option<String>,
+    ) -> Result<()> {
         let dir_key = format!("{}/", fs.key_for(dir).trim_end_matches('/'));
         if self.index.read().unwrap().is_covered(&dir_key) {
             return Ok(()); // 幂等,零远程
@@ -1524,7 +1633,7 @@ impl TrashState {
                 etag: None,
                 size: None,
                 is_dir: true,
-                recycle_name: None,
+                recycle_name: recycle_name.clone(),
                 recycle_i: None,
             },
         )
@@ -1534,6 +1643,8 @@ impl TrashState {
             idx.insert(&dir_key, true, date_partition_utc(SystemTime::now()));
             self.store_index_entries(idx.len());
         }
+        // 提交点后:recycle_names 与墓碑同生命周期(裁决 R3 ①)
+        self.insert_recycle_names(&tomb_key, &dir_key, &recycle_name);
         // 双形态缓存失效(裁决 #8):invalidate_trash_cached 覆盖裸形态
         // "/d" 与 "/d/" 尾斜杠形态及后代前缀(stat("/d") 与 stat("/d/")
         // 是不同缓存键 —— 只失效裸形态会让 "/d/" 正值条目存活至 TTL,
@@ -1546,6 +1657,154 @@ impl TrashState {
             .trash_tombstones_written
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// 系统回收站软删的反向索引写入(裁决 R3 ①):by_name →
+    /// 墓碑 key、by_key → recycle_name(最新,裁决 R7)。同名 $R 重复 →
+    /// by_name 覆盖为最新并 warn(不静默错删,测试 8 断言)。仅
+    /// recycle_name Some(系统视图软删)时写入;提交点后调用。
+    fn insert_recycle_names(
+        &self,
+        tomb_key: &str,
+        original_key: &str,
+        recycle_name: &Option<String>,
+    ) {
+        let Some(name) = recycle_name else {
+            return;
+        };
+        let mut names = self.recycle_names.write().unwrap();
+        if let Some(prev) = names.by_name.insert(name.clone(), tomb_key.to_string())
+            && prev != tomb_key
+        {
+            tracing::warn!(
+                recycle_name = %name,
+                "trash system view: recycle name 已存在,by_name 覆盖为最新墓碑(裁决 R7)"
+            );
+        }
+        names.by_key.insert(original_key.to_string(), name.clone());
+    }
+
+    /// 还原(rename 源在回收站条目层,单元 2):
+    /// 1. 解析 old → Entry{entry_name};$I 形态 → Err(元数据条目不可还原)。
+    /// 2. resolve_entry_original → None → Err(NotFound)。暖路径(by_name
+    ///    命中)零远程;Windows 冷路径内部 acquire 兜底。
+    /// 3. key_for(new) == original_key(还原到原位置,数据从未移动)→
+    ///    文件先 HEAD 原对象:404 → 清墓碑返回 OriginalGone(对齐
+    ///    trash_restore 三分支,不留空引用);存在 → 清墓碑 → Restored。
+    ///    零 copy(P4 守卫)。清墓碑 = clear_target_tombstones(裁决 R7:
+    ///    同名多日期全部版本清除)。
+    /// 4. new != original_key(拖到任意位置):镜像 rename_impl 拷贝机件
+    ///    (文件 copy_object/multipart;目录 copy_tree + allow_rename_dir/
+    ///    rename_dir_limit 守卫)→ copy 成功后清源墓碑 + 目标墓碑(覆盖
+    ///    语义,只清目标自身双形态不清祖先 —— 不复活已删目录,§2.4)。
+    /// 5. 原对象 404 → 清墓碑,返回 OriginalGone(不销毁可能存活的数据)。
+    ///
+    /// 返回 RestoreOutcome(对齐 trash_restore 三分支);rename 调用方丢弃
+    /// 详情(map 为 Ok(()) —— 还原失败已含语义,成功与否即 Outcome 之外
+    /// 的信息)。
+    pub(crate) async fn restore_via_system(
+        &self,
+        fs: &ObjectFs,
+        old: &str,
+        new: &str,
+    ) -> Result<RestoreOutcome> {
+        // 1. 解析 old → Entry{entry_name};$I 形态 → Err(NotFound 语义)
+        let Some(SystemTrashMatch::Entry { entry_name }) = self.match_system_trash(old) else {
+            anyhow::bail!("restore: source is not a system recycle bin entry");
+        };
+        if is_i_entry(&entry_name) {
+            anyhow::bail!("restore: cannot restore a $I metadata entry");
+        }
+        // 2. resolve_entry_original → None → Err(NotFound)
+        let Some(original_key) = self.resolve_entry_original(fs, &entry_name).await? else {
+            anyhow::bail!("restore: recycle bin entry not found: {entry_name}");
+        };
+        let is_dir = original_key.ends_with('/');
+        let new_key = fs.key_for(new);
+        let same_place = new_key.trim_end_matches('/') == original_key.trim_end_matches('/');
+
+        // 还原主体(HEAD/copy/清墓碑):持一个 permit(镜像 trash_restore
+        // 入口;resolve_entry_original 的冷路径 acquire 已先行释放)。
+        let _permit = fs.acquire().await?;
+        // 文件:HEAD 原对象校验(404 → OriginalGone 仅清墓碑)。目录无原
+        // 对象(隐式目录无 marker),跳过。
+        let mut size: u64 = 0;
+        if !is_dir {
+            let head = fs
+                .client
+                .head_object()
+                .bucket(&fs.bucket)
+                .key(&original_key)
+                .send()
+                .await;
+            match head {
+                Err(e) if is_s3_not_found(&e) => {
+                    self.clear_target_tombstones(fs, &original_key).await?;
+                    fs.invalidate_trash_cached(old, false);
+                    fs.invalidate_stat(new.trim_end_matches('/'));
+                    return Ok(RestoreOutcome::OriginalGone);
+                }
+                Err(e) => {
+                    fs.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(e).context("s3 head for system restore");
+                }
+                Ok(resp) => {
+                    fs.metrics.s3_heads.fetch_add(1, Ordering::Relaxed);
+                    fs.metrics.s3_stat_heads.fetch_add(1, Ordering::Relaxed);
+                    size = resp.content_length().map(|l| l.max(0) as u64).unwrap_or(0);
+                }
+            }
+        }
+        if same_place {
+            // 3. 还原到原位置:数据从未移动,零 copy(P4 守卫)
+            self.clear_target_tombstones(fs, &original_key).await?;
+            fs.invalidate_trash_cached(old, is_dir);
+            fs.invalidate_stat(new.trim_end_matches('/'));
+            return Ok(RestoreOutcome::Restored {
+                etag_mismatch: false,
+                multiple_versions: false,
+            });
+        }
+        // 4. 拖到任意位置:镜像 rename_impl 拷贝机件
+        let bare_original = original_key.trim_end_matches('/');
+        if is_dir {
+            if !fs.allow_rename_dir {
+                anyhow::bail!("directory rename is disabled");
+            }
+            if let Some(limit) = fs.rename_dir_limit {
+                let count = fs.count_tree_entries(bare_original, limit).await?;
+                if count > limit {
+                    anyhow::bail!(
+                        "directory {old} has {count} entries, exceeding rename-dir-limit {limit}"
+                    );
+                }
+            }
+            fs.copy_tree(bare_original, &new_key).await?;
+        } else if size >= crate::ossfs::MULTIPART_COPY_THRESHOLD {
+            fs.multipart_copy_object(&original_key, &new_key, size)
+                .await?;
+        } else {
+            let mut copy = fs
+                .client
+                .copy_object()
+                .bucket(&fs.bucket)
+                .key(&new_key)
+                .copy_source(crate::ossfs::s3_copy_source(&fs.bucket, &original_key));
+            if let Some(sc) = &fs.storage_class {
+                copy = copy.storage_class(sc.clone());
+            }
+            copy.send().await.context("s3 copy")?;
+        }
+        // 5. copy 成功 → 清源墓碑(提交点);目标被墓碑覆盖 → 覆盖语义
+        // (clear_target_tombstones(new) 只清 new 自身双形态,不清祖先)。
+        self.clear_target_tombstones(fs, &original_key).await?;
+        self.clear_target_tombstones(fs, &new_key).await?;
+        fs.invalidate_trash_cached(old, is_dir);
+        fs.invalidate_stat(new.trim_end_matches('/'));
+        Ok(RestoreOutcome::Restored {
+            etag_mismatch: false,
+            multiple_versions: false,
+        })
     }
 
     /// 重建入口统一清墓碑挂点(write / write_from_file / mkdir):门控 =
@@ -2502,6 +2761,52 @@ mod tests {
         assert!(s.is_system_trash_path("/$Recycle.Bin/S-1"));
         assert!(s.is_system_trash_path("/$Recycle.Bin/S-1/$R1.txt"));
         assert!(!s.is_system_trash_path("/$Recycle.Bin/S-1/$R1.txt/x"));
+    }
+
+    #[test]
+    fn macos_match_filters_uid_scope() {
+        // 裁决 R17:macOS 渲染/拦截限 macos_uid_dirs(空 = 当前用户 uid),
+        // 范围外按普通路径(返回 None,走 S3 404 自然失败);非数字 uid 不
+        // 拦截;Windows SID 段任意接受(不受 uid 过滤)。
+        let m = mac_state(); // macos_uid_dirs = [501]
+        assert_eq!(
+            m.match_system_trash("/.Trashes/501/a.txt"),
+            Some(SystemTrashMatch::Entry {
+                entry_name: "a.txt".into()
+            })
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/501"),
+            Some(SystemTrashMatch::Dir { level: 1 })
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/999"),
+            None,
+            "范围外 uid 不拦截"
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/999/a.txt"),
+            None,
+            "范围外 uid 不拦截"
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes/x/a.txt"),
+            None,
+            "非数字 uid 不拦截"
+        );
+        assert_eq!(
+            m.match_system_trash("/.Trashes"),
+            Some(SystemTrashMatch::Dir { level: 0 }),
+            "根层不过滤"
+        );
+        // Windows:SID 段非数字,不受 uid 过滤影响
+        let s = win_state();
+        assert_eq!(
+            s.match_system_trash("/$Recycle.Bin/S-1-5-21-1/$R1.txt"),
+            Some(SystemTrashMatch::Entry {
+                entry_name: "$R1.txt".into()
+            })
+        );
     }
 
     #[test]
