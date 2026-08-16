@@ -317,8 +317,26 @@ impl TrashState {
         }
         {
             let mut idx = self.index.write().unwrap();
+            // 裁决 #13:锁内一次性整体换入 —— dirs 批量 extend + sort_unstable
+            // + dedup(O((n+m)log(n+m))),取代逐条 binary_search+insert 的
+            // O(m×n) memmove(数十万 dirs + 上千新增时写锁持续毫秒到秒级,
+            // 期间全部 list/stat 读锁被阻塞)。mem::take 零克隆换出原 Vec,
+            // 排序期间读侧被写锁遮挡;files 由 HashSet 批量 extend(O(m))。
+            let mut dirs = std::mem::take(&mut idx.dirs);
+            dirs.extend(added.iter().filter(|(_, is_dir)| *is_dir).map(|(k, _)| {
+                if k.ends_with('/') {
+                    k.clone()
+                } else {
+                    format!("{k}/")
+                }
+            }));
+            dirs.sort_unstable();
+            dirs.dedup();
+            idx.dirs = dirs;
             for (key, is_dir) in added {
-                idx.insert(key, *is_dir);
+                if !*is_dir {
+                    idx.files.insert(key.clone());
+                }
             }
             self.index_entries
                 .store(idx.len() as u64, Ordering::Relaxed);
