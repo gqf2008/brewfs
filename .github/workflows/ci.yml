@@ -123,7 +123,10 @@ jobs:
       - name: Install WinFsp (runtime DLL for delay-loaded tests)
         shell: pwsh
         run: |
-          winget install --id WinFsp.WinFsp --silent --accept-package-agreements --accept-source-agreements
+          # winget's exit code is not a reliable signal (non-zero for
+          # "already installed" etc.) — ignore it and judge success solely
+          # by locating winfsp-x64.dll below.
+          winget install --id WinFsp.WinFsp --silent --accept-package-agreements --accept-source-agreements 2>$null
           $bin = @(
             "${env:ProgramFiles(x86)}\WinFsp\bin",
             "${env:ProgramFiles}\WinFsp\bin",
