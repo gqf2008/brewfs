@@ -425,7 +425,34 @@ impl OssFs {
         if let Some(len) = buf_len {
             entry.size = len;
         }
-        self.attr_for(&entry, inode_for_path(path))
+        let mut attr = self.attr_for(&entry, inode_for_path(path));
+        // 单元 5(§5.1 ②):macOS `.Trashes` 目录层恒报 0700(覆盖
+        // config.dir_mode)—— Finder 会把空 `.Trashes` 自置 0333(写权限
+        // 陷阱 → 删除立即生效),虚拟目录无真实 inode,按 0700 呈现保证
+        // 属主可写。[待验证] Finder 对虚拟目录权限的判定(实测项 D)。
+        if let Some(perm) = self.trashes_perm(path, entry.is_dir) {
+            attr.perm = perm;
+        }
+        attr
+    }
+
+    /// macOS `.Trashes` 目录层(macOS 平台形态)的 0700 覆盖。仅
+    /// `MacOsTrashes` 平台的 Dir 层(level 0/1,uid 范围过滤随
+    /// match_system_trash 生效,裁决 R17);条目层与 Windows 形态不覆盖。
+    /// trash 关闭/非 macOS 平台恒 None(行为不变)。
+    fn trashes_perm(&self, path: &str, is_dir: bool) -> Option<u16> {
+        if !is_dir {
+            return None;
+        }
+        let trash = self.fs.trash.as_ref()?;
+        let sys = trash.system.as_ref()?;
+        if sys.platform != super::trash::SystemTrashPlatform::MacOsTrashes {
+            return None;
+        }
+        match trash.match_system_trash(path) {
+            Some(super::trash::SystemTrashMatch::Dir { .. }) => Some(0o700),
+            _ => None,
+        }
     }
 
     /// Flush a dirty open file to the object store. A streaming handle
@@ -1611,7 +1638,24 @@ fn macos_fuse_backend() -> Option<&'static str> {
     }
 }
 
-fn build_config(allow_other: bool, read_only: bool) -> Config {
+/// 系统回收站开启时(macOS)的挂载选项(裁决 R12):macFUSE 分支追加
+/// `local`(gocryptfs `-ko local` / encfs `-olocal` 先例 —— 挂为本地卷位
+/// Finder 才启用卷级废纸篓);FUSE-T 挂为 NFS 网络卷不支持 Finder 废纸篓,
+/// 打 warning 并返回 None(不追加选项)。subtype 由 [`macos_fuse_backend`]
+/// 探测注入;抽成纯函数便于测试确定性断言两个分支。
+#[cfg(target_os = "macos")]
+fn system_trash_mount_option(subtype: &str) -> Option<MountOption> {
+    if subtype == "fuse-t" {
+        warn!(
+            "系统回收站已开启,但 FUSE-T 挂载为 NFS 网络卷,Finder 废纸篓不可用,删除将立即生效;请改用 macFUSE 以启用 Finder 废纸篓"
+        );
+        None
+    } else {
+        Some(MountOption::CUSTOM("local".to_string()))
+    }
+}
+
+fn build_config(allow_other: bool, read_only: bool, system_trash: bool) -> Config {
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("OSSFS-OSS".to_string())];
     if read_only {
@@ -1632,6 +1676,11 @@ fn build_config(allow_other: bool, read_only: bool) -> Config {
         };
         cfg.mount_options
             .push(MountOption::Subtype(subtype.to_string()));
+        // 单元 5(裁决 R12):系统回收站开启时,macFUSE 追加 local;FUSE-T
+        // 告警。关闭时行为不变。
+        if system_trash && let Some(opt) = system_trash_mount_option(subtype) {
+            cfg.mount_options.push(opt);
+        }
     }
     cfg.acl = SessionACL::Owner;
     // fuser's multi-threaded event loop is Linux-only; macOS (macFUSE /
@@ -1771,12 +1820,18 @@ pub async fn mount_oss_fuse(
 
     let allow_other = fs.allow_other();
     let read_only = fs.read_only();
+    // 单元 5(裁决 R12):系统回收站开启(macOS 平台形态由 build_trash_state
+    // 按 cfg 注入)决定 local 挂载选项 / FUSE-T 告警。
+    let system_trash_enabled = fs.trash.as_ref().and_then(|t| t.system.as_ref()).is_some();
     let handle = Handle::current();
     let dirs = Arc::new(Mutex::new(HashSet::new()));
     let oss_fs = OssFs::new(fs, handle, Arc::clone(&dirs));
-    let session =
-        fuser::spawn_mount2(oss_fs, mount_point, &build_config(allow_other, read_only))
-            .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e}", mount_point.display()))?;
+    let session = fuser::spawn_mount2(
+        oss_fs,
+        mount_point,
+        &build_config(allow_other, read_only, system_trash_enabled),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e}", mount_point.display()))?;
 
     // FUSE-T performs the real NFS mount asynchronously after the FUSE
     // session is negotiated. Poll until the mount actually shows up in the
@@ -2219,12 +2274,135 @@ mod tests {
 
     #[test]
     fn build_config_mounts_ro_when_read_only() {
-        let ro = build_config(false, true);
+        let ro = build_config(false, true, false);
         assert!(
             ro.mount_options.contains(&MountOption::RO),
             "--read-only must mount the kernel volume RO"
         );
-        let rw = build_config(false, false);
+        let rw = build_config(false, false, false);
         assert!(!rw.mount_options.contains(&MountOption::RO));
+    }
+
+    // -------------------------------------------------------------------
+    // 单元 5:macOS 系统回收站挂载选项(裁决 R12)+ .Trashes 目录 mode
+    // -------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_trash_mount_option_macfuse_appends_local() {
+        // macFUSE 分支:追加 local(本地卷位,Finder 启用卷级废纸篓)。
+        let opt = system_trash_mount_option("macfuse").expect("macFUSE 分支必有 local");
+        assert_eq!(opt, MountOption::CUSTOM("local".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_trash_mount_option_fuse_t_none_and_warms() {
+        // FUSE-T 分支:不追加任何选项(Finder 废纸篓不可用,告警由
+        // tracing::warn 发出——分支判定在此,告警内容见实现)。
+        assert_eq!(system_trash_mount_option("fuse-t"), None);
+    }
+
+    #[test]
+    fn build_config_never_appends_local_when_system_trash_off() {
+        // 关闭时行为不变:任何后端都不含 local(环境无关断言)。
+        let cfg = build_config(false, false, false);
+        assert!(
+            !cfg.mount_options
+                .iter()
+                .any(|o| *o == MountOption::CUSTOM("local".to_string())),
+            "系统回收站关闭不得追加 local: {:?}",
+            cfg.mount_options
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_config_with_system_trash_still_has_subtype() {
+        // 开启时:subtype 仍在(后端探测结果注入;local 分支由
+        // system_trash_mount_option 单测覆盖,此处不断言后端相关项)。
+        let cfg = build_config(false, false, true);
+        assert!(
+            cfg.mount_options
+                .iter()
+                .any(|o| matches!(o, MountOption::Subtype(_))),
+            "subtype 必须始终存在: {:?}",
+            cfg.mount_options
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trashes_perm_returns_0700_for_macos_trash_dirs_only() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let mut state = crate::ossfs::trash::TrashState::new(
+            ".trash/".to_string(),
+            crate::ossfs::TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        Arc::get_mut(&mut state)
+            .expect("freshly created arc is uniquely owned")
+            .system = Some(crate::ossfs::trash::SystemTrash {
+            dir_name: ".Trashes".into(),
+            platform: crate::ossfs::trash::SystemTrashPlatform::MacOsTrashes,
+            macos_uid_dirs: vec![501],
+        });
+        fs.trash = Some(state);
+        let oss = test_oss_with(fs);
+
+        let dir = DirEntry {
+            name: ".Trashes".into(),
+            is_dir: true,
+            size: 0,
+            mtime_secs: 0,
+        };
+        // .Trashes 与 .Trashes/<uid> 目录层 → 0700
+        assert_eq!(oss.trashes_perm("/.Trashes", true), Some(0o700));
+        assert_eq!(oss.trashes_perm("/.Trashes/501", true), Some(0o700));
+        // 条目层不覆盖
+        assert_eq!(oss.trashes_perm("/.Trashes/501/a.txt", true), None);
+        assert_eq!(oss.trashes_perm("/.Trashes/501/a.txt", false), None);
+        // 范围外 uid(R17)与普通路径不覆盖
+        assert_eq!(oss.trashes_perm("/.Trashes/999", true), None);
+        assert_eq!(oss.trashes_perm("/docs", true), None);
+        // effective_attr 全链路:getattr 语义(覆盖 config.dir_mode)
+        let attr = oss.effective_attr("/.Trashes", &dir);
+        assert_eq!(attr.perm, 0o700, "getattr 路径必须报 0700");
+        assert_eq!(attr.kind, FileType::Directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trashes_perm_none_when_trash_off_or_windows_platform() {
+        // 非 macOS 平台形态($Recycle.Bin)与 trash 关闭:恒 None(行为不变)
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let mut fs = test_fs_with_budget(port, 32, None);
+        let mut state = crate::ossfs::trash::TrashState::new(
+            ".trash/".to_string(),
+            crate::ossfs::TrashRefreshMode::Lazy,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+            crate::ossfs::TRASH_RETENTION_DAYS,
+        );
+        Arc::get_mut(&mut state)
+            .expect("freshly created arc is uniquely owned")
+            .system = Some(crate::ossfs::trash::SystemTrash {
+            dir_name: "$Recycle.Bin".into(),
+            platform: crate::ossfs::trash::SystemTrashPlatform::WindowsRecycleBin,
+            macos_uid_dirs: vec![],
+        });
+        fs.trash = Some(state);
+        let oss = test_oss_with(fs);
+        assert_eq!(oss.trashes_perm("/$Recycle.Bin", true), None);
+        assert_eq!(oss.trashes_perm("/$Recycle.Bin/S-1-5-21-1", true), None);
+        drop(oss);
+        // trash 关闭(system = None)
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let fs = test_fs_with_budget(port, 32, None);
+        let oss = test_oss_with(fs);
+        assert_eq!(oss.trashes_perm("/.Trashes", true), None);
     }
 }
