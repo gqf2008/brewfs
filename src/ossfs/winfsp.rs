@@ -1003,7 +1003,10 @@ impl FileSystemContext for OssMountContext {
                     attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
                 }
                 Some(SystemTrashMatch::Entry { entry_name })
-                    if trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                    if trash
+                        .system
+                        .as_ref()
+                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
                         && is_i_entry(&entry_name) =>
                 {
                     attributes |= FILE_ATTRIBUTE_HIDDEN;
@@ -1055,7 +1058,10 @@ impl FileSystemContext for OssMountContext {
             if let Some(trash) = &self.fs.trash {
                 if let Some(SystemTrashMatch::Entry { entry_name }) =
                     trash.match_system_trash(&posix)
-                    && trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                    && trash
+                        .system
+                        .as_ref()
+                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
                 {
                     if is_r_entry(&entry_name) {
                         return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
@@ -1126,7 +1132,10 @@ impl FileSystemContext for OssMountContext {
             if let Some(trash) = &self.fs.trash {
                 if let Some(SystemTrashMatch::Entry { entry_name }) =
                     trash.match_system_trash(&posix)
-                    && trash.platform == SystemTrashPlatform::WindowsRecycleBin
+                    && trash
+                        .system
+                        .as_ref()
+                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
                 {
                     if is_r_entry(&entry_name) {
                         return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
