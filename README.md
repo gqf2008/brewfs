@@ -189,7 +189,14 @@ Weak consistency — no locks, no atomic rename. Files are written whole-file on
 close/flush. This is a **cloud drive**, not a multi-writer POSIX filesystem;
 do not use it as a database backend or for concurrent editors on the same file.
 
-## System recycle bin
+## System recycle bin (opt-in / experimental)
+
+**Status: opt-in and experimental.** Real Explorer/Finder recycle-bin
+integration is **not available** (verified by live testing: Explorer does not
+move files into the bin on WinFsp mounts; macOS 26 blocks the macFUSE kext
+and FUSE-T mounts as an NFS volume). The virtual view works (browse, restore,
+empty) but is disabled by default because the system-bin entry point is not
+observable to users.
 
 A **virtual** recycle-bin view at the mount root (issue #80): entries are
 synthesized from the trash tombstone index, with **no local metadata database
