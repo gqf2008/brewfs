@@ -2659,7 +2659,7 @@ mod tests {
             .write()
             .unwrap()
             .by_name
-            .insert(recycle_name.to_string(), tomb_key);
+            .insert(recycle_name.to_string(), tomb_key.clone());
         trash
             .recycle_names
             .write()
@@ -2863,6 +2863,7 @@ mod tests {
                 false,
                 &mut fi,
             )
+            .map(|_| ())
             .expect_err("$I create 捕获未命中必须拒绝写");
         assert!(matches!(err, FspError::NTSTATUS(5)), "got {err:?}");
         // open-for-write 同口径:合成 stat 未命中 → FILE_NOT_FOUND,
@@ -2875,6 +2876,7 @@ mod tests {
                 0x2,
                 &mut fi,
             )
+            .map(|_| ())
             .expect_err("$I open-for-write 必须拒绝");
         assert!(
             matches!(err, FspError::NTSTATUS(5) | FspError::NTSTATUS(2)),
@@ -2921,6 +2923,7 @@ mod tests {
                 0x2,
                 &mut fi,
             )
+            .map(|_| ())
             .expect_err("$R open-for-write 必须拒绝");
         assert!(matches!(err, FspError::NTSTATUS(5)), "got {err:?}");
         // 读放行 + 转发:内容 = 原对象 docs/a.txt
@@ -2934,7 +2937,7 @@ mod tests {
             .expect("$R 读打开放行");
         let mut buf = [0u8; 32];
         let n = ctx.read_async(&file, &mut buf, 0).await.expect("read");
-        assert_eq!(&buf[..n], b"hello recycle");
+        assert_eq!(&buf[..n as usize], b"hello recycle");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
