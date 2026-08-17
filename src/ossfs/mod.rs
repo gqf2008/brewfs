@@ -262,6 +262,40 @@ pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32, umask:
     (base & !umask) as u16
 }
 
+/// 可恢复错误分类(issue #83):超时/连接失败/网络不可达/HTTP 5xx/限流
+/// 属于「用户重试可能成功」的错误 —— WinFsp 映射为 STATUS_IO_TIMEOUT
+/// (Explorer 弹"重试/取消"由用户决定),FUSE 映射为 EAGAIN(工具重试);
+/// 其余(404/403/签名错误/本地逻辑错误)为致命错误,保持设备错误映射。
+/// 基于错误链全文特征匹配(aws-sdk 错误文本跨版本稳定),宁可多判可重试
+/// (超时最坏后果 = 用户点重试),不可把致命错误判为可重试(会导致死循环)。
+pub(crate) fn is_retryable_error(e: &anyhow::Error) -> bool {
+    let mut text = e.to_string();
+    for cause in e.chain().skip(1) {
+        text.push(' ');
+        text.push_str(&cause.to_string());
+    }
+    let t = text.to_ascii_lowercase();
+    const RETRYABLE_MARKERS: [&str; 16] = [
+        "timeout",
+        "timed out",
+        "timedout",
+        "connect",
+        "connection",
+        "network",
+        "reset by peer",
+        "broken pipe",
+        "unreachable",
+        "slow down",
+        "throttl",
+        "too many requests",
+        "request rate limit",
+        " 5", // " 500"/" 502"/" 503" 等 5xx(带前导空格防误伤文件名)
+        "service unavailable",
+        "internal server error",
+    ];
+    RETRYABLE_MARKERS.iter().any(|m| t.contains(m))
+}
+
 /// Compute the CRC-64/ECMA-182 checksum used by Aliyun OSS
 /// (`x-oss-hash-crc64ecma`). The reflected polynomial is `0xC96C5795D7870F42`,
 /// init `0xFFFF_FFFF_FFFF_FFFF`, xorout `0xFFFF_FFFF_FFFF_FFFF`, identical to
@@ -4437,6 +4471,41 @@ fn effective_max_concurrent_requests(configured: Option<usize>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_retryable_error_classifies() {
+        // 可恢复(issue #83):超时/连接/网络/5xx/限流 → true
+        for msg in [
+            "request timed out after 60s",
+            "connect timed out",
+            "failed to connect to endpoint",
+            "network is unreachable",
+            "connection reset by peer",
+            "broken pipe",
+            "server returned 500 Internal Server Error",
+            "status 503 Service Unavailable",
+            "slow down (throttling)",
+            "too many requests (429)",
+        ] {
+            let e = anyhow::anyhow!(msg);
+            assert!(is_retryable_error(&e), "should be retryable: {msg}");
+        }
+        // 致命:权限/不存在/签名/本地逻辑 → false
+        for msg in [
+            "AccessDenied (403)",
+            "NoSuchKey (404)",
+            "SignatureDoesNotMatch",
+            "InvalidAccessKeyId",
+            "target already exists",
+            "cannot delete the mount root /",
+        ] {
+            let e = anyhow::anyhow!(msg);
+            assert!(!is_retryable_error(&e), "should NOT be retryable: {msg}");
+        }
+        // 嵌套 cause 也搜索(aws-sdk 包装链)。
+        let nested = anyhow::anyhow!("upload failed").context("request timed out");
+        assert!(is_retryable_error(&nested));
+    }
 
     #[test]
     fn rel_key_maps_paths() {
