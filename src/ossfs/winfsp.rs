@@ -3111,10 +3111,11 @@ mod tests {
         // 大文件(spool 路径):超过 WRITE_SPOOL_THRESHOLD 走 spool。用
         // open_async 拿按值句柄(close_async 消费所有权;test_file 是
         // &'static 引用无法 move)。
-        let mut fi = FileInfo::default();
+        let mut ofi = open_info(); // open_async 要 OpenFileInfo
+        let mut fi = FileInfo::default(); // write_async 要 FileInfo
         mock.set_object("big.bin", Vec::new());
         let file = ctx
-            .open_async(w("\\big.bin"), 0, 0x2, &mut fi)
+            .open_async(w("\\big.bin"), 0, 0x2, &mut ofi)
             .await
             .expect("open");
         let data = vec![0xABu8; (WRITE_SPOOL_THRESHOLD + 1024) as usize];
