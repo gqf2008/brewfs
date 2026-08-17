@@ -137,7 +137,7 @@ jobs:
               -Recurse -Filter winfsp-x64.dll -ErrorAction SilentlyContinue `
               | Select-Object -First 1).DirectoryName
           }
-          if ($bin) { "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append; Write-Host "WinFsp DLL at: $bin" }
+          if ($bin) { "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append; Write-Host "WinFsp DLL at: $bin"; exit 0 }
           else { throw "winfsp-x64.dll not found after install" }
 
       # `--tests` also runs tests/cli.rs (the ossmount CLI integration test),
