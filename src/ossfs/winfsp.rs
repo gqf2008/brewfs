@@ -3089,7 +3089,7 @@ mod tests {
         // 但数据不再丢弃)。
         ctx.cleanup_async(file, None, 0).await;
         assert!(!ctx.retry.queue.lock().unwrap().is_empty(), "失败必须入队");
-        assert!(!ctx.dirty.load(Ordering::Acquire), "队列接管上传责任");
+        assert!(!file.dirty.load(Ordering::Acquire), "队列接管上传责任");
         // 网络恢复(mock 放行)→ worker 退避 5s 后重试成功。
         mock.fail_put.store(0, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(7)).await;
@@ -3108,16 +3108,22 @@ mod tests {
         let fs = test_fs_with_budget(port, 32, None);
         let (_fs, ctx) = test_mount(fs);
         spawn_retry_worker_for_test(&ctx);
-        // 大文件(spool 路径):超过 WRITE_SPOOL_THRESHOLD 走 spool。
-        let file = test_file("/big.bin");
-        let data = vec![0xABu8; (WRITE_SPOOL_THRESHOLD + 1024) as usize];
+        // 大文件(spool 路径):超过 WRITE_SPOOL_THRESHOLD 走 spool。用
+        // open_async 拿按值句柄(close_async 消费所有权;test_file 是
+        // &'static 引用无法 move)。
         let mut fi = FileInfo::default();
-        ctx.write_async(file, &data, 0, false, false, &mut fi)
+        mock.set_object("big.bin", Vec::new());
+        let file = ctx
+            .open_async(w("\\big.bin"), 0, 0x2, &mut fi)
+            .await
+            .expect("open");
+        let data = vec![0xABu8; (WRITE_SPOOL_THRESHOLD + 1024) as usize];
+        ctx.write_async(&file, &data, 0, false, false, &mut fi)
             .await
             .expect("write");
         let spool_path = file.spool_path.lock().unwrap().clone();
         assert!(spool_path.is_some(), "大文件应有 spool");
-        ctx.cleanup_async(file, None, 0).await; // 失败入队
+        ctx.cleanup_async(&file, None, 0).await; // 失败入队
         assert!(!ctx.retry.queue.lock().unwrap().is_empty());
         ctx.close_async(file).await; // close 清理不得删队列 spool(file 最后使用)
         assert!(
