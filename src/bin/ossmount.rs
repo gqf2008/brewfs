@@ -52,16 +52,16 @@ fn usage_text() -> String {
                  MOUNT_POINT\n\
          --refresh-secs N:  periodic directory refresh interval in seconds\n\
                            (FUSE; 0 disables. Windows WinFsp fixed at 10s)\n\
-         --trash-dir NAME:  trash (soft delete) directory, default ON as .trash\n\
+         --trash-dir NAME:  trash (soft delete) directory, default OFF (opt-in)\n\
                            (deleted objects stay until GC: default 30-day retention,\n\
-                           --trash-retention-days N to override);\n\
-                           --no-trash restores immediate permanent delete\n\
+                           --trash-retention-days N to override); without it,\n\
+                           deletes are immediate and permanent (not recoverable)\n\
          --trash-refresh-mode lazy|eager:  trash refresh policy, default lazy\n\
                            (eager refreshes tombstones before every list/stat,\n\
                            shrinking the remote-deletion visibility window)\n\
-         --system-trash-dir NAME:  system recycle bin virtual view (issue #80)\n\
-                           Windows/Linux: default ON with trash (dir $Recycle.Bin);\n\
-                           macOS: default OFF — this flag enables it (dir .Trashes);\n\
+         --system-trash-dir NAME:  system recycle bin virtual view, default OFF (opt-in)\n\
+                           (issue #80; Explorer/Finder integration is NOT available —\n\
+                           the view is browsable + trash-restore only).\n\
                            NAME overrides the directory name on any platform\n\
          --system-trash-uids N[,N...]:  macOS only — render only these uid dirs\n\
                            under .Trashes (default: the mounting user's uid)\n\
@@ -703,29 +703,23 @@ fn parse_args_from(
             retries,
             multipart_size,
             multipart_concurrency,
-            // CLI 默认开启回收站(D5);--no-trash 优先级最高。
-            trash_dir: if no_trash {
-                None
-            } else {
-                Some(trash_dir.unwrap_or_else(|| ".trash".to_string()))
-            },
+            // 默认关闭回收站(0.4.0 回退:系统回收站集成实测不可用,删除
+            // 默认直接永久删除并提醒);--trash-dir 显式开启软删(opt-in,
+            // 30 天保留 + trash-restore 恢复)。--no-trash 显式关闭。
+            trash_dir: if no_trash { None } else { trash_dir },
             trash_retention_days,
             trash_refresh_interval_secs,
             trash_refresh_mode,
             trash_gc_interval_secs,
-            // 系统回收站视图(裁决 R1):Windows/Linux 默认随 trash 开启,
-            // macOS 默认关(仅 --system-trash-dir 显式开启);--no-system-trash
-            // 全平台显式关闭;--no-trash(硬删除)时视图无墓碑可渲染,一并关闭。
+            // 系统回收站视图(0.4.0 回退):全平台默认关闭(实测 explorer/
+            // Finder 均未进入系统回收站,入口对用户不可见);--system-trash-dir
+            // 显式开启(opt-in);--no-system-trash 显式关闭;--no-trash(硬删除)
+            // 时视图无墓碑可渲染,一并关闭。
             system_trash: if no_system_trash || no_trash {
                 None
-            } else if cfg!(target_os = "macos") {
+            } else {
                 system_trash_dir.map(|d| SystemTrashConfig {
                     dir_name: Some(d),
-                    macos_uid_dirs: system_trash_uids,
-                })
-            } else {
-                Some(SystemTrashConfig {
-                    dir_name: system_trash_dir,
                     macos_uid_dirs: system_trash_uids,
                 })
             },
@@ -1834,21 +1828,18 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn system_trash_default_on_non_macos() {
-        // 裁决 R1:Windows/Linux 跟随 trash_dir 默认开启
+    fn system_trash_default_off_on_non_macos() {
+        // 0.4.0 回退:系统回收站全平台默认关闭(实测 explorer/Finder 均
+        // 未进入系统回收站,入口对用户不可见);--system-trash-dir 显式开启。
         let (cfg, _, _, _, _, _, _) = parse_args_from(vec![
             "--bucket".to_string(),
             "b".to_string(),
             "Z:".to_string(),
         ]);
-        let sys = cfg
-            .system_trash
-            .expect("Windows/Linux 默认开启系统回收站视图");
-        assert_eq!(
-            sys.dir_name, None,
-            "默认目录名由 build_trash_state 按平台注入"
+        assert!(
+            cfg.system_trash.is_none(),
+            "默认必须关闭系统回收站视图(opt-in)"
         );
-        assert!(sys.macos_uid_dirs.is_empty());
     }
 
     #[test]

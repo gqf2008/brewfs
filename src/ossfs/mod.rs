@@ -3788,6 +3788,12 @@ impl ObjectFs {
             }
             return trash.soft_delete_file(self, path, None).await;
         }
+        // 回收站未开启:直接永久删除(0.4.0 默认)——明确记录提醒,
+        // 删除不可恢复(可查日志追溯)。
+        tracing::warn!(
+            path = %path,
+            "permanent delete (trash disabled): this deletion is NOT recoverable"
+        );
         let _permit = self.acquire().await?;
         self.delete_impl(path).await
     }
@@ -3851,6 +3857,11 @@ impl ObjectFs {
             }
             return trash.soft_delete_dir(self, dir, None).await;
         }
+        // 回收站未开启:递归永久删除(0.4.0 默认)——记录提醒,不可恢复。
+        tracing::warn!(
+            dir = %dir,
+            "permanent recursive delete (trash disabled): this deletion is NOT recoverable"
+        );
         let _permit = self.acquire().await?;
         self.delete_dir_recursive_impl(dir).await
     }
