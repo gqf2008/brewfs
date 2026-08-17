@@ -2293,7 +2293,7 @@ mod tests {
             refresh: Mutex::new(RefreshState::new()),
             dirty_budget: fs.dirty_budget(),
             operation_timeout: fs.operation_timeout(),
-            retry: Arc::new(super::RetryState {
+            retry: Arc::new(crate::ossfs::RetryState {
                 queue: Mutex::new(VecDeque::new()),
                 notify: tokio::sync::Notify::new(),
             }),
@@ -3063,7 +3063,7 @@ mod tests {
         assert!(spool_path.is_some(), "大文件应有 spool");
         // 模拟 cleanup 上传失败入队(spool 引用进队列)。
         let mut q = ctx.retry.queue.lock().unwrap();
-        q.push_back(super::RetryUpload {
+        q.push_back(crate::ossfs::RetryUpload {
             path: "/big.bin".to_string(),
             spool: spool_path.clone(),
             buf: None,
@@ -3098,7 +3098,7 @@ mod tests {
         assert!(spool_path.is_some(), "大文件应有 spool");
         {
             let mut q = ctx.retry.queue.lock().unwrap();
-            q.push_back(super::RetryUpload {
+            q.push_back(crate::ossfs::RetryUpload {
                 path: "/giveup.bin".to_string(),
                 spool: spool_path.clone(),
                 buf: None,
