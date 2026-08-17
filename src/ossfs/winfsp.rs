@@ -42,12 +42,14 @@ const WIN32_ACCESS_DENIED: i32 = 5;
 /// 可恢复错误 → STATUS_IO_TIMEOUT(Explorer 弹"重试/取消"由用户决定,
 /// issue #83);致命错误保持设备错误映射。S3 层错误统一经此转换,替代
 /// 裸 `IoError::other` —— 否则断网/超时被 Explorer 判定为设备故障,
-/// 复制任务未获用户确认即自动退出。
-fn s3_error(e: anyhow::Error) -> FspError {
-    if super::is_retryable_error(&e) {
+/// 复制任务未获用户确认即自动退出。泛型接收 anyhow::Error 或 io::Error
+/// (调用点闭包参数类型两者皆有)。
+fn s3_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> FspError {
+    let err = anyhow::Error::new(e);
+    if super::is_retryable_error(&err) {
         FspError::NTSTATUS(STATUS_IO_TIMEOUT)
     } else {
-        FspError::from(IoError::other(e.to_string()))
+        FspError::from(IoError::other(err.to_string()))
     }
 }
 const STATUS_IO_TIMEOUT: i32 = 0xC000_00B5;
