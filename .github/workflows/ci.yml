@@ -113,6 +113,14 @@ jobs:
       - name: Check WinFsp feature
         run: cargo check -p ossfs --no-default-features --features fuse-winfsp
 
+      # Runtime DLL for the delay-loaded tests: system-recycle-bin tests
+      # ($I/$R capture, set_recycle_i) exercise delay-loaded winfsp-x64.dll
+      # symbols; without the DLL the test process dies with 0xc06d007e
+      # (MOD_NOT_FOUND).
+      - name: Install WinFsp (runtime DLL for delay-loaded tests)
+        shell: pwsh
+        run: winget install --id WinFsp.WinFsp --silent --accept-package-agreements --accept-source-agreements
+
       # `--tests` also runs tests/cli.rs (the ossmount CLI integration test),
       # which does not need a mount or credentials and works on Windows.
       - name: Test WinFsp feature
