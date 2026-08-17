@@ -35,10 +35,14 @@ metadata database (s3fs-style layout).
 - Runtime records: `ossmount` writes per-instance JSON under
   `%TEMP%\ossfs-oss` (used by the tray to list/stop mounts).
 
-## Trash (soft delete)
+## Trash (soft delete, opt-in)
 
-Deletion is soft by default: `unlink`/`rmdir` no longer remove the object —
-they write a small JSON tombstone under the hidden `.trash/` prefix
+**Deletion is immediate and permanent by default** (0.4.0): `unlink`/`rmdir`
+remove the object from the bucket right away, and the deletion is **not
+recoverable** (the mount logs a warning on every permanent delete). The
+soft-delete trash is **opt-in**: mount with `--trash-dir NAME` to enable it.
+With trash enabled, `unlink`/`rmdir` no longer remove the object — they write
+a small JSON tombstone under the hidden `.trash/` prefix
 (`.trash/<YYYY-MM-DD>/<original-key>`, partitioned by the UTC deletion date)
 while the original object stays in the bucket. The mount filters tombstoned
 keys out of `list`/`stat`, so deleted paths disappear from the drive view
@@ -46,9 +50,9 @@ without any extra remote requests. Restore = delete the tombstone; real space
 reclamation = GC purging expired tombstones and their original objects
 (default retention: 30 days, `--trash-retention-days N` to override). GC runs
 at mount time, then every `--trash-gc-interval-secs` (default 86400 = 24 h),
-and on demand via `ossmount trash-clean`. `--no-trash` restores the previous
-immediate permanent-delete behavior; `--trash-dir NAME` (default `.trash`)
-selects the tombstone prefix.
+and on demand via `ossmount trash-clean`. `--no-trash` forces immediate
+permanent delete even when a trash dir is configured; `--trash-dir NAME`
+(default `.trash`) selects the tombstone prefix.
 
 Management commands (they share the mount connection arguments
 `--bucket`/`--endpoint`/`--region`/...):
@@ -96,7 +100,16 @@ documented here:
   Recreating a path with the same name first clears its tombstone, so the new
   content is immediately visible (overwrite semantics).
 
-## System recycle bin (issue #80)
+## System recycle bin (issue #80, opt-in / experimental)
+
+**Status (0.4.0): opt-in and experimental.** Real Explorer/Finder recycle-bin
+integration is **not available**: on macOS 26 the macFUSE kext is blocked by
+the OS and FUSE-T mounts as an NFS volume (Finder trash unavailable); on
+Windows the Explorer delete protocol does not move files into the bin on
+WinFsp mounts (verified by live testing). The virtual view itself still works
+— browse tombstones, restore via `trash-restore`, empty via delete — but the
+**system recycle bin entry point is not observable to users**, so this is
+disabled by default and kept only for users who opt in explicitly.
 
 A **virtual** recycle-bin view at the mount root, synthesized from the trash
 tombstone index — no local metadata database, zero data copies. The OS delete
@@ -105,9 +118,9 @@ bin" becomes a soft delete (one tombstone object; the original never moves),
 the bin's contents render from tombstones, restore = rename out of the bin
 (delete the tombstone), empty = permanent delete (tombstone + original).
 
-- Windows: `$Recycle.Bin` (ON with trash) — the `$R` name is recorded in the
-  tombstone, the `$I` metadata file is captured byte-faithfully (≤ 4 KiB,
-  stored in the tombstone body, never a real object).
+- Windows: `$Recycle.Bin` (OFF — `--system-trash-dir` to enable) — the `$R`
+  name is recorded in the tombstone, the `$I` metadata file is captured
+  byte-faithfully (≤ 4 KiB, stored in the tombstone body, never a real object).
 - macOS: `.Trashes` (OFF — `--system-trash-dir` to enable) — needs **macFUSE**
   and the `local` mount option (appended automatically); **FUSE-T mounts as an
   NFS network volume: Finder trash unavailable, deletes take effect
