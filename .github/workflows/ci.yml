@@ -116,18 +116,26 @@ jobs:
       # Runtime DLL for the delay-loaded tests: system-recycle-bin tests
       # ($I/$R capture, set_recycle_i) exercise delay-loaded winfsp-x64.dll
       # symbols; without the DLL the test process dies with 0xc06d007e
-      # (MOD_NOT_FOUND). The MSI installs to "Program Files (x86)\WinFsp\bin",
-      # which is not on PATH — the delay loader searches PATH, so add it to
-      # GITHUB_PATH for subsequent steps.
+      # (MOD_NOT_FOUND). The MSI can land per-machine or per-user depending
+      # on winget defaults, so locate the DLL after install instead of
+      # guessing the path; the delay loader searches PATH, so append the bin
+      # dir to GITHUB_PATH.
       - name: Install WinFsp (runtime DLL for delay-loaded tests)
         shell: pwsh
         run: |
           winget install --id WinFsp.WinFsp --silent --accept-package-agreements --accept-source-agreements
-          # NB: `$env:ProgramFiles(x86)` parses as $env:ProgramFiles + "(x86)"
-          # (path loses the space); brace the name: ${env:ProgramFiles(x86)}.
-          $bin = "${env:ProgramFiles(x86)}\WinFsp\bin"
-          if (Test-Path $bin) { "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append }
-          else { throw "WinFsp bin not found at $bin" }
+          $bin = @(
+            "${env:ProgramFiles(x86)}\WinFsp\bin",
+            "${env:ProgramFiles}\WinFsp\bin",
+            "$env:LOCALAPPDATA\WinFsp\bin"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bin) {
+            $bin = (Get-ChildItem "${env:ProgramFiles(x86)}", "${env:ProgramFiles}", "$env:LOCALAPPDATA" `
+              -Recurse -Filter winfsp-x64.dll -ErrorAction SilentlyContinue `
+              | Select-Object -First 1).DirectoryName
+          }
+          if ($bin) { "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append; Write-Host "WinFsp DLL at: $bin" }
+          else { throw "winfsp-x64.dll not found after install" }
 
       # `--tests` also runs tests/cli.rs (the ossmount CLI integration test),
       # which does not need a mount or credentials and works on Windows.
