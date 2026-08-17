@@ -67,9 +67,6 @@ const WRITE_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
 // is watching, FspFileSystemNotifyBegin fails and no S3 listing happens.
 const REFRESH_INTERVAL_MS: u32 = 10_000;
 
-/// 失败上传后台重试上限(issue #85):超过后最终放弃并 error 日志(数据
-/// 未上传,spool 保留供人工定位)。退避 5s * 3^n 封顶 5 分钟 → 10 次 ≈ 25 分钟。
-const RETRY_MAX_ATTEMPTS: u32 = 10;
 /// Upper bound on the number of directories the periodic change-notification
 /// pass refreshes (root always included; oldest non-root evicted on overflow).
 const MAX_TRACKED_DIRS: usize = 64;
@@ -334,26 +331,7 @@ pub struct OssMountContext {
     /// 错误返回通道(Explorer 收到"成功"),若静默丢弃则数据丢失(实测:
     /// 21.44G 源复制后桶里仅 8.33G)。重试成功前 spool 缓冲保留不删。
     /// 独立 Arc:worker 与 host 生命周期解耦(host 消费 context 值)。
-    retry: Arc<RetryState>,
-}
-
-/// 失败上传重试的共享状态(worker 与 OssMountContext 各持 Arc)。
-struct RetryState {
-    queue: Mutex<VecDeque<RetryUpload>>,
-    /// 唤醒重试 worker 的信号(入队后 notify_one)。
-    notify: tokio::sync::Notify,
-}
-
-/// 一次失败的上传:数据源为 spool 文件或内存缓冲,二选一。
-struct RetryUpload {
-    /// 目标 POSIX 路径(挂载视图形态,如 "/临时/a.txt")。
-    path: String,
-    /// spool 读回缓冲文件(流式/大文件路径);重试成功后由 worker 删除。
-    spool: Option<PathBuf>,
-    /// 内存缓冲(小文件路径,clone 自 write_buf 固化)。
-    buf: Option<Vec<u8>>,
-    /// 已重试次数(指数退避 5s/15s/45s/2m/5m,超过上限最终放弃并告警)。
-    attempts: u32,
+    retry: Arc<super::RetryState>,
 }
 
 impl OssMountContext {
@@ -1061,7 +1039,7 @@ impl OssMountContext {
         };
         {
             let mut q = self.retry.queue.lock().unwrap();
-            q.push_back(RetryUpload {
+            q.push_back(super::RetryUpload {
                 path,
                 spool,
                 buf,
@@ -1077,53 +1055,10 @@ impl OssMountContext {
         );
     }
 
-    /// 后台重试 worker:监听入队通知,指数退避重试失败上传。与 host 生命
-    /// 周期解耦(fs + retry 均为 Arc),挂载退出时随 runtime drop。
-    fn spawn_retry_worker(fs: Arc<ObjectFs>, retry: Arc<RetryState>) {
-        tokio::spawn(async move {
-            loop {
-                retry.notify.notified().await;
-                let item = {
-                    let mut q = retry.queue.lock().unwrap();
-                    q.pop_front()
-                };
-                let Some(mut item) = item else { continue };
-                // 指数退避:5s * 3^attempts,上限 5 分钟。
-                let delay = std::time::Duration::from_secs(5 * 3u64.pow(item.attempts.min(5)));
-                tokio::time::sleep(delay).await;
-                let result = if let Some(spool) = &item.spool {
-                    fs.write_from_file(&item.path, spool).await
-                } else if let Some(buf) = &item.buf {
-                    fs.write(&item.path, buf).await
-                } else {
-                    Ok(())
-                };
-                match result {
-                    Ok(()) => {
-                        if let Some(spool) = item.spool.take() {
-                            let _ = std::fs::remove_file(&spool);
-                        }
-                        tracing::info!(path = %item.path, "retry upload succeeded");
-                    }
-                    Err(e) => {
-                        item.attempts += 1;
-                        if item.attempts >= RETRY_MAX_ATTEMPTS {
-                            tracing::error!(
-                                path = %item.path,
-                                error = ?e,
-                                "retry upload gave up after {RETRY_MAX_ATTEMPTS} attempts; \
-                                 data NOT uploaded (spool kept at {:?})",
-                                item.spool
-                            );
-                        } else {
-                            let mut q = retry.queue.lock().unwrap();
-                            q.push_back(item);
-                            retry.notify.notify_one();
-                        }
-                    }
-                }
-            }
-        });
+    /// 启动后台重试 worker(平台无关主体在 [`super::run_retry_worker`],
+    /// 本方法仅负责 spawn;与 host 生命周期解耦,挂载退出时随 runtime drop)。
+    fn spawn_retry_worker(fs: Arc<ObjectFs>, retry: Arc<super::RetryState>) {
+        tokio::spawn(super::run_retry_worker(fs, retry));
     }
 
     fn refresh_dir(&self, notifier: &Notifier, dir: &str) {
@@ -1233,7 +1168,7 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
     let dirty_budget = fs.dirty_budget();
     // 失败上传重试 worker(issue #85):独立于 host 生命周期,弱网下
     // cleanup 上传失败的数据入队后台补传,不再静默丢失。
-    let retry = Arc::new(RetryState {
+    let retry = Arc::new(super::RetryState {
         queue: Mutex::new(VecDeque::new()),
         notify: tokio::sync::Notify::new(),
     });
@@ -2358,7 +2293,7 @@ mod tests {
             refresh: Mutex::new(RefreshState::new()),
             dirty_budget: fs.dirty_budget(),
             operation_timeout: fs.operation_timeout(),
-            retry: Arc::new(RetryState {
+            retry: Arc::new(super::RetryState {
                 queue: Mutex::new(VecDeque::new()),
                 notify: tokio::sync::Notify::new(),
             }),
@@ -3128,7 +3063,7 @@ mod tests {
         assert!(spool_path.is_some(), "大文件应有 spool");
         // 模拟 cleanup 上传失败入队(spool 引用进队列)。
         let mut q = ctx.retry.queue.lock().unwrap();
-        q.push_back(RetryUpload {
+        q.push_back(super::RetryUpload {
             path: "/big.bin".to_string(),
             spool: spool_path.clone(),
             buf: None,
@@ -3163,7 +3098,7 @@ mod tests {
         assert!(spool_path.is_some(), "大文件应有 spool");
         {
             let mut q = ctx.retry.queue.lock().unwrap();
-            q.push_back(RetryUpload {
+            q.push_back(super::RetryUpload {
                 path: "/giveup.bin".to_string(),
                 spool: spool_path.clone(),
                 buf: None,
