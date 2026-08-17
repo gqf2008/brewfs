@@ -431,6 +431,248 @@ impl OssMountContext {
         *file_info = file_info_from(&entry, context.index());
         Ok(())
     }
+
+    /// Async core of [`Self::open`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn open_async(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        granted_access: u32,
+        file_info: &mut OpenFileInfo,
+    ) -> winfsp::Result<OssFileContext> {
+        let posix = win_path_to_posix(file_name);
+        let entry = self
+            .fs
+            .stat(&posix)
+            .await
+            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        let entry = entry
+            .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
+        let is_dir = entry.is_dir;
+        if create_options & FILE_DIRECTORY_FILE != 0 && !is_dir {
+            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32)); // STATUS_FILE_IS_A_DIRECTORY
+        }
+        if create_options & FILE_NON_DIRECTORY_FILE != 0 && is_dir {
+            return Err(FspError::NTSTATUS(0xC000_0103u32 as i32)); // STATUS_NOT_A_DIRECTORY
+        }
+
+        let write = granted_access & 0x2 != 0 || granted_access & 0x4000_0000 != 0;
+        if write && self.fs.read_only() {
+            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+        }
+        // 单元 4(裁决 R11 ②):Windows 回收站条目写拒绝($R)/捕获($I)。
+        // 捕获条件:$I 形态(8 位 hex);$R 形态 open-for-write →
+        // ACCESS_DENIED(只读预览放行)。
+        // F5(medium):$I 捕获未命中(对应 $R 墓碑不在反向索引 —— 重启后
+        // by_name 空、或他端完成软删本端未刷新)同样拒绝写:捕获 miss 若
+        // 走普通写路径会把 $I 字节真实落桶,成为不可删除的幽灵条目
+        // (列出、合成 stat、delete no-op,restore 后孤儿残留)。
+        let mut capture_i = false;
+        if write {
+            if let Some(trash) = &self.fs.trash {
+                if let Some(SystemTrashMatch::Entry { entry_name }) =
+                    trash.match_system_trash(&posix)
+                    && trash
+                        .system
+                        .as_ref()
+                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
+                {
+                    if is_r_entry(&entry_name) {
+                        return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                    }
+                    if is_i_entry(&entry_name) {
+                        if !trash.i_entry_has_r_tombstone(&entry_name) {
+                            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
+                        }
+                        capture_i = true;
+                    }
+                }
+            }
+        }
+        let write_buf = if is_dir {
+            None
+        } else if write {
+            // Lazy: the existing content is fetched on the first write or
+            // truncate that needs it (see write_async), so opening a file
+            // for write never downloads the whole object.
+            Some(Vec::new())
+        } else {
+            None
+        };
+        *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
+        Ok(OssFileContext {
+            path: Mutex::new(posix),
+            is_dir,
+            write_buf: Mutex::new(write_buf),
+            // $I 捕获:缓冲权威(无 S3 对象可懒加载),首个写直接落缓冲。
+            loaded: AtomicBool::new(capture_i),
+            dirty: AtomicBool::new(false),
+            delete_on_close: AtomicBool::new(false),
+            capture_i: AtomicBool::new(capture_i),
+            dir_buffer: DirBuffer::new(),
+            budget_units: AtomicUsize::new(0),
+            budget_permits: Mutex::new(Vec::new()),
+            spool_path: Mutex::new(None),
+            spool_size: AtomicU64::new(0),
+            stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
+            logical_size: AtomicU64::new(0),
+        })
+    }
+
+    /// Async core of [`Self::get_security_by_name`] (kept separate so tests
+    /// can drive it without a WinFsp dispatcher thread to block on).
+    async fn get_security_by_name_async(
+        &self,
+        file_name: &U16CStr,
+        _security_descriptor: Option<&mut [c_void]>,
+        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
+    ) -> winfsp::Result<FileSecurity> {
+        let posix = win_path_to_posix(file_name);
+        let entry = self
+            .fs
+            .stat(&posix)
+            .await
+            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        let entry = entry
+            .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
+        // 单元 4(裁决 R10):系统回收站目录($Recycle.Bin 与 SID 层)按
+        // DIRECTORY|HIDDEN|SYSTEM 暴露;Windows $I 条目 ARCHIVE|HIDDEN;
+        // $R 保持 ARCHIVE(只读预览)。判定经 fs.trash 内联(裁决 R16:
+        // 不加 ObjectFs 包装方法)。
+        let mut attributes = if entry.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_ARCHIVE
+                | if self.fs.read_only() {
+                    FILE_ATTRIBUTE_READONLY
+                } else {
+                    0
+                }
+        };
+        if let Some(trash) = &self.fs.trash {
+            match trash.match_system_trash(&posix) {
+                Some(SystemTrashMatch::Dir { .. }) => {
+                    attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+                }
+                Some(SystemTrashMatch::Entry { entry_name })
+                    if trash
+                        .system
+                        .as_ref()
+                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
+                        && is_i_entry(&entry_name) =>
+                {
+                    attributes |= FILE_ATTRIBUTE_HIDDEN;
+                }
+                _ => {}
+            }
+        }
+        Ok(FileSecurity {
+            reparse: false,
+            sz_security_descriptor: 0,
+            attributes,
+        })
+    }
+
+    /// Async core of [`Self::cleanup`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn cleanup_async(
+        &self,
+        context: &OssFileContext,
+        _file_name: Option<&U16CStr>,
+        flags: u32,
+    ) {
+        let delete_requested = context.delete_on_close.load(Ordering::Acquire)
+            || winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
+        if delete_requested {
+            // Discard an in-flight multipart upload and the read-back spool:
+            // the handle is being deleted, so its bytes must be neither
+            // uploaded nor orphaned as an incomplete multipart (#46/#47).
+            {
+                let mut stream_guard = context.stream.lock().await;
+                if let Some(up) = stream_guard.take() {
+                    up.abort().await;
+                }
+            }
+            if let Some(path) = context.spool_path.lock().unwrap().take() {
+                let _ = std::fs::remove_file(&path);
+                context.spool_size.store(0, Ordering::Release);
+            }
+            let path = context.path.lock().unwrap().clone();
+            let is_dir = context.is_dir;
+            let fs = Arc::clone(&self.fs);
+            let result = if is_dir {
+                fs.delete_dir_recursive(&path).await
+            } else {
+                fs.delete(&path).await
+            };
+            match result {
+                Ok(()) => debug!(path = log_path(&path), "ossfs cleanup deleted"),
+                Err(e) => warn!(path = log_path(&path), error = ?e, "ossfs cleanup delete failed"),
+            }
+            return;
+        }
+        if context.dirty.load(Ordering::Acquire)
+            && let Err(e) = self.upload_dirty_timed(context).await
+        {
+            warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
+        }
+    }
+
+    /// Async core of [`Self::close`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn close_async(&self, context: OssFileContext) {
+        // 单元 4(裁决 R8):$I 捕获句柄 —— 捕获缓冲落墓碑 body(异步,
+        // update 式写:GET body → 设 recycle_i → PUT,保 etag/size)。
+        // 空写/$R 未解析 → commit_capture_i 内部 no-op;超时静默丢弃
+        // (close 无错误回报通道,落 body 失败由 set_recycle_i warn)。
+        if context.capture_i.load(Ordering::Acquire) {
+            let _ =
+                tokio::time::timeout(self.operation_timeout, self.commit_capture_i(&context)).await;
+            return;
+        }
+        // The handle is gone, so nothing can retry a failed upload — release
+        // the read-back spool and abort any leftover stream so neither leaks
+        // in %TEMP% / S3 (#47).
+        if let Some(path) = context.spool_path.lock().unwrap().take() {
+            let _ = std::fs::remove_file(&path);
+            context.spool_size.store(0, Ordering::Release);
+        }
+        let _ = tokio::time::timeout(self.operation_timeout, async {
+            let mut guard = context.stream.lock().await;
+            if let Some(up) = guard.take() {
+                up.abort().await;
+            }
+        })
+        .await;
+    }
+
+    /// Async core of [`Self::flush`] (kept separate so tests can drive it
+    /// without a WinFsp dispatcher thread to block on).
+    async fn flush_async(
+        &self,
+        context: Option<&OssFileContext>,
+        _file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let Some(ctx) = context else { return Ok(()) };
+        self.upload_dirty_timed(ctx).await
+    }
+
+    /// Async core of [`Self::set_delete`] (kept separate so tests can drive
+    /// it without a WinFsp dispatcher thread to block on).
+    async fn set_delete_async(
+        &self,
+        context: &OssFileContext,
+        _file_name: &U16CStr,
+        delete_file: bool,
+    ) -> winfsp::Result<()> {
+        context
+            .delete_on_close
+            .store(delete_file, Ordering::Release);
+        Ok(())
+    }
+
     fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future,
@@ -977,48 +1219,11 @@ impl FileSystemContext for OssMountContext {
         _security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let posix = win_path_to_posix(file_name);
-        let entry = self
-            .block_on(self.fs.stat(&posix))
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        let entry = entry
-            .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
-        // 单元 4(裁决 R10):系统回收站目录($Recycle.Bin 与 SID 层)按
-        // DIRECTORY|HIDDEN|SYSTEM 暴露;Windows $I 条目 ARCHIVE|HIDDEN;
-        // $R 保持 ARCHIVE(只读预览)。判定经 fs.trash 内联(裁决 R16:
-        // 不加 ObjectFs 包装方法)。
-        let mut attributes = if entry.is_dir {
-            FILE_ATTRIBUTE_DIRECTORY
-        } else {
-            FILE_ATTRIBUTE_ARCHIVE
-                | if self.fs.read_only() {
-                    FILE_ATTRIBUTE_READONLY
-                } else {
-                    0
-                }
-        };
-        if let Some(trash) = &self.fs.trash {
-            match trash.match_system_trash(&posix) {
-                Some(SystemTrashMatch::Dir { .. }) => {
-                    attributes |= FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
-                }
-                Some(SystemTrashMatch::Entry { entry_name })
-                    if trash
-                        .system
-                        .as_ref()
-                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
-                        && is_i_entry(&entry_name) =>
-                {
-                    attributes |= FILE_ATTRIBUTE_HIDDEN;
-                }
-                _ => {}
-            }
-        }
-        Ok(FileSecurity {
-            reparse: false,
-            sz_security_descriptor: 0,
-            attributes,
-        })
+        self.block_on(self.get_security_by_name_async(
+            file_name,
+            _security_descriptor,
+            _reparse_point_resolver,
+        ))
     }
 
     fn open(
@@ -1028,82 +1233,7 @@ impl FileSystemContext for OssMountContext {
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let posix = win_path_to_posix(file_name);
-        let entry = self
-            .block_on(self.fs.stat(&posix))
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
-        let entry = entry
-            .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
-        let is_dir = entry.is_dir;
-        if create_options & FILE_DIRECTORY_FILE != 0 && !is_dir {
-            return Err(FspError::NTSTATUS(0xC000_00BAu32 as i32)); // STATUS_FILE_IS_A_DIRECTORY
-        }
-        if create_options & FILE_NON_DIRECTORY_FILE != 0 && is_dir {
-            return Err(FspError::NTSTATUS(0xC000_0103u32 as i32)); // STATUS_NOT_A_DIRECTORY
-        }
-
-        let write = granted_access & 0x2 != 0 || granted_access & 0x4000_0000 != 0;
-        if write && self.fs.read_only() {
-            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
-        }
-        // 单元 4(裁决 R11 ②):Windows 回收站条目写拒绝($R)/捕获($I)。
-        // 捕获条件:$I 形态(8 位 hex);$R 形态 open-for-write →
-        // ACCESS_DENIED(只读预览放行)。
-        // F5(medium):$I 捕获未命中(对应 $R 墓碑不在反向索引 —— 重启后
-        // by_name 空、或他端完成软删本端未刷新)同样拒绝写:捕获 miss 若
-        // 走普通写路径会把 $I 字节真实落桶,成为不可删除的幽灵条目
-        // (列出、合成 stat、delete no-op,restore 后孤儿残留)。
-        let mut capture_i = false;
-        if write {
-            if let Some(trash) = &self.fs.trash {
-                if let Some(SystemTrashMatch::Entry { entry_name }) =
-                    trash.match_system_trash(&posix)
-                    && trash
-                        .system
-                        .as_ref()
-                        .is_some_and(|s| s.platform == SystemTrashPlatform::WindowsRecycleBin)
-                {
-                    if is_r_entry(&entry_name) {
-                        return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
-                    }
-                    if is_i_entry(&entry_name) {
-                        if !trash.i_entry_has_r_tombstone(&entry_name) {
-                            return Err(FspError::NTSTATUS(WIN32_ACCESS_DENIED));
-                        }
-                        capture_i = true;
-                    }
-                }
-            }
-        }
-        let write_buf = if is_dir {
-            None
-        } else if write {
-            // Lazy: the existing content is fetched on the first write or
-            // truncate that needs it (see write_async), so opening a file
-            // for write never downloads the whole object.
-            Some(Vec::new())
-        } else {
-            None
-        };
-        *file_info.as_mut() = file_info_from(&entry, file_index(&posix));
-        Ok(OssFileContext {
-            path: Mutex::new(posix),
-            is_dir,
-            write_buf: Mutex::new(write_buf),
-            // $I 捕获:缓冲权威(无 S3 对象可懒加载),首个写直接落缓冲。
-            loaded: AtomicBool::new(capture_i),
-            dirty: AtomicBool::new(false),
-            delete_on_close: AtomicBool::new(false),
-            capture_i: AtomicBool::new(capture_i),
-            dir_buffer: DirBuffer::new(),
-            budget_units: AtomicUsize::new(0),
-            budget_permits: Mutex::new(Vec::new()),
-            spool_path: Mutex::new(None),
-            spool_size: AtomicU64::new(0),
-            stream: tokio::sync::Mutex::new(None),
-            stream_failed: AtomicBool::new(false),
-            logical_size: AtomicU64::new(0),
-        })
+        self.block_on(self.open_async(file_name, create_options, granted_access, file_info))
     }
 
     fn create(
@@ -1213,75 +1343,11 @@ impl FileSystemContext for OssMountContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
-        let delete_requested = context.delete_on_close.load(Ordering::Acquire)
-            || winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
-        if delete_requested {
-            // Discard an in-flight multipart upload and the read-back spool:
-            // the handle is being deleted, so its bytes must be neither
-            // uploaded nor orphaned as an incomplete multipart (#46/#47).
-            {
-                let mut stream_guard = self.block_on(async { context.stream.lock().await });
-                if let Some(up) = stream_guard.take() {
-                    self.block_on(up.abort());
-                }
-            }
-            if let Some(path) = context.spool_path.lock().unwrap().take() {
-                let _ = std::fs::remove_file(&path);
-                context.spool_size.store(0, Ordering::Release);
-            }
-            let path = context.path.lock().unwrap().clone();
-            let is_dir = context.is_dir;
-            let fs = Arc::clone(&self.fs);
-            let result = self.block_on({
-                let path = path.clone();
-                async move {
-                    if is_dir {
-                        fs.delete_dir_recursive(&path).await
-                    } else {
-                        fs.delete(&path).await
-                    }
-                }
-            });
-            match result {
-                Ok(()) => debug!(path = log_path(&path), "ossfs cleanup deleted"),
-                Err(e) => warn!(path = log_path(&path), error = ?e, "ossfs cleanup delete failed"),
-            }
-            return;
-        }
-        if context.dirty.load(Ordering::Acquire)
-            && let Err(e) = self.block_on(self.upload_dirty_timed(context))
-        {
-            warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
-        }
+        self.block_on(self.cleanup_async(context, _file_name, flags))
     }
 
     fn close(&self, context: Self::FileContext) {
-        // 单元 4(裁决 R8):$I 捕获句柄 —— 捕获缓冲落墓碑 body(异步,
-        // update 式写:GET body → 设 recycle_i → PUT,保 etag/size)。
-        // 空写/$R 未解析 → commit_capture_i 内部 no-op;超时静默丢弃
-        // (close 无错误回报通道,落 body 失败由 set_recycle_i warn)。
-        if context.capture_i.load(Ordering::Acquire) {
-            let _ = self.block_on(async {
-                tokio::time::timeout(self.operation_timeout, self.commit_capture_i(&context)).await
-            });
-            return;
-        }
-        // The handle is gone, so nothing can retry a failed upload — release
-        // the read-back spool and abort any leftover stream so neither leaks
-        // in %TEMP% / S3 (#47).
-        if let Some(path) = context.spool_path.lock().unwrap().take() {
-            let _ = std::fs::remove_file(&path);
-            context.spool_size.store(0, Ordering::Release);
-        }
-        let _ = self.block_on(async {
-            tokio::time::timeout(self.operation_timeout, async {
-                let mut guard = context.stream.lock().await;
-                if let Some(up) = guard.take() {
-                    up.abort().await;
-                }
-            })
-            .await
-        });
+        self.block_on(self.close_async(context))
     }
 
     fn flush(
@@ -1289,8 +1355,7 @@ impl FileSystemContext for OssMountContext {
         context: Option<&Self::FileContext>,
         _file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let Some(ctx) = context else { return Ok(()) };
-        self.block_on(self.upload_dirty_timed(ctx))
+        self.block_on(self.flush_async(context, _file_info))
     }
 
     fn get_file_info(
@@ -1480,10 +1545,7 @@ impl FileSystemContext for OssMountContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        context
-            .delete_on_close
-            .store(delete_file, Ordering::Release);
-        Ok(())
+        self.block_on(self.set_delete_async(context, _file_name, delete_file))
     }
 
     fn set_file_size(
@@ -2694,12 +2756,14 @@ mod tests {
         let (_fs, ctx) = test_mount(fs);
         let file = test_file("/f");
         // 探测序列:set_delete(true) 后取消(无粘性)
-        ctx.set_delete(file, w("\\f"), true)
+        ctx.set_delete_async(file, w("\\f"), true)
+            .await
             .expect("set_delete(true)");
-        ctx.set_delete(file, w("\\f"), false)
+        ctx.set_delete_async(file, w("\\f"), false)
+            .await
             .expect("set_delete(false) 取消");
         assert!(!file.delete_on_close.load(Ordering::Acquire));
-        ctx.cleanup(file, None, 0); // 无 FspCleanupDelete 标志
+        ctx.cleanup_async(file, None, 0).await; // 无 FspCleanupDelete 标志
         assert_eq!(
             mock.recorded.lock().unwrap().len(),
             0,
@@ -2715,13 +2779,15 @@ mod tests {
             "取消后无墓碑"
         );
         // 正向对照:set_delete(true) + FspCleanupDelete → 软删(墓碑落盘)
-        ctx.set_delete(file, w("\\f"), true)
+        ctx.set_delete_async(file, w("\\f"), true)
+            .await
             .expect("set_delete(true)");
-        ctx.cleanup(
+        ctx.cleanup_async(
             file,
             None,
             winfsp::constants::FspCleanupFlags::FspCleanupDelete as u32,
-        );
+        )
+        .await;
         assert!(
             mock.objects
                 .lock()
@@ -2775,7 +2841,7 @@ mod tests {
             !file.dirty.load(Ordering::Acquire),
             "捕获句柄不置 dirty(flush/cleanup 不得 PUT)"
         );
-        ctx.close(file);
+        ctx.close_async(file).await;
         // P8:唯一 PUT 是墓碑,桶中无 $I 对象
         {
             let recorded = mock.recorded.lock().unwrap();
@@ -2830,7 +2896,7 @@ mod tests {
         ctx.write_async(&file, &big, 0, false, false, &mut wfi)
             .await
             .expect("write");
-        ctx.close(file);
+        ctx.close_async(file).await;
         let back: crate::ossfs::trash::TombstoneBody =
             serde_json::from_slice(&mock.objects.lock().unwrap()[".trash/2026-08-16/docs/a.txt"])
                 .unwrap();
@@ -2870,12 +2936,13 @@ mod tests {
         // 真实 $I 对象(经单元 1 真实对象回退)→ ACCESS_DENIED ——
         // 两种拒绝均不得真实落桶
         let err = ctx
-            .open(
+            .open_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
                 0,
                 0x2,
                 &mut fi,
             )
+            .await
             .map(|_| ())
             .expect_err("$I open-for-write 必须拒绝");
         assert!(
@@ -2917,23 +2984,25 @@ mod tests {
         let (_fs, ctx) = test_mount(fs);
         let mut fi = open_info();
         let err = ctx
-            .open(
+            .open_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
                 0,
                 0x2,
                 &mut fi,
             )
+            .await
             .map(|_| ())
             .expect_err("$R open-for-write 必须拒绝");
         assert!(matches!(err, FspError::NTSTATUS(5)), "got {err:?}");
         // 读放行 + 转发:内容 = 原对象 docs/a.txt
         let file = ctx
-            .open(
+            .open_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
                 0,
                 0,
                 &mut fi,
             )
+            .await
             .expect("$R 读打开放行");
         let mut buf = [0u8; 32];
         let n = ctx.read_async(&file, &mut buf, 0).await.expect("read");
@@ -2953,12 +3022,13 @@ mod tests {
         let (_fs, ctx) = test_mount(fs);
         let mut fi = open_info();
         let file = ctx
-            .open(
+            .open_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
                 0,
                 0x2,
                 &mut fi,
             )
+            .await
             .expect("open $I write");
         assert!(file.capture_i.load(Ordering::Acquire));
         assert!(
@@ -2966,7 +3036,8 @@ mod tests {
             "捕获缓冲权威:首个写不懒加载合成字节"
         );
         let file2 = ctx
-            .open(w("\\docs\\plain.txt"), 0, 0x2, &mut fi)
+            .open_async(w("\\docs\\plain.txt"), 0, 0x2, &mut fi)
+            .await
             .expect("open plain write");
         assert!(!file2.capture_i.load(Ordering::Acquire), "普通文件不进捕获");
     }
@@ -2990,40 +3061,45 @@ mod tests {
         mock.set_object("docs/plain.txt", b"x".to_vec());
         let (_fs, ctx) = test_mount(fs);
         let sec = ctx
-            .get_security_by_name(w("\\$Recycle.Bin"), None, |_| None)
+            .get_security_by_name_async(w("\\$Recycle.Bin"), None, |_| None)
+            .await
             .expect("root dir");
         assert_eq!(
             sec.attributes,
             FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
         );
         let sec = ctx
-            .get_security_by_name(w("\\$Recycle.Bin\\S-1-5-21-1"), None, |_| None)
+            .get_security_by_name_async(w("\\$Recycle.Bin\\S-1-5-21-1"), None, |_| None)
+            .await
             .expect("sid dir");
         assert_eq!(
             sec.attributes,
             FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
         );
         let sec = ctx
-            .get_security_by_name(
+            .get_security_by_name_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$R4de00001a.txt"),
                 None,
                 |_| None,
             )
+            .await
             .expect("$R entry");
         assert_eq!(sec.attributes, FILE_ATTRIBUTE_ARCHIVE);
         let sec = ctx
-            .get_security_by_name(
+            .get_security_by_name_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
                 None,
                 |_| None,
             )
+            .await
             .expect("$I entry");
         assert_eq!(
             sec.attributes,
             FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN
         );
         let sec = ctx
-            .get_security_by_name(w("\\docs\\plain.txt"), None, |_| None)
+            .get_security_by_name_async(w("\\docs\\plain.txt"), None, |_| None)
+            .await
             .expect("plain file");
         assert_eq!(sec.attributes, FILE_ATTRIBUTE_ARCHIVE);
     }
