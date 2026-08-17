@@ -3103,8 +3103,10 @@ mod tests {
     async fn close_keeps_spool_queued_for_retry() {
         // issue #85:重试队列引用的 spool 在 close 时必须保留(worker 重试
         // 需要数据源),否则失败上传的数据随 close 一起消失。
+        // 注:大文件走流式上传(POST CreateMultipartUpload,不受 fail_put
+        // 拦截),故手动构造"失败已入队"状态(等价 cleanup 失败后的队列),
+        // 验证 close 不删队列引用的 spool。
         let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
-        mock.fail_put.store(100, Ordering::SeqCst); // 持续失败
         let fs = test_fs_with_budget(port, 32, None);
         let (_fs, ctx) = test_mount(fs);
         spawn_retry_worker_for_test(&ctx);
@@ -3124,8 +3126,15 @@ mod tests {
             .expect("write");
         let spool_path = file.spool_path.lock().unwrap().clone();
         assert!(spool_path.is_some(), "大文件应有 spool");
-        ctx.cleanup_async(&file, None, 0).await; // 失败入队
-        assert!(!ctx.retry.queue.lock().unwrap().is_empty());
+        // 模拟 cleanup 上传失败入队(spool 引用进队列)。
+        let mut q = ctx.retry.queue.lock().unwrap();
+        q.push_back(RetryUpload {
+            path: "/big.bin".to_string(),
+            spool: spool_path.clone(),
+            buf: None,
+            attempts: 0,
+        });
+        drop(q);
         ctx.close_async(file).await; // close 清理不得删队列 spool(file 最后使用)
         assert!(
             spool_path.as_ref().is_some_and(|p| p.exists()),
@@ -3136,7 +3145,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retry_gives_up_after_max_attempts_keeps_spool() {
         // issue #85:重试耗尽(持续失败)→ 队列清空、spool 保留(error 日志
-        // 定位),不静默消失。
+        // 定位),不静默消失。手动入队(等价 cleanup 失败后):worker 重试
+        // 走 write_from_file(plain PUT,8MiB+1KB < 16MiB 不分片),被
+        // fail_put 持续拦截 → 耗尽。
         let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
         mock.fail_put.store(1000, Ordering::SeqCst); // 持续失败
         let fs = test_fs_with_budget(port, 32, None);
@@ -3149,7 +3160,17 @@ mod tests {
             .await
             .expect("write");
         let spool_path = file.spool_path.lock().unwrap().clone();
-        ctx.cleanup_async(file, None, 0).await;
+        assert!(spool_path.is_some(), "大文件应有 spool");
+        {
+            let mut q = ctx.retry.queue.lock().unwrap();
+            q.push_back(RetryUpload {
+                path: "/giveup.bin".to_string(),
+                spool: spool_path.clone(),
+                buf: None,
+                attempts: 0,
+            });
+        }
+        ctx.retry.notify.notify_one();
         // 10 次重试 × 指数退避(5s+15s+45s+...):等 60s 覆盖到第 10 次。
         for _ in 0..12 {
             tokio::time::sleep(Duration::from_secs(5)).await;
