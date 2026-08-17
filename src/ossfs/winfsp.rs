@@ -2946,7 +2946,7 @@ mod tests {
             .map(|_| ())
             .expect_err("$I open-for-write 必须拒绝");
         assert!(
-            matches!(err, FspError::NTSTATUS(5) | FspError::NTSTATUS(2)),
+            matches!(err, FspError::NTSTATUS(5) | FspError::WIN32(2)),
             "got {err:?}"
         );
         // P8:桶中无真实 $I 对象,被拒路径零 S3 请求
