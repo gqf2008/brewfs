@@ -123,7 +123,9 @@ jobs:
         shell: pwsh
         run: |
           winget install --id WinFsp.WinFsp --silent --accept-package-agreements --accept-source-agreements
-          $bin = "$env:ProgramFiles(x86)\WinFsp\bin"
+          # NB: `$env:ProgramFiles(x86)` parses as $env:ProgramFiles + "(x86)"
+          # (path loses the space); brace the name: ${env:ProgramFiles(x86)}.
+          $bin = "${env:ProgramFiles(x86)}\WinFsp\bin"
           if (Test-Path $bin) { "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append }
           else { throw "WinFsp bin not found at $bin" }
 
