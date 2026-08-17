@@ -53,7 +53,7 @@ fn s3_error<E: Into<anyhow::Error>>(e: E) -> FspError {
         FspError::from(IoError::other(err.to_string()))
     }
 }
-const STATUS_IO_TIMEOUT: i32 = 0xC000_00B5;
+const STATUS_IO_TIMEOUT: i32 = 0xC000_00B5u32 as i32;
 const WIN32_INVALID_PARAMETER: i32 = 87;
 const WIN32_ALREADY_EXISTS: i32 = 183;
 
