@@ -38,6 +38,19 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
 const WIN32_FILE_NOT_FOUND: i32 = 2;
 const WIN32_ACCESS_DENIED: i32 = 5;
+
+/// 可恢复错误 → STATUS_IO_TIMEOUT(Explorer 弹"重试/取消"由用户决定,
+/// issue #83);致命错误保持设备错误映射。S3 层错误统一经此转换,替代
+/// 裸 `IoError::other` —— 否则断网/超时被 Explorer 判定为设备故障,
+/// 复制任务未获用户确认即自动退出。
+fn s3_error(e: anyhow::Error) -> FspError {
+    if super::is_retryable_error(&e) {
+        FspError::NTSTATUS(STATUS_IO_TIMEOUT)
+    } else {
+        FspError::from(IoError::other(e.to_string()))
+    }
+}
+const STATUS_IO_TIMEOUT: i32 = 0xC000_00B5;
 const WIN32_INVALID_PARAMETER: i32 = 87;
 const WIN32_ALREADY_EXISTS: i32 = 183;
 
@@ -328,11 +341,10 @@ impl OssMountContext {
         fs.rename(&old, &new_for_upload, replace_if_exists)
             .await
             .map_err(|e| {
-                let io = IoError::other(e.to_string());
                 if e.to_string().contains("target already exists") {
                     FspError::from(IoError::from_raw_os_error(WIN32_ALREADY_EXISTS))
                 } else {
-                    FspError::from(io)
+                    s3_error(e)
                 }
             })?;
         // Retarget this handle to the new path so a later flush writes the
@@ -442,11 +454,7 @@ impl OssMountContext {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<OssFileContext> {
         let posix = win_path_to_posix(file_name);
-        let entry = self
-            .fs
-            .stat(&posix)
-            .await
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        let entry = self.fs.stat(&posix).await.map_err(|e| s3_error(e))?;
         let entry = entry
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
         let is_dir = entry.is_dir;
@@ -530,11 +538,7 @@ impl OssMountContext {
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let posix = win_path_to_posix(file_name);
-        let entry = self
-            .fs
-            .stat(&posix)
-            .await
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+        let entry = self.fs.stat(&posix).await.map_err(|e| s3_error(e))?;
         let entry = entry
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
         // 单元 4(裁决 R10):系统回收站目录($Recycle.Bin 与 SID 层)按
@@ -754,7 +758,7 @@ impl OssMountContext {
         trash
             .set_recycle_i(&self.fs, &entry_name, bytes)
             .await
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))
+            .map_err(|e| s3_error(e))
     }
 
     /// Upload the handle's dirty content, streaming from the spool file when
@@ -794,7 +798,7 @@ impl OssMountContext {
                     self.fs
                         .write_from_file(&target, &path)
                         .await
-                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                        .map_err(|e| s3_error(e))?;
                     let _ = std::fs::remove_file(&path);
                     ctx.spool_size.store(0, Ordering::Release);
                 }
@@ -809,7 +813,7 @@ impl OssMountContext {
                 // through the buffer path would PUT an empty object over the
                 // previous content; remember that and refuse.
                 ctx.stream_failed.store(true, Ordering::Release);
-                return Err(FspError::from(IoError::other(e.to_string())));
+                return Err(s3_error(e));
             }
             // The upload is complete; drop the read-back spool (#47).
             if let Some(path) = ctx.spool_path.lock().unwrap().take() {
@@ -827,7 +831,7 @@ impl OssMountContext {
             self.fs
                 .write_from_file(&*ctx.path.lock().unwrap(), &path)
                 .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
             let _ = std::fs::remove_file(&path);
             ctx.spool_path.lock().unwrap().take();
             ctx.spool_size.store(0, Ordering::Release);
@@ -876,7 +880,7 @@ impl OssMountContext {
                         .fs
                         .read_range(&*ctx.path.lock().unwrap(), 0, usize::MAX)
                         .await
-                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                        .map_err(|e| s3_error(e))?;
                     self.reserve_dirty(ctx, data.len()).await?;
                 }
                 self.reserve_dirty(ctx, logical).await?;
@@ -885,7 +889,7 @@ impl OssMountContext {
             self.fs
                 .write(&*ctx.path.lock().unwrap(), &data)
                 .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
         }
         // Small-buffer path keeps the buffer (later reads serve from it), so
         // only the flag needs clearing.
@@ -1286,7 +1290,7 @@ impl FileSystemContext for OssMountContext {
         let mut needs_existing = false;
         if is_dir {
             self.block_on(self.fs.mkdir(&posix))
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
         } else if !capture_i {
             // #50: materialize the object for a brand-new file so it still
             // exists after the handle closes (a never-PUT path would 404 on
@@ -1298,7 +1302,7 @@ impl FileSystemContext for OssMountContext {
             // If-None-Match:* — which ObjectFs does not expose yet.)
             let existing = self
                 .block_on(self.fs.stat(&posix))
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
             match existing {
                 Some(entry) => {
                     size = entry.size;
@@ -1306,7 +1310,7 @@ impl FileSystemContext for OssMountContext {
                 }
                 None => {
                     self.block_on(self.fs.write(&posix, &[]))
-                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                        .map_err(|e| s3_error(e))?;
                 }
             }
         }
@@ -1415,7 +1419,7 @@ impl FileSystemContext for OssMountContext {
         }
         let entry = self
             .block_on(self.fs.stat(&*context.path.lock().unwrap()))
-            .map_err(|e| FspError::from(IoError::other(e.to_string())))?
+            .map_err(|e| s3_error(e))?
             .ok_or_else(|| FspError::from(IoError::from_raw_os_error(WIN32_FILE_NOT_FOUND)))?;
         *file_info = file_info_from(&entry, context.index());
         Ok(())
@@ -1527,7 +1531,7 @@ impl FileSystemContext for OssMountContext {
             // the fallback DirEntry below locks it again (#46).
             let path = context.path.lock().unwrap().clone();
             self.block_on(self.fs.stat(&path))
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?
+                .map_err(|e| s3_error(e))?
                 .unwrap_or(DirEntry {
                     name: path,
                     is_dir: context.is_dir,
@@ -1585,13 +1589,13 @@ impl AsyncFileSystemContext for OssMountContext {
             if let Some(path) = spool {
                 let mut file = tokio::fs::File::open(&path)
                     .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    .map_err(|e| s3_error(e))?;
                 tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset))
                     .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    .map_err(|e| s3_error(e))?;
                 let n = tokio::io::AsyncReadExt::read(&mut file, buffer)
                     .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    .map_err(|e| s3_error(e))?;
                 return Ok(n as u32);
             }
         }
@@ -1690,9 +1694,7 @@ impl AsyncFileSystemContext for OssMountContext {
                         "streaming write at offset {base} while current size is {cur}"
                     ))));
                 }
-                up.write(buffer)
-                    .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                up.write(buffer).await.map_err(|e| s3_error(e))?;
                 // #47: mirror the bytes into the read-back spool only after
                 // the stream accepted them — appending first would expose
                 // rejected bytes to reads and double-append on a retry. A
@@ -1704,7 +1706,7 @@ impl AsyncFileSystemContext for OssMountContext {
                         .append(true)
                         .open(&path)
                         .await
-                        .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                        .map_err(|e| s3_error(e))?;
                     if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut f, buffer).await {
                         warn!(path = %path.display(), error = ?e, "ossfs spool append failed; read-back degraded");
                     } else {
@@ -1754,7 +1756,7 @@ impl AsyncFileSystemContext for OssMountContext {
                 .fs
                 .read_range(&lazy_path, 0, usize::MAX)
                 .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
             // The object may have grown since stat; top up the reservation.
             if self.dirty_budget.is_some() {
                 self.reserve_dirty(context, data.len()).await?;
@@ -1814,7 +1816,7 @@ impl AsyncFileSystemContext for OssMountContext {
                 .fs
                 .begin_streaming_upload(&stream_path)
                 .await
-                .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                .map_err(|e| s3_error(e))?;
             // #47: place `buffer` at its declared anchor. The buffer holds
             // the full content (lazy-loaded original + earlier writes), so
             // the stream must be prefix + buffer + suffix — naively appending
@@ -1839,7 +1841,7 @@ impl AsyncFileSystemContext for OssMountContext {
             {
                 let mut f = tokio::fs::File::create(&spool)
                     .await
-                    .map_err(|e| FspError::from(IoError::other(e.to_string())))?;
+                    .map_err(|e| s3_error(e))?;
                 let seed = async {
                     if let Some(existing) = &existing {
                         tokio::io::AsyncWriteExt::write_all(&mut f, &existing[..cut]).await?;
@@ -2086,6 +2088,19 @@ mod tests {
     use super::*;
     use crate::ossfs::{MockS3, test_fs_with_budget};
     use std::time::Duration;
+
+    #[test]
+    fn s3_error_maps_retryable_to_io_timeout() {
+        // issue #83:可恢复错误 → STATUS_IO_TIMEOUT(Explorer 弹"重试/取消"),
+        // 不再统一映射为设备错误导致复制任务自动退出。
+        let err = anyhow::anyhow!("request timed out after 60s");
+        assert!(matches!(s3_error(err), FspError::NTSTATUS(s) if s == STATUS_IO_TIMEOUT));
+        let err = anyhow::anyhow!("upload failed").context("connection reset by peer");
+        assert!(matches!(s3_error(err), FspError::NTSTATUS(s) if s == STATUS_IO_TIMEOUT));
+        // 致命错误保持设备错误映射(行为不变)。
+        let err = anyhow::anyhow!("NoSuchKey (404)");
+        assert!(!matches!(s3_error(err), FspError::NTSTATUS(s) if s == STATUS_IO_TIMEOUT));
+    }
 
     /// NUL-terminated U16CStr for callback tests (leaked, tests only).
     fn w(s: &str) -> &'static U16CStr {

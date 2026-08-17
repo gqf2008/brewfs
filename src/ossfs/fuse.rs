@@ -563,6 +563,11 @@ impl OssFs {
         if ACCESS_DENIED_MARKERS.iter().any(|m| text.contains(m)) {
             return Errno::EACCES;
         }
+        // 可恢复错误(超时/断网/5xx/限流,issue #83):EAGAIN 让工具重试
+        // 而非 EIO 直接放弃(与 WinFsp 的 STATUS_IO_TIMEOUT 同口径)。
+        if super::is_retryable_error(e) {
+            return Errno::EAGAIN;
+        }
         Errno::EIO
     }
 }
@@ -2259,15 +2264,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errno_for_retryable_errors_is_eagain() {
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let oss = test_oss(port, None);
+        // 可恢复错误(issue #83):EAGAIN 让工具重试,而非 EIO 直接放弃。
+        for msg in [
+            "connection reset by peer",
+            "timeout after 60s",
+            "failed to connect to endpoint",
+            "server returned 503 Service Unavailable",
+            "too many requests (429)",
+        ] {
+            assert_eq!(
+                i32::from(oss.errno_for(&anyhow::anyhow!(msg), true)),
+                i32::from(Errno::EAGAIN),
+                "retryable error should map to EAGAIN: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn errno_for_other_errors_stay_eio() {
         let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
         let oss = test_oss(port, None);
         assert_eq!(
-            i32::from(oss.errno_for(&anyhow::anyhow!("connection reset by peer"), true)),
+            i32::from(oss.errno_for(&anyhow::anyhow!("object not found"), true)),
             i32::from(Errno::EIO)
         );
         assert_eq!(
-            i32::from(oss.errno_for(&anyhow::anyhow!("timeout"), false)),
+            i32::from(oss.errno_for(&anyhow::anyhow!("internal logic error"), false)),
             i32::from(Errno::EIO)
         );
     }
