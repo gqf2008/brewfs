@@ -2935,6 +2935,7 @@ mod tests {
         // open-for-write 同口径:合成 stat 未命中 → FILE_NOT_FOUND,
         // 真实 $I 对象(经单元 1 真实对象回退)→ ACCESS_DENIED ——
         // 两种拒绝均不得真实落桶
+        let before = mock.recorded.lock().unwrap().len();
         let err = ctx
             .open_async(
                 w("\\$Recycle.Bin\\S-1-5-21-1\\$I4de00001a.txt"),
@@ -2949,7 +2950,8 @@ mod tests {
             matches!(err, FspError::NTSTATUS(5) | FspError::WIN32(2)),
             "got {err:?}"
         );
-        // P8:桶中无真实 $I 对象,被拒路径零 S3 请求
+        // P8:桶中无真实 $I 对象;拒绝路径不产生额外 S3 请求
+        // (open 固有的条目 stat 除外——前置解析,非拒绝路径)。
         assert!(
             mock.objects
                 .lock()
@@ -2958,9 +2960,10 @@ mod tests {
                 .all(|k| !k.contains("$I4de00001a")),
             "捕获未命中不得真实落桶"
         );
-        assert!(
-            mock.recorded.lock().unwrap().is_empty(),
-            "被拒路径零 S3 请求"
+        assert_eq!(
+            mock.recorded.lock().unwrap().len(),
+            before,
+            "拒绝路径零新增 S3 请求"
         );
     }
 
