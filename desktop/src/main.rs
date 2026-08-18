@@ -180,7 +180,7 @@ fn run_installer(path: &std::path::Path) {
 }
 
 /// 非 macOS(Windows):ShellExecute runas /passive + 退出。
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn run_installer(path: &std::path::Path) {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -203,6 +203,12 @@ fn run_installer(path: &std::path::Path) {
     }
     // 退出 tray 让 WiX 安装器写文件(替换 ossfs-tray/ossmount)。
     std::process::exit(0);
+}
+
+/// Linux:tray 可编译但无安装包(release 仅 dmg/exe),不自动更新。
+#[cfg(target_os = "linux")]
+fn run_installer(_path: &std::path::Path) {
+    eprintln!("auto-update not supported on Linux (no installer asset)");
 }
 
 /// 发现新版弹提示:确认后打开下载页。
