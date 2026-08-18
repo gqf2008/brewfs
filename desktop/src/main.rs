@@ -37,27 +37,103 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// 拉取 GitHub 最新 release 版本号;网络/解析失败返回 None(静默降级)。
-fn fetch_latest_version() -> Option<String> {
+/// 拉取 GitHub 最新 release 信息(tag_name + 安装包下载 URL);网络/解析
+/// 失败返回 None(静默降级)。Windows 找 `OSSFS-Setup-*.exe`,macOS 找
+/// `OSSFS-*-macos-arm64.dmg`。
+struct ReleaseInfo {
+    version: String,
+    url: String,
+}
+
+fn fetch_latest_release() -> Option<ReleaseInfo> {
     let resp = ureq::get("https://api.github.com/repos/gqf2008/ossfs/releases/latest")
         .set("User-Agent", "ossfs-tray")
         .timeout(std::time::Duration::from_secs(10))
         .call()
         .ok()?;
     let json: serde_json::Value = resp.into_json().ok()?;
-    json.get("tag_name")?.as_str().map(str::to_string)
+    let version = json.get("tag_name")?.as_str()?.to_string();
+    let url = parse_release_asset(&json)?;
+    Some(ReleaseInfo { version, url })
 }
 
-/// 检查是否有新版本:最新 > 当前时返回 Some(最新版本号)。
-fn check_for_update(current: &str) -> Option<String> {
-    let latest = fetch_latest_version()?;
-    let (c, l) = (parse_version(current)?, parse_version(&latest)?);
-    (l > c).then_some(latest)
+/// 从 release JSON 里挑出当前平台的安装包下载 URL。
+fn parse_release_asset(json: &serde_json::Value) -> Option<String> {
+    let suffix = if cfg!(target_os = "macos") {
+        "-macos-arm64.dmg"
+    } else {
+        "-Setup-"
+    };
+    json.get("assets")?.as_array()?.iter().find_map(|a| {
+        let name = a.get("name")?.as_str()?;
+        let url = a.get("browser_download_url")?.as_str()?;
+        (name.contains(suffix) && name.ends_with(".exe") == cfg!(target_os = "windows"))
+            .then_some(url.to_string())
+    })
 }
 
-/// 打开 GitHub release 下载页。
+/// 检查是否有新版本:最新 > 当前 → Some((版本号, 下载 URL))。
+fn check_for_update(current: &str) -> Option<ReleaseInfo> {
+    let release = fetch_latest_release()?;
+    let (c, l) = (parse_version(current)?, parse_version(&release.version)?);
+    (l > c).then_some(release)
+}
+
+/// 打开 GitHub release 下载页(手动 fallback)。
 fn open_release_page() {
     let _ = webbrowser::open("https://github.com/gqf2008/ossfs/releases/latest");
+}
+
+/// 下载安装包到临时目录。返回本地路径,失败返回 None。
+fn download_installer(url: &str, version: &str) -> Option<std::path::PathBuf> {
+    let ext = if cfg!(target_os = "macos") {
+        "dmg"
+    } else {
+        "exe"
+    };
+    let filename = format!("OSSFS-{version}.{ext}");
+    let dir = std::env::temp_dir();
+    let path = dir.join(&filename);
+    let resp = ureq::get(url)
+        .set("User-Agent", "ossfs-tray")
+        .timeout(std::time::Duration::from_secs(120))
+        .call()
+        .ok()?;
+    use std::io::Write;
+    let mut file = std::fs::File::create(&path).ok()?;
+    let mut reader = resp.into_reader();
+    std::io::copy(&mut reader, &mut file).ok()?;
+    Some(path)
+}
+
+/// 运行安装包(Windows:ShellExecute runas 提权;macOS:open)。
+#[cfg(windows)]
+fn run_installer(path: &std::path::Path) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op: Vec<u16> = "runas\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let params: Vec<u16> = "/passive\0".encode_utf16().collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// 非 Windows:open dmg(Finder 挂载,用户拖入 Applications)。
+#[cfg(not(windows))]
+fn run_installer(path: &std::path::Path) {
+    let _ = webbrowser::open(&path.to_string_lossy());
 }
 
 /// 发现新版弹提示:确认后打开下载页。
@@ -92,18 +168,65 @@ fn show_update_dialog(_current: &str, latest: &str) {
     open_release_page();
 }
 
-/// 后台线程检查更新:发现新版 → 菜单状态改「有新版本(x.x.x)」+ 弹提示。
+/// 下载完成提示安装:Windows MessageBox「下载完成,是否立即安装?」。
+#[cfg(windows)]
+fn show_install_prompt(version: &str, path: &std::path::Path) -> bool {
+    let msg = format!("新版本 {version} 已下载完成。\n\n是否立即安装?(安装会关闭托盘)",);
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
+    };
+    let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "OSSFS 更新"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let choice = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONINFORMATION,
+        )
+    };
+    let _ = path; // path 用于后续安装(此函数仅询问)
+    choice == IDYES
+}
+
+#[cfg(not(windows))]
+fn show_install_prompt(_version: &str, _path: &std::path::Path) -> bool {
+    false
+}
+
+/// 后台线程检查更新:发现新版 → 菜单显示「下载新版本」→ 自动下载 →
+/// 完成提示安装(Windows MessageBox;非 Windows 打开 dmg)。
 /// `quiet_on_none` 控制"无新版/失败"时是否静默(自动检查静默;手动检查
 /// 要告知结果)。UI 更新经 `upgrade_in_event_loop`(Slint 跨线程纪律)。
 fn run_update_check(current: String, quiet_on_none: bool, tray_weak: slint::Weak<Tray>) {
     std::thread::spawn(move || {
         match check_for_update(&current) {
-            Some(latest) => {
-                let status = format!("有新版本({latest})");
+            Some(release) => {
+                let version_dl = release.version.clone();
                 let _ = tray_weak.upgrade_in_event_loop(move |tray| {
-                    tray.set_update_status(status.into());
+                    tray.set_update_status(format!("下载新版本 {version_dl}…").into());
                 });
-                show_update_dialog(&current, &latest);
+                let url = release.url.clone();
+                let version = release.version.clone();
+                if let Some(path) = download_installer(&url, &version) {
+                    let status = format!("有新版本({version})");
+                    let _ = tray_weak.upgrade_in_event_loop(move |tray| {
+                        tray.set_update_status(status.into());
+                    });
+                    if show_install_prompt(&version, &path) {
+                        run_installer(&path);
+                    }
+                } else {
+                    // 下载失败:fallback 打开下载页。
+                    let status = format!("有新版本({version})");
+                    let _ = tray_weak.upgrade_in_event_loop(move |tray| {
+                        tray.set_update_status(status.into());
+                    });
+                    show_update_dialog(&current, &version);
+                }
             }
             None if !quiet_on_none => {
                 // 手动检查:区分"已是最新"与"检查失败"(网络/解析)。
@@ -2096,6 +2219,26 @@ mod mac_dock_reopen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_release_asset_picks_windows_installer() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "tag_name": "v0.4.3",
+            "assets": [
+                {"name": "OSSFS-0.4.3-macos-arm64.dmg", "browser_download_url": "https://x/dmg"},
+                {"name": "OSSFS-Setup-0.4.3.exe", "browser_download_url": "https://x/exe"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let url = parse_release_asset(&json);
+        if cfg!(target_os = "macos") {
+            assert_eq!(url.as_deref(), Some("https://x/dmg"));
+        } else {
+            assert_eq!(url.as_deref(), Some("https://x/exe"));
+        }
+    }
 
     #[test]
     fn parse_version_handles_v_prefix_and_parts() {
