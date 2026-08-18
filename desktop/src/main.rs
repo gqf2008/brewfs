@@ -2221,6 +2221,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn parse_release_asset_picks_windows_installer() {
         let json: serde_json::Value = serde_json::from_str(
             r#"{
@@ -2233,11 +2234,12 @@ mod tests {
         )
         .unwrap();
         let url = parse_release_asset(&json);
-        if cfg!(target_os = "macos") {
-            assert_eq!(url.as_deref(), Some("https://x/dmg"));
+        let expected = if cfg!(target_os = "macos") {
+            "https://x/dmg"
         } else {
-            assert_eq!(url.as_deref(), Some("https://x/exe"));
-        }
+            "https://x/exe"
+        };
+        assert_eq!(url.as_deref(), Some(expected));
     }
 
     #[test]
