@@ -63,14 +63,15 @@ fn open_release_page() {
 /// 发现新版弹提示:确认后打开下载页。
 #[cfg(windows)]
 fn show_update_dialog(current: &str, latest: &str) {
-    let msg = format!(
-        "发现新版本 {latest}(当前 {current})。\n\n是否打开下载页面?",
-    );
+    let msg = format!("发现新版本 {latest}(当前 {current})。\n\n是否打开下载页面?",);
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_YESNO, IDYES,
+        IDYES, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
     };
     let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = "OSSFS 更新".encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "OSSFS 更新"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let choice = unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
@@ -102,7 +103,7 @@ fn run_update_check(current: String, quiet_on_none: bool) {
                 #[cfg(windows)]
                 {
                     use windows_sys::Win32::UI::WindowsAndMessaging::{
-                        MessageBoxW, MB_ICONINFORMATION, MB_OK,
+                        MB_ICONINFORMATION, MB_OK, MessageBoxW,
                     };
                     let msg = if parse_version(&current).is_some() {
                         "检查失败(网络不可达或解析失败)。".to_string()
@@ -110,7 +111,10 @@ fn run_update_check(current: String, quiet_on_none: bool) {
                         "已是最新版本。".to_string()
                     };
                     let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-                    let title: Vec<u16> = "OSSFS 更新".encode_utf16().chain(std::iter::once(0)).collect();
+                    let title: Vec<u16> = "OSSFS 更新"
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
                     unsafe {
                         MessageBoxW(
                             std::ptr::null_mut(),
@@ -2097,7 +2101,10 @@ mod tests {
     fn version_compare_semantics() {
         // check_for_update 的纯比较逻辑:最新 > 当前 → Some(最新)。
         let cmp = |current: &str, latest: &str| -> bool {
-            let (c, l) = (parse_version(current).unwrap(), parse_version(latest).unwrap());
+            let (c, l) = (
+                parse_version(current).unwrap(),
+                parse_version(latest).unwrap(),
+            );
             l > c
         };
         assert!(cmp("0.4.1", "0.4.2"));
