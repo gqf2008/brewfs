@@ -46,15 +46,30 @@ struct ReleaseInfo {
 }
 
 fn fetch_latest_release() -> Option<ReleaseInfo> {
-    let resp = ureq::get("https://api.github.com/repos/gqf2008/ossfs/releases/latest")
+    let resp = build_http_agent()
+        .get("https://api.github.com/repos/gqf2008/ossfs/releases/latest")
         .set("User-Agent", "ossfs-tray")
-        .timeout(std::time::Duration::from_secs(10))
         .call()
         .ok()?;
     let json: serde_json::Value = resp.into_json().ok()?;
     let version = json.get("tag_name")?.as_str()?.to_string();
     let url = parse_release_asset(&json)?;
     Some(ReleaseInfo { version, url })
+}
+
+/// 构建 HTTP agent(读 HTTPS_PROXY/https_proxy 环境变量;ureq 2 的便捷
+/// 函数不自动读 env 代理,需显式 Proxy——中国网络到 GitHub 需走代理)。
+fn build_http_agent() -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30));
+    for var in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Ok(p) = std::env::var(var)
+            && let Ok(proxy) = ureq::Proxy::new(&p)
+        {
+            builder = builder.proxy(proxy);
+            break;
+        }
+    }
+    builder.build()
 }
 
 /// 从 release JSON 里挑出当前平台的安装包下载 URL。
@@ -94,20 +109,78 @@ fn download_installer(url: &str, version: &str) -> Option<std::path::PathBuf> {
     let filename = format!("OSSFS-{version}.{ext}");
     let dir = std::env::temp_dir();
     let path = dir.join(&filename);
-    let resp = ureq::get(url)
+    let resp = build_http_agent()
+        .get(url)
         .set("User-Agent", "ossfs-tray")
-        .timeout(std::time::Duration::from_secs(120))
         .call()
+        .map_err(|e| eprintln!("download connect failed: {e}"))
         .ok()?;
     use std::io::Write;
-    let mut file = std::fs::File::create(&path).ok()?;
+    let mut file = std::fs::File::create(&path)
+        .map_err(|e| eprintln!("create file failed: {e}"))
+        .ok()?;
     let mut reader = resp.into_reader();
-    std::io::copy(&mut reader, &mut file).ok()?;
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| eprintln!("copy bytes failed: {e}"))
+        .ok()?;
+    eprintln!("downloaded to {}", path.display());
     Some(path)
 }
 
-/// 运行安装包(Windows:ShellExecute runas 提权;macOS:open)。
-#[cfg(windows)]
+/// 运行安装包(程序内自安装,不引导用户):
+/// - macOS:`hdiutil attach` → `cp -R OSSFS.app /Applications/` → `detach` →
+///   spawn 新 tray + 退出当前(覆盖式更新,挂载进程不受影响)。
+/// - Windows:`ShellExecute runas /passive`(WiX 静默安装)+ 退出 tray 让
+///   安装器写文件;安装后由 WiX 重启应用或用户手动启动(后续增强)。
+#[cfg(target_os = "macos")]
+fn run_installer(path: &std::path::Path) {
+    use std::process::{Command, exit};
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return,
+    };
+    // 挂载 dmg(-nobrowse:不在 Finder 弹窗)。
+    let out = match Command::new("hdiutil")
+        .args(["attach", "-nobrowse", path_str])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("hdiutil attach failed: {e}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // hdiutil 输出最后字段为挂载点(如 /Volumes/OSSFS)。
+    let mount = match stdout
+        .lines()
+        .last()
+        .and_then(|l| l.split_whitespace().last())
+    {
+        Some(m) => m.to_string(),
+        None => return,
+    };
+    eprintln!("mounted at {mount}");
+    // 拷贝 .app 到 /Applications(覆盖式更新;运行中的旧 tray 仍可用旧二进制
+    // 直到 exit,新 spawn 的是新版)。
+    let cp = Command::new("cp")
+        .args(["-R", &format!("{mount}/OSSFS.app"), "/Applications/"])
+        .status();
+    eprintln!("cp -R status: {:?}", cp);
+    // 卸载 dmg。
+    let _ = Command::new("hdiutil").args(["detach", &mount]).status();
+    // 重启:spawn 新 tray(/Applications/OSSFS.app)+ 退出当前。
+    let _ = Command::new("/Applications/OSSFS.app/Contents/MacOS/ossfs-tray")
+        .env(
+            "OSSMOUNT_EXE",
+            "/Applications/OSSFS.app/Contents/MacOS/ossmount",
+        )
+        .spawn();
+    exit(0);
+}
+
+/// 非 macOS(Windows):ShellExecute runas /passive + 退出。
+#[cfg(not(target_os = "macos"))]
 fn run_installer(path: &std::path::Path) {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -128,12 +201,8 @@ fn run_installer(path: &std::path::Path) {
             SW_SHOWNORMAL,
         );
     }
-}
-
-/// 非 Windows:open dmg(Finder 挂载,用户拖入 Applications)。
-#[cfg(not(windows))]
-fn run_installer(path: &std::path::Path) {
-    let _ = webbrowser::open(&path.to_string_lossy());
+    // 退出 tray 让 WiX 安装器写文件(替换 ossfs-tray/ossmount)。
+    std::process::exit(0);
 }
 
 /// 发现新版弹提示:确认后打开下载页。
@@ -194,7 +263,9 @@ fn show_install_prompt(version: &str, path: &std::path::Path) -> bool {
 
 #[cfg(not(windows))]
 fn show_install_prompt(_version: &str, _path: &std::path::Path) -> bool {
-    false
+    // 非 Windows:无原生消息框,下载完成直接自安装(run_installer 程序内
+    // 完成 hdiutil+cp+重启,不引导用户操作)。
+    true
 }
 
 /// 后台线程检查更新:发现新版 → 菜单显示「下载新版本」→ 自动下载 →
