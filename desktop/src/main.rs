@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-/// 版本更新检查(issue #87):GET GitHub Releases 最新版,与当前版本对比,
-/// 发现新版提示下载。网络失败/解析失败静默(不打扰用户)。
+// 版本更新检查(issue #87):GET GitHub Releases 最新版,与当前版本对比,
+// 发现新版提示下载。网络失败/解析失败静默(不打扰用户)。
 
 /// 解析 "v0.4.2" 或 "0.4.2" → (0,4,2)。非数字段返回 None。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
