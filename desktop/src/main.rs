@@ -1110,9 +1110,7 @@ fn wire_callbacks(
     // --- 检查更新(issue #87) ---
     // 菜单状态默认「检查更新」;发现新版时回写「有新版本(x.x.x)」。
     // 菜单状态:默认「检查更新 v0.4.2」(版本号常显);发现新版 →「有新版本(x.x.x)」。
-    tray.set_update_status(
-        format!("检查更新 v{}", env!("CARGO_PKG_VERSION")).into(),
-    );
+    tray.set_update_status(format!("检查更新 v{}", env!("CARGO_PKG_VERSION")).into());
     // 手动:菜单点击 → 新版弹提示,无新版/失败也告知结果。
     tray.on_check_update({
         let current = env!("CARGO_PKG_VERSION").to_string();
