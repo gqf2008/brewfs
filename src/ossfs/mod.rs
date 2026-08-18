@@ -262,6 +262,84 @@ pub(crate) fn effective_mode(is_dir: bool, dir_mode: u32, file_mode: u32, umask:
     (base & !umask) as u16
 }
 
+/// 重试上限:超过后最终放弃并 error 日志(数据未上传,spool 保留供人工
+/// 定位)。退避 5s * 3^n 封顶 5 分钟 → 10 次 ≈ 25 分钟。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const RETRY_MAX_ATTEMPTS: u32 = 10;
+
+/// 指数退避:5s * 3^min(attempts,5),封顶 5 分钟。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn retry_backoff(attempts: u32) -> Duration {
+    Duration::from_secs(5 * 3u64.pow(attempts.min(5)))
+}
+
+/// 失败上传后台重试的共享状态(issue #85):cleanup/close 上传失败(弱网
+/// 超时等)时数据入队,worker 指数退避重试,网络恢复后自动补传 —— 文件
+/// 系统回调(如 WinFsp cleanup)无错误返回通道,静默丢弃即数据丢失(实测:
+/// 21.44G 源复制后桶里仅 8.33G)。重试成功前 spool 缓冲保留不删。
+/// 平台无关:winfsp.rs 只负责入队挂点与 close 的 spool 保留检查。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct RetryState {
+    pub(crate) queue: Mutex<VecDeque<RetryUpload>>,
+    /// 唤醒重试 worker 的信号(入队后 notify_one)。
+    pub(crate) notify: tokio::sync::Notify,
+}
+
+/// 一次失败的上传:数据源为 spool 文件或内存缓冲,二选一。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct RetryUpload {
+    /// 目标 POSIX 路径(挂载视图形态,如 "/临时/a.txt")。
+    pub(crate) path: String,
+    /// spool 读回缓冲文件(流式/大文件路径);重试成功后由 worker 删除。
+    pub(crate) spool: Option<PathBuf>,
+    /// 内存缓冲(小文件路径,clone 自 write_buf 固化)。
+    pub(crate) buf: Option<Vec<u8>>,
+    /// 已重试次数(指数退避,超过 [`RETRY_MAX_ATTEMPTS`] 最终放弃并告警)。
+    pub(crate) attempts: u32,
+}
+
+/// 后台重试 worker 主体(平台无关):监听入队通知,指数退避重试失败上传。
+/// 与挂载生命周期解耦(fs + retry 均为 Arc),由适配器(mount)spawn。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) async fn run_retry_worker(fs: Arc<ObjectFs>, retry: Arc<RetryState>) {
+    loop {
+        retry.notify.notified().await;
+        let item = retry.queue.lock().unwrap().pop_front();
+        let Some(mut item) = item else { continue };
+        tokio::time::sleep(retry_backoff(item.attempts)).await;
+        let result = if let Some(spool) = &item.spool {
+            fs.write_from_file(&item.path, spool).await
+        } else if let Some(buf) = &item.buf {
+            fs.write(&item.path, buf).await
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(()) => {
+                if let Some(spool) = item.spool.take() {
+                    let _ = std::fs::remove_file(&spool);
+                }
+                tracing::info!(path = %item.path, "retry upload succeeded");
+            }
+            Err(e) => {
+                item.attempts += 1;
+                if item.attempts >= RETRY_MAX_ATTEMPTS {
+                    tracing::error!(
+                        path = %item.path,
+                        error = ?e,
+                        "retry upload gave up after {RETRY_MAX_ATTEMPTS} attempts; \
+                         data NOT uploaded (spool kept at {:?})",
+                        item.spool
+                    );
+                } else {
+                    retry.queue.lock().unwrap().push_back(item);
+                    retry.notify.notify_one();
+                }
+            }
+        }
+    }
+}
+
 /// 可恢复错误分类(issue #83):超时/连接失败/网络不可达/HTTP 5xx/限流
 /// 属于「用户重试可能成功」的错误 —— WinFsp 映射为 STATUS_IO_TIMEOUT
 /// (Explorer 弹"重试/取消"由用户决定),FUSE 映射为 EAGAIN(工具重试);
@@ -4505,6 +4583,54 @@ mod tests {
         // 嵌套 cause 也搜索(aws-sdk 包装链)。
         let nested = anyhow::anyhow!("upload failed").context("request timed out");
         assert!(is_retryable_error(&nested));
+    }
+
+    #[test]
+    fn retry_backoff_scales_and_caps() {
+        // 退避 5s * 3^min(attempts,5),封顶 5 分钟(issue #85)。
+        assert_eq!(retry_backoff(0), Duration::from_secs(5));
+        assert_eq!(retry_backoff(1), Duration::from_secs(15));
+        assert_eq!(retry_backoff(2), Duration::from_secs(45));
+        assert_eq!(retry_backoff(5), Duration::from_secs(5 * 3u64.pow(5)));
+        assert_eq!(retry_backoff(9), retry_backoff(5), "封顶");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_worker_recovers_after_transient_failure() {
+        // issue #85:失败上传入队 → 网络恢复 → worker 退避后重试成功,
+        // 对象最终存在、队列清空。平台无关核心(macOS 可跑)。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.fail_put.store(1, Ordering::SeqCst); // 第一次 PUT 失败
+        let fs = Arc::new(test_fs_with_budget(port, 32, None));
+        let retry = Arc::new(RetryState {
+            queue: Mutex::new(VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+        });
+        {
+            let mut q = retry.queue.lock().unwrap();
+            q.push_back(RetryUpload {
+                path: "/f.txt".to_string(),
+                spool: None,
+                buf: Some(b"hello retry".to_vec()),
+                attempts: 0,
+            });
+        }
+        retry.notify.notify_one();
+        let worker_fs = Arc::clone(&fs);
+        let worker_retry = Arc::clone(&retry);
+        tokio::spawn(async move {
+            run_retry_worker(worker_fs, worker_retry).await;
+        });
+        // worker 退避 5s 后才重试:期间恢复网络(mock 放行)。
+        mock.fail_put.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        assert!(retry.queue.lock().unwrap().is_empty(), "重试成功后退队");
+        let obj = mock.objects.lock().unwrap().get("f.txt").cloned();
+        assert_eq!(
+            obj.as_deref(),
+            Some(b"hello retry".as_slice()),
+            "对象最终必须存在且内容正确"
+        );
     }
 
     #[test]

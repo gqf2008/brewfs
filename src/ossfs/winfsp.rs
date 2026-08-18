@@ -4,7 +4,7 @@
 //! buffered in memory and flushed as a whole-object `PutObject` on
 //! close/flush — the same "cloud drive" semantics as ossfs/s3fs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::future::Future;
 use std::io::Error as IoError;
@@ -66,6 +66,7 @@ const WRITE_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
 // so changes made by other machines appear without a manual F5. When nothing
 // is watching, FspFileSystemNotifyBegin fails and no S3 listing happens.
 const REFRESH_INTERVAL_MS: u32 = 10_000;
+
 /// Upper bound on the number of directories the periodic change-notification
 /// pass refreshes (root always included; oldest non-root evicted on overflow).
 const MAX_TRACKED_DIRS: usize = 64;
@@ -325,6 +326,12 @@ pub struct OssMountContext {
     /// the operation instead of parking the WinFsp callback — and with it
     /// Explorer — indefinitely (#43).
     operation_timeout: std::time::Duration,
+    /// 失败上传重试状态(issue #85):cleanup 上传失败(弱网超时等)时数据
+    /// 入队,后台 worker 指数退避重试,网络恢复后自动补传 —— cleanup 无
+    /// 错误返回通道(Explorer 收到"成功"),若静默丢弃则数据丢失(实测:
+    /// 21.44G 源复制后桶里仅 8.33G)。重试成功前 spool 缓冲保留不删。
+    /// 独立 Arc:worker 与 host 生命周期解耦(host 消费 context 值)。
+    retry: Arc<super::RetryState>,
 }
 
 impl OssMountContext {
@@ -620,10 +627,18 @@ impl OssMountContext {
             }
             return;
         }
-        if context.dirty.load(Ordering::Acquire)
-            && let Err(e) = self.upload_dirty_timed(context).await
-        {
-            warn!(path = log_path(&*context.path.lock().unwrap()), error = ?e, "ossfs cleanup flush failed");
+        if context.dirty.load(Ordering::Acquire) {
+            if let Err(e) = self.upload_dirty_timed(context).await {
+                tracing::warn!(
+                    path = log_path(&*context.path.lock().unwrap()),
+                    error = ?e,
+                    "ossfs cleanup flush failed; queued for background retry (issue #85)"
+                );
+                // 上传失败不能静默丢弃(cleanup 无错误返回通道,Explorer 已
+                // 收到"成功"):数据固化入队,后台 worker 重试,网络恢复后
+                // 自动补传 —— 否则弱网复制静默丢数据(实测 21.44G → 8.33G)。
+                self.enqueue_retry(context);
+            }
         }
     }
 
@@ -641,9 +656,19 @@ impl OssMountContext {
         }
         // The handle is gone, so nothing can retry a failed upload — release
         // the read-back spool and abort any leftover stream so neither leaks
-        // in %TEMP% / S3 (#47).
+        // in %TEMP% / S3 (#47). 重试队列引用的 spool 必须保留(worker 重试
+        // 成功后删除;issue #85 —— 否则失败上传的数据随 close 一起消失)。
         if let Some(path) = context.spool_path.lock().unwrap().take() {
-            let _ = std::fs::remove_file(&path);
+            let in_retry = self
+                .retry
+                .queue
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.spool.as_deref() == Some(path.as_path()));
+            if !in_retry {
+                let _ = std::fs::remove_file(&path);
+            }
             context.spool_size.store(0, Ordering::Release);
         }
         let _ = tokio::time::timeout(self.operation_timeout, async {
@@ -1000,6 +1025,42 @@ impl NotifyingFileSystemContext<()> for OssMountContext {
 }
 
 impl OssMountContext {
+    /// cleanup 上传失败(弱网超时等,issue #85):数据固化入队,后台 worker
+    /// 指数退避重试 —— cleanup 无错误返回通道(Explorer 收到"成功"),
+    /// 静默丢弃即数据丢失(实测 21.44G 源 → 桶 8.33G)。spool 保留不删
+    /// (close 清理跳过队列引用);无 spool 则 clone write_buf 固化内存。
+    fn enqueue_retry(&self, ctx: &OssFileContext) {
+        let path = ctx.path.lock().unwrap().clone();
+        let spool = ctx.spool_path.lock().unwrap().clone();
+        let buf = if spool.is_none() {
+            ctx.write_buf.lock().unwrap().clone()
+        } else {
+            None
+        };
+        {
+            let mut q = self.retry.queue.lock().unwrap();
+            q.push_back(super::RetryUpload {
+                path,
+                spool,
+                buf,
+                attempts: 0,
+            });
+        }
+        self.retry.notify.notify_one();
+        // 队列接管上传责任;dirty 清 false,避免 close/后续 flush 重复入队。
+        ctx.dirty.store(false, Ordering::Release);
+        tracing::warn!(
+            path = log_path(&*ctx.path.lock().unwrap()),
+            "cleanup upload failed; queued for background retry"
+        );
+    }
+
+    /// 启动后台重试 worker(平台无关主体在 [`super::run_retry_worker`],
+    /// 本方法仅负责 spawn;与 host 生命周期解耦,挂载退出时随 runtime drop)。
+    fn spawn_retry_worker(fs: Arc<ObjectFs>, retry: Arc<super::RetryState>) {
+        tokio::spawn(super::run_retry_worker(fs, retry));
+    }
+
     fn refresh_dir(&self, notifier: &Notifier, dir: &str) {
         let current = match self.block_on(self.fs.list(dir)) {
             Ok(entries) => entries,
@@ -1105,6 +1166,13 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
     let rt = Handle::current();
     let read_only = fs.read_only();
     let dirty_budget = fs.dirty_budget();
+    // 失败上传重试 worker(issue #85):独立于 host 生命周期,弱网下
+    // cleanup 上传失败的数据入队后台补传,不再静默丢失。
+    let retry = Arc::new(super::RetryState {
+        queue: Mutex::new(VecDeque::new()),
+        notify: tokio::sync::Notify::new(),
+    });
+    OssMountContext::spawn_retry_worker(fs.clone(), Arc::clone(&retry));
     let context = OssMountContext {
         fs: fs.clone(),
         rt,
@@ -1112,6 +1180,7 @@ pub async fn mount_oss_winfsp(fs: Arc<ObjectFs>, mount_point: &Path) -> anyhow::
         refresh: Mutex::new(RefreshState::new()),
         dirty_budget,
         operation_timeout: fs.operation_timeout(),
+        retry,
     };
     let params = FileSystemParams::default_params(build_volume_params(read_only));
     let mut host = FileSystemHost::new_with_timer_async::<(), REFRESH_INTERVAL_MS>(params, context)
@@ -2224,6 +2293,10 @@ mod tests {
             refresh: Mutex::new(RefreshState::new()),
             dirty_budget: fs.dirty_budget(),
             operation_timeout: fs.operation_timeout(),
+            retry: Arc::new(crate::ossfs::RetryState {
+                queue: Mutex::new(VecDeque::new()),
+                notify: tokio::sync::Notify::new(),
+            }),
         };
         (fs, ctx)
     }
@@ -2922,6 +2995,128 @@ mod tests {
             back.recycle_i.unwrap().len(),
             crate::ossfs::trash::MAX_RECYCLE_I_BYTES,
             "超限截断"
+        );
+    }
+
+    /// 驱动后台重试 worker 的测试助手:spawn worker(生产在 mount 函数
+    /// spawn,测试手动)。
+    fn spawn_retry_worker_for_test(ctx: &OssMountContext) {
+        let fs = Arc::clone(&ctx.fs);
+        let retry = Arc::clone(&ctx.retry);
+        OssMountContext::spawn_retry_worker(fs, retry);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_failure_queues_and_retries_uploads() {
+        // issue #85:cleanup 上传失败(弱网超时等)不能静默丢数据 —— 入队
+        // 后台重试,网络恢复后对象最终存在。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.fail_put.store(1, Ordering::SeqCst); // 第一次 PUT 失败
+        let fs = test_fs_with_budget(port, 32, None);
+        let (_fs, ctx) = test_mount(fs);
+        spawn_retry_worker_for_test(&ctx);
+        let file = test_file("/f.txt");
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, b"hello retry", 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        // cleanup 触发上传:fail_put=1 → 失败 → 入队(不返回错误给 Explorer,
+        // 但数据不再丢弃)。
+        ctx.cleanup_async(file, None, 0).await;
+        assert!(!ctx.retry.queue.lock().unwrap().is_empty(), "失败必须入队");
+        assert!(!file.dirty.load(Ordering::Acquire), "队列接管上传责任");
+        // 网络恢复(mock 放行)→ worker 退避 5s 后重试成功。
+        mock.fail_put.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        assert!(ctx.retry.queue.lock().unwrap().is_empty(), "重试成功后退队");
+        let objects = mock.objects.lock().unwrap();
+        let obj = objects.get("f.txt").expect("对象最终必须存在");
+        assert_eq!(obj, b"hello retry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_keeps_spool_queued_for_retry() {
+        // issue #85:重试队列引用的 spool 在 close 时必须保留(worker 重试
+        // 需要数据源),否则失败上传的数据随 close 一起消失。
+        // 注:大文件走流式上传(POST CreateMultipartUpload,不受 fail_put
+        // 拦截),故手动构造"失败已入队"状态(等价 cleanup 失败后的队列),
+        // 验证 close 不删队列引用的 spool。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        let fs = test_fs_with_budget(port, 32, None);
+        let (_fs, ctx) = test_mount(fs);
+        spawn_retry_worker_for_test(&ctx);
+        // 大文件(spool 路径):超过 WRITE_SPOOL_THRESHOLD 走 spool。用
+        // open_async 拿按值句柄(close_async 消费所有权;test_file 是
+        // &'static 引用无法 move)。
+        let mut ofi = open_info(); // open_async 要 OpenFileInfo
+        let mut fi = FileInfo::default(); // write_async 要 FileInfo
+        mock.set_object("big.bin", Vec::new());
+        let file = ctx
+            .open_async(w("\\big.bin"), 0, 0x2, &mut ofi)
+            .await
+            .expect("open");
+        let data = vec![0xABu8; (WRITE_SPOOL_THRESHOLD + 1024) as usize];
+        ctx.write_async(&file, &data, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        let spool_path = file.spool_path.lock().unwrap().clone();
+        assert!(spool_path.is_some(), "大文件应有 spool");
+        // 模拟 cleanup 上传失败入队(spool 引用进队列)。
+        let mut q = ctx.retry.queue.lock().unwrap();
+        q.push_back(crate::ossfs::RetryUpload {
+            path: "/big.bin".to_string(),
+            spool: spool_path.clone(),
+            buf: None,
+            attempts: 0,
+        });
+        drop(q);
+        ctx.close_async(file).await; // close 清理不得删队列 spool(file 最后使用)
+        assert!(
+            spool_path.as_ref().is_some_and(|p| p.exists()),
+            "队列中的 spool 必须保留"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_gives_up_after_max_attempts_keeps_spool() {
+        // issue #85:重试耗尽(持续失败)→ 队列清空、spool 保留(error 日志
+        // 定位),不静默消失。手动入队(等价 cleanup 失败后):worker 重试
+        // 走 write_from_file(plain PUT,8MiB+1KB < 16MiB 不分片),被
+        // fail_put 持续拦截 → 耗尽。
+        let (mock, port) = MockS3::start(vec![], Duration::ZERO).await;
+        mock.fail_put.store(1000, Ordering::SeqCst); // 持续失败
+        let fs = test_fs_with_budget(port, 32, None);
+        let (_fs, ctx) = test_mount(fs);
+        spawn_retry_worker_for_test(&ctx);
+        let file = test_file("/giveup.bin");
+        let data = vec![0xCDu8; (WRITE_SPOOL_THRESHOLD + 2048) as usize];
+        let mut fi = FileInfo::default();
+        ctx.write_async(file, &data, 0, false, false, &mut fi)
+            .await
+            .expect("write");
+        let spool_path = file.spool_path.lock().unwrap().clone();
+        assert!(spool_path.is_some(), "大文件应有 spool");
+        {
+            let mut q = ctx.retry.queue.lock().unwrap();
+            q.push_back(crate::ossfs::RetryUpload {
+                path: "/giveup.bin".to_string(),
+                spool: spool_path.clone(),
+                buf: None,
+                attempts: 0,
+            });
+        }
+        ctx.retry.notify.notify_one();
+        // 10 次重试 × 指数退避(5s+15s+45s+...):等 60s 覆盖到第 10 次。
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if ctx.retry.queue.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(ctx.retry.queue.lock().unwrap().is_empty(), "重试耗尽后退队");
+        assert!(
+            spool_path.as_ref().is_some_and(|p| p.exists()),
+            "放弃后 spool 保留供人工定位"
         );
     }
 
