@@ -24,6 +24,112 @@ use std::time::{Duration, Instant};
 
 use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+/// 版本更新检查(issue #87):GET GitHub Releases 最新版,与当前版本对比,
+/// 发现新版提示下载。网络失败/解析失败静默(不打扰用户)。
+
+/// 解析 "v0.4.2" 或 "0.4.2" → (0,4,2)。非数字段返回 None。
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let v = s.trim().trim_start_matches('v');
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// 拉取 GitHub 最新 release 版本号;网络/解析失败返回 None(静默降级)。
+fn fetch_latest_version() -> Option<String> {
+    let resp = ureq::get("https://api.github.com/repos/gqf2008/ossfs/releases/latest")
+        .set("User-Agent", "ossfs-tray")
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .ok()?;
+    let json: serde_json::Value = resp.into_json().ok()?;
+    json.get("tag_name")?.as_str().map(str::to_string)
+}
+
+/// 检查是否有新版本:最新 > 当前时返回 Some(最新版本号)。
+fn check_for_update(current: &str) -> Option<String> {
+    let latest = fetch_latest_version()?;
+    let (c, l) = (parse_version(current)?, parse_version(&latest)?);
+    (l > c).then_some(latest)
+}
+
+/// 打开 GitHub release 下载页。
+fn open_release_page() {
+    let _ = webbrowser::open("https://github.com/gqf2008/ossfs/releases/latest");
+}
+
+/// 发现新版弹提示:确认后打开下载页。
+#[cfg(windows)]
+fn show_update_dialog(current: &str, latest: &str) {
+    let msg = format!(
+        "发现新版本 {latest}(当前 {current})。\n\n是否打开下载页面?",
+    );
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_YESNO, IDYES,
+    };
+    let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "OSSFS 更新".encode_utf16().chain(std::iter::once(0)).collect();
+    let choice = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONINFORMATION,
+        )
+    };
+    if choice == IDYES {
+        open_release_page();
+    }
+}
+
+/// 非 Windows 平台:直接打开下载页(无原生消息框)。
+#[cfg(not(windows))]
+fn show_update_dialog(_current: &str, latest: &str) {
+    eprintln!("OSSFS update available: {latest}");
+    open_release_page();
+}
+
+/// 后台线程检查更新:发现新版弹提示。`quiet_on_none` 控制"无新版/失败"时
+/// 是否静默(自动检查静默;手动检查要告知结果)。
+fn run_update_check(current: String, quiet_on_none: bool) {
+    std::thread::spawn(move || {
+        match check_for_update(&current) {
+            Some(latest) => show_update_dialog(&current, &latest),
+            None if !quiet_on_none => {
+                // 手动检查:区分"已是最新"与"检查失败"(网络/解析)。
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        MessageBoxW, MB_ICONINFORMATION, MB_OK,
+                    };
+                    let msg = if parse_version(&current).is_some() {
+                        "检查失败(网络不可达或解析失败)。".to_string()
+                    } else {
+                        "已是最新版本。".to_string()
+                    };
+                    let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                    let title: Vec<u16> = "OSSFS 更新".encode_utf16().chain(std::iter::once(0)).collect();
+                    unsafe {
+                        MessageBoxW(
+                            std::ptr::null_mut(),
+                            wide.as_ptr(),
+                            title.as_ptr(),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    eprintln!("OSSFS update check: no update or check failed");
+                }
+            }
+            None => {}
+        }
+    });
+}
+
 slint::include_modules!();
 
 /// A `ossfs mount` process we started that has not yet produced a runtime
@@ -989,6 +1095,15 @@ fn wire_callbacks(
     };
     ui.on_quit_app(do_quit.clone());
     tray.on_quit_app(do_quit);
+
+    // --- 检查更新(issue #87) ---
+    // 手动:菜单「检查更新」→ 新版弹提示,无新版/失败也告知结果。
+    tray.on_check_update({
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        move || run_update_check(current.clone(), false)
+    });
+    // 自动:启动后异步检查,仅发现新版时提示(网络失败静默)。
+    run_update_check(env!("CARGO_PKG_VERSION").to_string(), true);
 }
 
 /// Spawn `ossmount` for `p`, remember the profile, and report progress.
@@ -1966,6 +2081,32 @@ mod mac_dock_reopen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_version_handles_v_prefix_and_parts() {
+        assert_eq!(parse_version("v0.4.2"), Some((0, 4, 2)));
+        assert_eq!(parse_version("0.4.2"), Some((0, 4, 2)));
+        assert_eq!(parse_version("v1.10.0"), Some((1, 10, 0)));
+        assert_eq!(parse_version("0.4"), None);
+        assert_eq!(parse_version("v0.4.x"), None);
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("v0.4.2-beta"), None);
+    }
+
+    #[test]
+    fn version_compare_semantics() {
+        // check_for_update 的纯比较逻辑:最新 > 当前 → Some(最新)。
+        let cmp = |current: &str, latest: &str| -> bool {
+            let (c, l) = (parse_version(current).unwrap(), parse_version(latest).unwrap());
+            l > c
+        };
+        assert!(cmp("0.4.1", "0.4.2"));
+        assert!(cmp("0.4.9", "0.4.10"), "10 > 9,非字典序");
+        assert!(cmp("0.3.0", "0.4.0"));
+        assert!(!cmp("0.4.2", "0.4.2"));
+        assert!(!cmp("0.4.3", "0.4.2"));
+        assert!(!cmp("0.5.0", "0.4.2"));
+    }
 
     #[test]
     fn sanitize_filename_keeps_safe_chars() {

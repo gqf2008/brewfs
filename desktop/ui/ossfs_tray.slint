@@ -663,6 +663,7 @@ export component Tray inherits SystemTrayIcon {
     callback show-window();
     callback open-mount(int);
     callback autostart-changed(bool);
+    callback check-update();
     callback quit-app();
 
     clicked => {
@@ -694,6 +695,13 @@ export component Tray inherits SystemTrayIcon {
                 root.autostart = !root.autostart;
                 root.autostart-changed(root.autostart);
             }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: "检查更新";
+            activated => { root.check-update(); }
         }
 
         MenuSeparator { }
