@@ -92,12 +92,19 @@ fn show_update_dialog(_current: &str, latest: &str) {
     open_release_page();
 }
 
-/// 后台线程检查更新:发现新版弹提示。`quiet_on_none` 控制"无新版/失败"时
-/// 是否静默(自动检查静默;手动检查要告知结果)。
-fn run_update_check(current: String, quiet_on_none: bool) {
+/// 后台线程检查更新:发现新版 → 菜单状态改「有新版本(x.x.x)」+ 弹提示。
+/// `quiet_on_none` 控制"无新版/失败"时是否静默(自动检查静默;手动检查
+/// 要告知结果)。UI 更新经 `upgrade_in_event_loop`(Slint 跨线程纪律)。
+fn run_update_check(current: String, quiet_on_none: bool, tray_weak: slint::Weak<Tray>) {
     std::thread::spawn(move || {
         match check_for_update(&current) {
-            Some(latest) => show_update_dialog(&current, &latest),
+            Some(latest) => {
+                let status = format!("有新版本({latest})");
+                let _ = tray_weak.upgrade_in_event_loop(move |tray| {
+                    tray.set_update_status(status.into());
+                });
+                show_update_dialog(&current, &latest);
+            }
             None if !quiet_on_none => {
                 // 手动检查:区分"已是最新"与"检查失败"(网络/解析)。
                 #[cfg(windows)]
@@ -1101,13 +1108,19 @@ fn wire_callbacks(
     tray.on_quit_app(do_quit);
 
     // --- 检查更新(issue #87) ---
-    // 手动:菜单「检查更新」→ 新版弹提示,无新版/失败也告知结果。
+    // 菜单状态默认「检查更新」;发现新版时回写「有新版本(x.x.x)」。
+    // 菜单状态:默认「检查更新 v0.4.2」(版本号常显);发现新版 →「有新版本(x.x.x)」。
+    tray.set_update_status(
+        format!("检查更新 v{}", env!("CARGO_PKG_VERSION")).into(),
+    );
+    // 手动:菜单点击 → 新版弹提示,无新版/失败也告知结果。
     tray.on_check_update({
         let current = env!("CARGO_PKG_VERSION").to_string();
-        move || run_update_check(current.clone(), false)
+        let tray_weak = tray.as_weak();
+        move || run_update_check(current.clone(), false, tray_weak.clone())
     });
     // 自动:启动后异步检查,仅发现新版时提示(网络失败静默)。
-    run_update_check(env!("CARGO_PKG_VERSION").to_string(), true);
+    run_update_check(env!("CARGO_PKG_VERSION").to_string(), true, tray.as_weak());
 }
 
 /// Spawn `ossmount` for `p`, remember the profile, and report progress.

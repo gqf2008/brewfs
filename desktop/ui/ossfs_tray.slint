@@ -659,6 +659,8 @@ export component Tray inherits SystemTrayIcon {
     in property <string> tray-tooltip;
     in property <[MountInfo]> mounts;
     in-out property <bool> autostart;
+    /// 检查更新菜单状态:默认「检查更新」,发现新版 →「有新版本(x.x.x)」。
+    in-out property <string> update-status;
 
     callback show-window();
     callback open-mount(int);
@@ -700,7 +702,7 @@ export component Tray inherits SystemTrayIcon {
         MenuSeparator { }
 
         MenuItem {
-            title: "检查更新";
+            title: root.update-status;
             activated => { root.check-update(); }
         }
 
